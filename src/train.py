@@ -203,18 +203,18 @@ def parse_args():
 def _create_adapter(method: str, model: nn.Module, training_cfg: dict):
     method = method.lower()
     if method == "ngfat":
-        return NGFATState(model, lr=training_cfg.get("adapt_lr", 1e-3))
+        return NGFATState(model, lr=float(training_cfg.get("adapt_lr", 1e-3)))
     if method == "rotta":
         return RoTTAState(
             model,
-            lr=training_cfg.get("adapt_lr", 1e-3),
-            delta=training_cfg.get("delta", 0.1),
+            lr=float(training_cfg.get("adapt_lr", 1e-3)),
+            delta=float(training_cfg.get("delta", 0.1)),
         )
     if method in {"zorro-lite", "zorro_full", "zorro-full", "zorro"}:
         return ZorroState(
             model,
-            lambda_=training_cfg.get("lambda", 1.0),
-            eps=training_cfg.get("eps", 1e-3),
+            lambda_=float(training_cfg.get("lambda", 1.0)),
+            eps=float(training_cfg.get("eps", 1e-3)),
             k_ckpt=3,
             enable_rollback=method not in {"zorro-lite"},
         )

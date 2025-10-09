@@ -1,0 +1,14 @@
+{
+  "run_id": "tinyimagenet_resnet20_gn_zorro_full",
+  "method": "zorro-full",
+  "epochs": 1,
+  "train_history": [
+    {
+      "epoch": 1,
+      "loss": 22.6136633605957,
+      "acc": 0.6
+    }
+  ],
+  "val_loss": 36.20732745361328,
+  "val_acc": 0.6
+}

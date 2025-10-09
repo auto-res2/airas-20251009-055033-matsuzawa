@@ -1,0 +1,14 @@
+{
+  "run_id": "tinyimagenet_resnet20_gn_source_frozen",
+  "method": "source-frozen",
+  "epochs": 1,
+  "train_history": [
+    {
+      "epoch": 1,
+      "loss": 5.576096656799316,
+      "acc": 0.65
+    }
+  ],
+  "val_loss": 5.576857543945312,
+  "val_acc": 0.7
+}

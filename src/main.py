@@ -93,7 +93,19 @@ def main():
     args = parse_args()
     results_root = Path(args.results_dir).expanduser()
     if results_root.exists():
-        shutil.rmtree(results_root)
+        # Use ignore_errors=True to handle files that may be in use
+        shutil.rmtree(results_root, ignore_errors=True)
+        # If the directory still exists, just ensure it's created
+        if results_root.exists():
+            # Clear the directory contents instead
+            for item in results_root.iterdir():
+                if item.is_file():
+                    try:
+                        item.unlink()
+                    except OSError:
+                        pass
+                elif item.is_dir():
+                    shutil.rmtree(item, ignore_errors=True)
     results_root.mkdir(parents=True, exist_ok=True)
 
     cfg_path = CONFIG_DIR / ("smoke_test.yaml" if args.smoke_test else "full_experiment.yaml")

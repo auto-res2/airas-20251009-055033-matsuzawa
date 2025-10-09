@@ -1,0 +1,14 @@
+{
+  "run_id": "tinyimagenet_resnet20_gn_ngfat",
+  "method": "ngfat",
+  "epochs": 1,
+  "train_history": [
+    {
+      "epoch": 1,
+      "loss": 5.540921932220459,
+      "acc": 0.65
+    }
+  ],
+  "val_loss": 5.5074967117309575,
+  "val_acc": 0.7
+}

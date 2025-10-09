@@ -1,0 +1,12 @@
+dataset:
+  max_samples: 5000
+  name: tinyimagenet_c
+  split: test
+model:
+  name: resnet20_gn
+run_id: tinyimagenet_resnet20_gn_source_frozen
+seed: 7
+training:
+  batch_size: 32
+  epochs: 1
+  method: source-frozen
