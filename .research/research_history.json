@@ -1,0 +1,11 @@
+{
+  "research_topic": "Improve Test-Time Adaptation in terms of convergence speed.",
+  "queries": [
+    "fast test-time adaptation",
+    "test-time adaptation convergence",
+    "unsupervised TTA acceleration",
+    "gradient-based adaptation speed",
+    "meta-learning test-time adaptation speed",
+    "TENT convergence acceleration"
+  ]
+}
