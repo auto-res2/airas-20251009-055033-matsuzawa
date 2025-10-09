@@ -1,0 +1,17 @@
+
+Input:
+# Task
+You carefully read the contents of the “Paper Outline” and select one GitHub link from the “GitHub URLs List” that you think is most relevant to the contents.
+# Constraints
+- Output the index number corresponding to the selected GitHub URL.
+- Be sure to select only one GitHub URL.
+- If there is no related GitHub link, output None.
+# Paper Outline
+TnALE improves upon TNLS by replacing its random sampling with Alternating Local Enumeration (ALE). It iteratively updates each structure-related variable (TN-ranks 'r' and graph 'G') by enumerating all its possible values within a defined neighborhood while keeping other variables fixed. This alternating enumeration proceeds in a 'round-trip' manner (forward and backward through variables). The core intuition is to avoid combinatorial explosion and ensure a non-increasing objective function value. The method also incorporates 'knowledge transfer' tricks, such as reusing optimized core tensors from lower-rank structures for higher-rank initializations and using linear interpolation for objective estimation to accelerate evaluation, especially during an initial phase with a larger search radius. Theoretically, the paper re-defines discrete analogues for fundamental concepts like finite gradient, strong convexity, and smoothness to analyze the algorithm's convergence and evaluation efficiency. It also draws a connection between ALE and TT-cross approximation, suggesting that the low-rank structure of the optimization landscape contributes to TnALE's efficiency.
+
+# GitHub URLs List
+['https://github.com/oscarmickelin/tensor-ring-decomposition']
+Output:
+{
+    "index": 0
+}
