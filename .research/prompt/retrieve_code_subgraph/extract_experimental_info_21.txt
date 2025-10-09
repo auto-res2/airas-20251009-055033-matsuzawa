@@ -1,0 +1,4062 @@
+
+Input:
+You are a researcher with expertise in engineering in the field of machine learning.
+
+# Instructions
+- The content described in “Repository Content” corresponds to the GitHub repository of the method described in “Method.”
+- Please extract the following two pieces of information from “Repository Content”:
+    - experimental_code：Extract the implementation sections that are directly related to the method described in “Method.”
+    - experimental_info：Extract and output the experimental settings related to the method described in “Method.”
+
+# Method
+TTAC employs a mixture of Gaussians to model clusters in the target domain, using category-wise source domain statistics as anchors. It minimizes the KL-Divergence between target and source component Gaussians for category-wise alignment. For robustness against noisy predictions, a pseudo label filtering mechanism is developed, combining temporal consistency filtering (based on exponential moving average posteriors) and posterior probability filtering. Component Gaussians are updated only by samples passing these filters. To utilize all test samples, a global feature alignment objective minimizes the KL-Divergence between global source and target feature distributions. An efficient iterative updating strategy is proposed for running statistics of target domain Gaussians, avoiding storing all features and incorporating a clipping mechanism to prevent gradient vanishing. The overall TTAC algorithm uses a fixed-length queue for recent test samples and optimizes a combined anchored clustering and global feature alignment loss.
+
+# Repository Content
+File Path: cifar/TTAC_multipass.py
+Content:
+import argparse
+
+import torch
+import torch.optim as optim
+import torch.nn.functional as F
+import torch.utils.data as data
+
+from utils.misc import *
+from utils.test_helpers import *
+from utils.prepare_dataset import *
+
+# ----------------------------------
+import copy
+import math
+import random
+import numpy as np
+import torch.backends.cudnn as cudnn
+
+from offline import *
+from utils.contrastive import *
+import time
+# ----------------------------------
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--dataset', default='cifar10')
+parser.add_argument('--dataroot', default="./data")
+parser.add_argument('--batch_size', default=128, type=int)
+parser.add_argument('--batch_size_align', default=512, type=int)
+parser.add_argument('--workers', default=0, type=int)
+parser.add_argument('--num_sample', default=1000000, type=int)
+parser.add_argument('--bnepoch', default=2, type=int)
+parser.add_argument('--nepoch', default=500, type=int)
+parser.add_argument('--stopepoch', default=25, type=int)
+parser.add_argument('--lr', default=0.001, type=float)
+parser.add_argument('--outf', default='.')
+parser.add_argument('--level', default=5, type=int)
+parser.add_argument('--corruption', default='snow')
+parser.add_argument('--resume', default=None, help='directory of pretrained model')
+parser.add_argument('--ckpt', default=None, type=int)
+parser.add_argument('--ssl', default='contrastive', help='self-supervised task')
+parser.add_argument('--temperature', default=0.5, type=float)
+parser.add_argument('--align_ext', action='store_true')
+parser.add_argument('--align_ssh', action='store_true')
+parser.add_argument('--fix_ssh', action='store_true')
+parser.add_argument('--with_ssl', action='store_true', default=False)
+parser.add_argument('--with_shot', action='store_true', default=False)
+parser.add_argument('--without_global', action='store_true', default=False)
+parser.add_argument('--without_mixture', action='store_true', default=False)
+parser.add_argument('--filter', default="ours", choices=['ours', 'posterior', 'none'])
+parser.add_argument('--model', default='resnet50', help='resnet50')
+parser.add_argument('--seed', default=0, type=int)
+
+
+args = parser.parse_args()
+
+print(args)
+
+my_makedir(args.outf)
+
+torch.manual_seed(args.seed)
+random.seed(args.seed)
+np.random.seed(args.seed)
+torch.cuda.manual_seed(args.seed)
+torch.cuda.manual_seed_all(args.seed)
+
+cudnn.benchmark = True
+
+# -------------------------------
+
+net, ext, head, ssh, classifier = build_resnet50(args)
+_, teloader = prepare_test_data(args)
+
+# -------------------------------
+
+args.batch_size = min(args.batch_size, args.num_sample)
+args.batch_size_align = min(args.batch_size_align, args.num_sample)
+
+args_align = copy.deepcopy(args)
+args_align.ssl = None
+args_align.batch_size = args.batch_size_align
+
+_, tr_dataloader = prepare_train_data(args, args.num_sample)
+
+_, trloader_extra = prepare_test_data(args_align, ttt=True, num_sample=args.num_sample)
+trloader_extra_iter = iter(trloader_extra)
+
+# -------------------------------
+
+print('Resuming from %s...' %(args.resume))
+
+load_resnet50(net, head, ssh, classifier, args)
+
+if torch.cuda.device_count() > 1:
+    ext = torch.nn.DataParallel(ext)
+
+# ----------- Test ------------
+
+all_err_cls = []
+all_err_ssh = []
+
+print('Running...')
+
+if args.fix_ssh:
+    optimizer = optim.SGD(ext.parameters(), lr=args.lr, momentum=0.9)
+else:
+    optimizer = optim.SGD(ssh.parameters(), lr=args.lr, momentum=0.9)
+
+scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer,
+    'min', factor=0.5, patience=10, cooldown=10,
+    threshold=0.0001, threshold_mode='rel', min_lr=0.0001, verbose=True)
+
+criterion = SupConLoss(temperature=args.temperature).cuda()
+# -------------------------------
+
+class_num = 10 if args.dataset == 'cifar10' else 100
+
+# ----------- Offline Feature Summarization ------------
+_, offlineloader = prepare_train_data(args_align)
+
+ext_src_mu, ext_src_cov, ssh_src_mu, ssh_src_cov, mu_src_ext, cov_src_ext, mu_src_ssh, cov_src_ssh = offline(offlineloader, ext, classifier, head, class_num)
+bias = cov_src_ext.max().item() / 30.
+bias2 = cov_src_ssh.max().item() / 30.
+template_ext_cov = torch.eye(2048).cuda() * bias
+template_ssh_cov = torch.eye(128).cuda() * bias2
+
+print('Error (%)\t\ttest')
+err_cls = test(teloader, net)[0]
+print(('Epoch %d:' %(0)).ljust(24) +
+            '%.2f\t\t' %(err_cls*100))
+
+
+# ----------- Improved Test-time Training ------------
+
+ext_src_mu = torch.stack(ext_src_mu)
+ext_src_cov = torch.stack(ext_src_cov) + template_ext_cov[None, :, :]
+
+source_component_distribution = torch.distributions.MultivariateNormal(ext_src_mu, ext_src_cov)
+target_compoent_distribution = torch.distributions.MultivariateNormal(ext_src_mu, ext_src_cov)
+
+is_both_activated=False
+sample_predict_ema_logit = torch.zeros(len(tr_dataloader.dataset), class_num, dtype=torch.float)
+sample_predict_alpha = torch.ones(len(tr_dataloader.dataset), dtype=torch.float)
+ema_alpha = 0.9
+
+ema_n = torch.zeros(class_num).cuda()
+ema_ext_mu = ext_src_mu.clone()
+ema_ext_cov = ext_src_cov.clone()
+
+ema_ext_total_mu = torch.zeros(2048).float()
+ema_ext_total_cov = torch.zeros(2048, 2048).float()
+
+ema_ssh_total_mu = torch.zeros(128).float()
+ema_ssh_total_cov = torch.zeros(128, 128).float()
+
+
+ema_total_n = 0.
+if class_num == 10:
+    ema_length = 128
+    epoch_bias = 0
+else: 
+    ema_length = 64
+    epoch_bias = 10
+
+if class_num == 10:
+    loss_scale = 0.05
+else:
+    loss_scale = 0.5
+
+for epoch in range(1, args.nepoch+1):
+    tic = time.time()
+
+    if args.fix_ssh:
+        head.eval()
+    else:
+        head.train()
+    ext.train()
+    classifier.eval()
+
+    sample_predict_alpha = torch.where(sample_predict_alpha < 1, sample_predict_alpha + 0.2, torch.ones_like(sample_predict_alpha))
+
+    for batch_idx, (inputs, labels) in enumerate(tr_dataloader):
+        optimizer.zero_grad()
+
+        if args.with_ssl:
+            images = torch.cat([inputs[0], inputs[1]], dim=0)
+            images = images.cuda(non_blocking=True)
+            indexes = inputs[-1]
+            bsz = labels.shape[0]
+            backbone_features = ext(images)
+            features = F.normalize(head(backbone_features), dim=1)
+            f1, f2 = torch.split(features, [bsz, bsz], dim=0)
+            features = torch.cat([f1.unsqueeze(1), f2.unsqueeze(1)], dim=1)
+            loss = criterion(features)
+            loss.backward()
+            del loss
+
+        if is_both_activated:
+            loss = 0.
+            try:
+                inputs, labels = next(trloader_extra_iter)
+            except StopIteration:
+                del trloader_extra_iter
+                trloader_extra_iter = iter(trloader_extra)
+                inputs, labels = next(trloader_extra_iter)
+
+            inputs, indexes = inputs
+            inputs = inputs.cuda()
+
+            feat_ext = ext(inputs)
+            logit = classifier(feat_ext)
+            feat_ssh = head(feat_ext)
+
+            with torch.no_grad():
+                ext.eval()
+                origin_images = inputs
+                origin_image_index = indexes
+                predict_logit = net(origin_images)
+                softmax_logit = predict_logit.softmax(dim=1).cpu()
+
+                old_logit = sample_predict_ema_logit[origin_image_index, :]
+                max_val, max_pos = softmax_logit.max(dim=1)
+                old_max_val = old_logit[torch.arange(max_pos.shape[0]), max_pos]
+                accept_mask = max_val > (old_max_val - 0.001)
+
+                sample_predict_alpha[origin_image_index] = torch.where(accept_mask, sample_predict_alpha[origin_image_index], torch.zeros_like(accept_mask).float())
+
+                sample_predict_ema_logit[origin_image_index, :] = \
+                    torch.where(sample_predict_ema_logit[origin_image_index, :] == torch.zeros(class_num), \
+                                softmax_logit, \
+                                (1 - ema_alpha) * sample_predict_ema_logit[origin_image_index, :] + ema_alpha * softmax_logit)
+                
+                pro, pseudo_label = sample_predict_ema_logit[origin_image_index].max(dim=1)
+                ext.train()
+                del predict_logit
+
+            if args.filter == 'ours':
+                pseudo_label_mask = (sample_predict_alpha[origin_image_index] == 1) & (pro > 0.9)
+                feat_ext2 = feat_ext[pseudo_label_mask]
+                feat_ssh2 = feat_ssh[pseudo_label_mask]
+                pseudo_label2 = pseudo_label[pseudo_label_mask].cuda()
+            elif args.filter == 'none':
+                feat_ext2 = feat_ext
+                feat_ssh2 = feat_ssh
+                pseudo_label2 = pseudo_label.cuda()
+            elif args.filter == 'posterior':
+                with torch.no_grad():
+                    posterior = target_compoent_distribution.log_prob(feat_ext[:, None, :]) # log prob
+                    posterior_tmp = posterior.max(dim=1, keepdim=True)[0] - math.log((2 ** 127) / 10) # B, K
+                    posterior -= posterior_tmp
+                    posterior = posterior.exp() # prob / exp(posterior_tmp)
+                    posterior /= posterior.sum(dim=1, keepdim=True)
+                    posterior = posterior.transpose(0, 1).detach()  # K, N
+            else:
+                raise Exception("%s filter type has not yet been implemented." % args.filter)
+
+
+            if args.align_ext:
+                if not args.without_mixture:
+                    # Mixture Gaussian
+                    if args.filter != 'posterior':
+                        b, d = feat_ext2.shape
+                        feat_ext2_categories = torch.zeros(class_num, b, d).cuda() # K, N, D
+                        feat_ext2_categories.scatter_add_(dim=0, index=pseudo_label2[None, :, None].expand(-1, -1, d), src=feat_ext2[None, :, :])
+                        num_categories = torch.zeros(class_num, b, dtype=torch.int).cuda() # K, N
+                        num_categories.scatter_add_(dim=0, index=pseudo_label2[None, :], src=torch.ones_like(pseudo_label2[None, :], dtype=torch.int))
+
+                        ema_n += num_categories.sum(dim=1) # K
+                        alpha = torch.where(ema_n > ema_length, torch.ones(class_num, dtype=torch.float).cuda() / ema_length, 1. / (ema_n + 1e-10))
+
+                        delta_pre = (feat_ext2_categories - ema_ext_mu[:, None, :]) * num_categories[:, :, None] # K, N, D
+                        delta = alpha[:, None] * delta_pre.sum(dim=1) # K, D
+                        new_component_mean = ema_ext_mu + delta
+                        new_component_cov = ema_ext_cov \
+                                            + alpha[:, None, None] * ((delta_pre.permute(0, 2, 1) @ delta_pre) - num_categories.sum(dim=1)[:, None, None] * ema_ext_cov) \
+                                            - delta[:, :, None] @ delta[:, None, :]
+
+                        with torch.no_grad():
+                            ema_ext_mu = new_component_mean.detach()
+                            ema_ext_cov = new_component_cov.detach()
+                        
+                        if epoch > epoch_bias:
+                            target_compoent_distribution.loc = new_component_mean
+                            target_compoent_distribution.covariance_matrix = new_component_cov + template_ext_cov
+                            target_compoent_distribution._unbroadcasted_scale_tril = torch.linalg.cholesky(new_component_cov + template_ext_cov)
+                            loss += (torch.distributions.kl_divergence(source_component_distribution, target_compoent_distribution) \
+                                    + torch.distributions.kl_divergence(target_compoent_distribution, source_component_distribution)).mean() * loss_scale
+                    else:
+                        feat_ext2_categories = feat_ext[None, :, :].expand(class_num, -1, -1) # K, N, D
+                        num_categories = posterior # K, N
+                        ema_n += num_categories.sum(dim=1) # K
+                        alpha = torch.where(ema_n > ema_length, torch.ones(class_num, dtype=torch.float).cuda() / ema_length, 1. / (ema_n + 1e-10))
+                        
+                        delta_pre = (feat_ext2_categories - ema_ext_mu[:, None, :]) * num_categories[:, :, None] # K, N, D
+                        delta = alpha[:, None] * delta_pre.sum(dim=1) # K, D
+                        new_component_mean = ema_ext_mu + delta
+                        new_component_cov = ema_ext_cov \
+                                            + alpha[:, None, None] * ((delta_pre.permute(0, 2, 1) @ delta_pre) - num_categories.sum(dim=1)[:, None, None] * ema_ext_cov) \
+                                            - delta[:, :, None] @ delta[:, None, :]
+
+                        with torch.no_grad():
+                            ema_ext_mu = new_component_mean.detach()
+                            ema_ext_cov = new_component_cov.detach()
+                        
+                        if epoch > epoch_bias:
+                            target_compoent_distribution.loc = new_component_mean
+                            target_compoent_distribution.covariance_matrix = new_component_cov + template_ext_cov
+                            target_compoent_distribution._unbroadcasted_scale_tril = torch.linalg.cholesky(new_component_cov + template_ext_cov)
+                            loss += (torch.distributions.kl_divergence(source_component_distribution, target_compoent_distribution) \
+                                    + torch.distributions.kl_divergence(target_compoent_distribution, source_component_distribution)).mean() * loss_scale
+
+                if not args.without_global:
+                    # Global Gaussian
+                    b = feat_ext.shape[0]
+                    ema_total_n += b
+                    alpha = 1. / 1280 if ema_total_n > 1280 else 1. / ema_total_n
+                    delta_pre = (feat_ext - ema_ext_total_mu.cuda())
+                    delta = alpha * delta_pre.sum(dim=0)
+                    tmp_mu = ema_ext_total_mu.cuda() + delta
+                    tmp_cov = ema_ext_total_cov.cuda() + alpha * (delta_pre.t() @ delta_pre - b * ema_ext_total_cov.cuda()) - delta[:, None] @ delta[None, :]
+                    with torch.no_grad():
+                        ema_ext_total_mu = tmp_mu.detach().cpu()
+                        ema_ext_total_cov = tmp_cov.detach().cpu()
+
+                    source_domain = torch.distributions.MultivariateNormal(mu_src_ext, cov_src_ext + template_ext_cov)
+                    target_domain = torch.distributions.MultivariateNormal(tmp_mu, tmp_cov + template_ext_cov)
+                    loss += (torch.distributions.kl_divergence(source_domain, target_domain) + torch.distributions.kl_divergence(target_domain, source_domain)) * loss_scale
+
+                if args.without_mixture and args.without_global:
+                    logit2 = logit[pseudo_label_mask.cuda()]
+                    loss += F.cross_entropy(logit2, pseudo_label2) * loss_scale * 2
+
+            if args.align_ssh:  
+                b = feat_ssh.shape[0]
+                alpha = 1. / 1280 if ema_total_n > 1280 else 1. / ema_total_n
+                delta_pre = (feat_ssh - ema_ssh_total_mu.cuda())
+                delta = alpha * delta_pre.sum(dim=0)
+                tmp_mu = ema_ssh_total_mu.cuda() + delta
+                tmp_cov = ema_ssh_total_cov.cuda() + alpha * (delta_pre.t() @ delta_pre - b * ema_ssh_total_cov.cuda()) - delta[:, None] @ delta[None, :]
+
+                with torch.no_grad():
+                    ema_ssh_total_mu = tmp_mu.detach().cpu()
+                    ema_ssh_total_cov = tmp_cov.detach().cpu()
+                source_domain = torch.distributions.MultivariateNormal(mu_src_ssh, cov_src_ssh + template_ssh_cov)
+                target_domain = torch.distributions.MultivariateNormal(tmp_mu, tmp_cov + template_ssh_cov)
+                loss += (torch.distributions.kl_divergence(source_domain, target_domain) + torch.distributions.kl_divergence(target_domain, source_domain)) * loss_scale
+            
+                
+            if args.with_shot:
+                ent_loss = softmax_entropy(logit).mean(0)
+                softmax_out = F.softmax(logit, dim=-1)
+                msoftmax = softmax_out.mean(dim=0)
+                ent_loss += torch.sum(msoftmax * torch.log(msoftmax + 1e-5))
+                loss += ent_loss * loss_scale * 2
+
+            try:
+                loss.backward()
+            except:
+                pass
+            finally:
+                del loss
+
+        if epoch > args.bnepoch:
+            optimizer.step()
+            optimizer.zero_grad()
+
+    err_cls = test(teloader, net)[0]
+    all_err_cls.append(err_cls)
+
+    toc = time.time()
+    print(('Epoch %d/%d (%.0fs):' %(epoch, args.nepoch, toc-tic)).ljust(24) +
+                    '%.2f\t\t' %(err_cls*100))
+    
+    # both components
+    if not is_both_activated and epoch > args.bnepoch:
+        is_both_activated = True
+
+    # termination
+    if epoch > (args.stopepoch + 1) and all_err_cls[-args.stopepoch] < min(all_err_cls[-args.stopepoch+1:]):
+        print("{} Termination: {:.2f}".format(args.corruption, all_err_cls[-args.stopepoch]*100))
+        break
+
+    # save
+    if epoch > args.bnepoch and len(all_err_cls) > 2 and all_err_cls[-1] < min(all_err_cls[:-1]):
+        state = {'net': net.state_dict(), 'head': head.state_dict()}
+        save_file = os.path.join(args.outf, args.corruption + '.pth')
+        torch.save(state, save_file)
+        print('Save model to', save_file)
+
+    # lr decay
+    scheduler.step(err_cls)
+
+
+File Path: cifar/TTAC_multipass2.py
+Content:
+import argparse
+
+import torch
+import torch.optim as optim
+import torch.nn.functional as F
+import torch.utils.data as data
+
+from utils.misc import *
+from utils.test_helpers import *
+from utils.prepare_dataset import *
+
+# ----------------------------------
+import copy
+import math
+import random
+import numpy as np
+import torch.backends.cudnn as cudnn
+
+from offline import *
+from utils.contrastive import *
+import time
+# ----------------------------------
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--dataset', default='cifar10')
+parser.add_argument('--dataroot', default="./data")
+parser.add_argument('--batch_size', default=128, type=int)
+parser.add_argument('--batch_size_align', default=512, type=int)
+parser.add_argument('--workers', default=0, type=int)
+parser.add_argument('--num_sample', default=1000000, type=int)
+parser.add_argument('--bnepoch', default=2, type=int)
+parser.add_argument('--nepoch', default=500, type=int)
+parser.add_argument('--stopepoch', default=25, type=int)
+parser.add_argument('--lr', default=0.001, type=float)
+parser.add_argument('--outf', default='.')
+parser.add_argument('--level', default=5, type=int)
+parser.add_argument('--corruption', default='snow')
+parser.add_argument('--resume', default=None, help='directory of pretrained model')
+parser.add_argument('--ckpt', default=None, type=int)
+parser.add_argument('--ssl', default='contrastive', help='self-supervised task')
+parser.add_argument('--temperature', default=0.5, type=float)
+parser.add_argument('--align_ext', action='store_true')
+parser.add_argument('--align_ssh', action='store_true')
+parser.add_argument('--fix_ssh', action='store_true')
+parser.add_argument('--with_ssl', action='store_true', default=False)
+parser.add_argument('--with_shot', action='store_true', default=False)
+parser.add_argument('--without_global', action='store_true', default=False)
+parser.add_argument('--without_mixture', action='store_true', default=False)
+parser.add_argument('--filter', default="ours", choices=['ours', 'posterior', 'none'])
+parser.add_argument('--model', default='resnet50', help='resnet50')
+parser.add_argument('--seed', default=0, type=int)
+
+
+args = parser.parse_args()
+
+print(args)
+
+my_makedir(args.outf)
+
+torch.manual_seed(args.seed)
+random.seed(args.seed)
+np.random.seed(args.seed)
+torch.cuda.manual_seed(args.seed)
+torch.cuda.manual_seed_all(args.seed)
+
+cudnn.benchmark = True
+
+# -------------------------------
+
+net, ext, head, ssh, classifier = build_resnet50(args)
+_, teloader = prepare_test_data(args)
+
+# -------------------------------
+
+args.batch_size = min(args.batch_size, args.num_sample)
+args.batch_size_align = min(args.batch_size_align, args.num_sample)
+
+args_align = copy.deepcopy(args)
+args_align.ssl = None
+args_align.batch_size = args.batch_size_align
+
+_, tr_dataloader = prepare_train_data(args, args.num_sample)
+
+_, trloader_extra = prepare_test_data(args_align, ttt=True, num_sample=args.num_sample)
+trloader_extra_iter = iter(trloader_extra)
+
+# -------------------------------
+
+print('Resuming from %s...' %(args.resume))
+
+load_resnet50(net, head, ssh, classifier, args)
+
+if torch.cuda.device_count() > 1:
+    ext = torch.nn.DataParallel(ext)
+
+# ----------- Test ------------
+
+all_err_cls = []
+all_err_ssh = []
+
+print('Running...')
+
+if args.fix_ssh:
+    optimizer = optim.SGD(ext.parameters(), lr=args.lr, momentum=0.9)
+else:
+    optimizer = optim.SGD(ssh.parameters(), lr=args.lr, momentum=0.9)
+
+scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer,
+    'min', factor=0.5, patience=10, cooldown=10,
+    threshold=0.0001, threshold_mode='rel', min_lr=0.0001, verbose=True)
+
+criterion = SupConLoss(temperature=args.temperature).cuda()
+# -------------------------------
+
+class_num = 10 if args.dataset == 'cifar10' else 100
+
+# ----------- Offline Feature Summarization ------------
+_, offlineloader = prepare_train_data(args_align)
+
+ext_src_mu, ext_src_cov, ssh_src_mu, ssh_src_cov, mu_src_ext, cov_src_ext, mu_src_ssh, cov_src_ssh = offline(offlineloader, ext, classifier, head, class_num)
+bias = cov_src_ext.max().item() / 30.
+bias2 = cov_src_ssh.max().item() / 30.
+template_ext_cov = torch.eye(2048).cuda() * bias
+template_ssh_cov = torch.eye(128).cuda() * bias2
+
+print('Error (%)\t\ttest')
+err_cls = test(teloader, net)[0]
+print(('Epoch %d:' %(0)).ljust(24) +
+            '%.2f\t\t' %(err_cls*100))
+
+
+# ----------- Improved Test-time Training ------------
+
+ext_src_mu = torch.stack(ext_src_mu)
+ext_src_cov = torch.stack(ext_src_cov) + template_ext_cov[None, :, :]
+
+source_component_distribution = torch.distributions.MultivariateNormal(ext_src_mu, ext_src_cov)
+target_compoent_distribution = torch.distributions.MultivariateNormal(ext_src_mu, ext_src_cov)
+
+is_both_activated=False
+sample_predict_ema_logit = torch.zeros(len(tr_dataloader.dataset), class_num, dtype=torch.float)
+sample_predict_alpha = torch.ones(len(tr_dataloader.dataset), dtype=torch.float)
+ema_alpha = 0.9
+
+ema_n = torch.zeros(class_num).cuda()
+ema_ext_mu = ext_src_mu.clone()
+ema_ext_cov = ext_src_cov.clone()
+
+ema_ext_total_mu = torch.zeros(2048).float()
+ema_ext_total_cov = torch.zeros(2048, 2048).float()
+
+ema_ssh_total_mu = torch.zeros(128).float()
+ema_ssh_total_cov = torch.zeros(128, 128).float()
+
+
+ema_total_n = 0.
+if class_num == 10:
+    ema_length = 128
+    epoch_bias = 0
+else: 
+    ema_length = 64
+    epoch_bias = 10
+
+if class_num == 10:
+    loss_scale = 0.05
+else:
+    loss_scale = 0.5
+
+for epoch in range(1, args.nepoch+1):
+    tic = time.time()
+
+    if args.fix_ssh:
+        head.eval()
+    else:
+        head.train()
+    ext.train()
+    classifier.eval()
+
+    sample_predict_alpha = torch.where(sample_predict_alpha < 1, sample_predict_alpha + 0.2, torch.ones_like(sample_predict_alpha))
+
+    for batch_idx, (inputs, labels) in enumerate(tr_dataloader):
+        optimizer.zero_grad()
+
+        if args.with_ssl:
+            images = torch.cat([inputs[0], inputs[1]], dim=0)
+            images = images.cuda(non_blocking=True)
+            indexes = inputs[-1]
+            bsz = labels.shape[0]
+            backbone_features = ext(images)
+            features = F.normalize(head(backbone_features), dim=1)
+            f1, f2 = torch.split(features, [bsz, bsz], dim=0)
+            features = torch.cat([f1.unsqueeze(1), f2.unsqueeze(1)], dim=1)
+            loss = criterion(features)
+            loss.backward()
+            del loss
+
+        if is_both_activated:
+            loss = 0.
+            try:
+                inputs, labels = next(trloader_extra_iter)
+            except StopIteration:
+                del trloader_extra_iter
+                trloader_extra_iter = iter(trloader_extra)
+                inputs, labels = next(trloader_extra_iter)
+
+            inputs, indexes = inputs
+            inputs = inputs.cuda()
+
+            feat_ext = ext(inputs)
+            logit = classifier(feat_ext)
+            feat_ssh = head(feat_ext)
+
+            with torch.no_grad():
+                ext.eval()
+                origin_images = inputs
+                origin_image_index = indexes
+                predict_logit = net(origin_images)
+                softmax_logit = predict_logit.softmax(dim=1).cpu()
+
+                old_logit = sample_predict_ema_logit[origin_image_index, :]
+                max_val, max_pos = softmax_logit.max(dim=1)
+                old_max_val = old_logit[torch.arange(max_pos.shape[0]), max_pos]
+                accept_mask = max_val > (old_max_val - 0.001)
+
+                sample_predict_alpha[origin_image_index] = torch.where(accept_mask, sample_predict_alpha[origin_image_index], torch.zeros_like(accept_mask).float())
+
+                sample_predict_ema_logit[origin_image_index, :] = \
+                    torch.where(sample_predict_ema_logit[origin_image_index, :] == torch.zeros(class_num), \
+                                softmax_logit, \
+                                (1 - ema_alpha) * sample_predict_ema_logit[origin_image_index, :] + ema_alpha * softmax_logit)
+                
+                pro, pseudo_label = sample_predict_ema_logit[origin_image_index].max(dim=1)
+                ext.train()
+                del predict_logit
+
+            if args.filter == 'ours':
+                pseudo_label_mask = (sample_predict_alpha[origin_image_index] == 1) & (pro > 0.9)
+                feat_ext2 = feat_ext[pseudo_label_mask]
+                feat_ssh2 = feat_ssh[pseudo_label_mask]
+                pseudo_label2 = pseudo_label[pseudo_label_mask].cuda()
+            elif args.filter == 'none':
+                feat_ext2 = feat_ext
+                feat_ssh2 = feat_ssh
+                pseudo_label2 = pseudo_label.cuda()
+            elif args.filter == 'posterior':
+                with torch.no_grad():
+                    posterior = target_compoent_distribution.log_prob(feat_ext[:, None, :]) # log prob
+                    posterior_tmp = posterior.max(dim=1, keepdim=True)[0] - math.log((2 ** 127) / 10) # B, K
+                    posterior -= posterior_tmp
+                    posterior = posterior.exp() # prob / exp(posterior_tmp)
+                    posterior /= posterior.sum(dim=1, keepdim=True)
+                    posterior = posterior.transpose(0, 1).detach()  # K, N
+            else:
+                raise Exception("%s filter type has not yet been implemented." % args.filter)
+
+
+            if args.align_ext:
+                if not args.without_mixture:
+                    # Mixture Gaussian
+                    if args.filter != 'posterior':
+                        for label in pseudo_label2.unique():
+                            feat_ext_per_category = feat_ext2[pseudo_label2 == label, :]
+
+                            b = feat_ext_per_category.shape[0]
+                            ema_n[label] += b
+                            alpha = 1. / ema_length if ema_n[label] > ema_length else 1. / ema_n[label]
+
+                            ema_ext_mu_that = ema_ext_mu[label, :]
+                            ema_ext_cov_that = ema_ext_cov[label, :, :]
+                            delta_pre = feat_ext_per_category - ema_ext_mu_that
+
+                            delta = alpha * delta_pre.sum(dim=0)
+                            tmp_mu = ema_ext_mu_that + delta
+                            tmp_cov = ema_ext_cov_that + alpha * (delta_pre.t() @ delta_pre - b * ema_ext_cov_that) - delta[:, None] @ delta[None, :]
+
+                            with torch.no_grad():
+                                ema_ext_mu[label, :] = tmp_mu.detach()
+                                ema_ext_cov[label, :, :] = tmp_cov.detach()
+
+                            if epoch > epoch_bias:
+                                source_domain = torch.distributions.MultivariateNormal(ext_src_mu[label, :], ext_src_cov[label, :, :] + template_ext_cov)
+                                target_domain = torch.distributions.MultivariateNormal(tmp_mu, tmp_cov + template_ext_cov)
+                                loss += (torch.distributions.kl_divergence(source_domain, target_domain) + torch.distributions.kl_divergence(target_domain, source_domain)) * loss_scale / class_num
+                    else:
+                        feat_ext2_categories = feat_ext[None, :, :].expand(class_num, -1, -1) # K, N, D
+                        num_categories = posterior # K, N
+                        ema_n += num_categories.sum(dim=1) # K
+                        alpha = torch.where(ema_n > ema_length, torch.ones(class_num, dtype=torch.float).cuda() / ema_length, 1. / (ema_n + 1e-10))
+                        
+                        delta_pre = (feat_ext2_categories - ema_ext_mu[:, None, :]) * num_categories[:, :, None] # K, N, D
+                        delta = alpha[:, None] * delta_pre.sum(dim=1) # K, D
+                        new_component_mean = ema_ext_mu + delta
+                        new_component_cov = ema_ext_cov \
+                                            + alpha[:, None, None] * ((delta_pre.permute(0, 2, 1) @ delta_pre) - num_categories.sum(dim=1)[:, None, None] * ema_ext_cov) \
+                                            - delta[:, :, None] @ delta[:, None, :]
+
+                        with torch.no_grad():
+                            ema_ext_mu = new_component_mean.detach()
+                            ema_ext_cov = new_component_cov.detach()
+                        
+                        if epoch > epoch_bias:
+                            target_compoent_distribution.loc = new_component_mean
+                            target_compoent_distribution.covariance_matrix = new_component_cov + template_ext_cov
+                            target_compoent_distribution._unbroadcasted_scale_tril = torch.linalg.cholesky(new_component_cov + template_ext_cov)
+                            loss += (torch.distributions.kl_divergence(source_component_distribution, target_compoent_distribution) \
+                                    + torch.distributions.kl_divergence(target_compoent_distribution, source_component_distribution)).mean() * loss_scale
+
+                if not args.without_global:
+                    # Global Gaussian
+                    b = feat_ext.shape[0]
+                    ema_total_n += b
+                    alpha = 1. / 1280 if ema_total_n > 1280 else 1. / ema_total_n
+                    delta_pre = (feat_ext - ema_ext_total_mu.cuda())
+                    delta = alpha * delta_pre.sum(dim=0)
+                    tmp_mu = ema_ext_total_mu.cuda() + delta
+                    tmp_cov = ema_ext_total_cov.cuda() + alpha * (delta_pre.t() @ delta_pre - b * ema_ext_total_cov.cuda()) - delta[:, None] @ delta[None, :]
+                    with torch.no_grad():
+                        ema_ext_total_mu = tmp_mu.detach().cpu()
+                        ema_ext_total_cov = tmp_cov.detach().cpu()
+
+                    source_domain = torch.distributions.MultivariateNormal(mu_src_ext, cov_src_ext + template_ext_cov)
+                    target_domain = torch.distributions.MultivariateNormal(tmp_mu, tmp_cov + template_ext_cov)
+                    loss += (torch.distributions.kl_divergence(source_domain, target_domain) + torch.distributions.kl_divergence(target_domain, source_domain)) * loss_scale
+
+                if args.without_mixture and args.without_global:
+                    logit2 = logit[pseudo_label_mask.cuda()]
+                    loss += F.cross_entropy(logit2, pseudo_label2) * loss_scale * 2
+
+            if args.align_ssh:  
+                b = feat_ssh.shape[0]
+                alpha = 1. / 1280 if ema_total_n > 1280 else 1. / ema_total_n
+                delta_pre = (feat_ssh - ema_ssh_total_mu.cuda())
+                delta = alpha * delta_pre.sum(dim=0)
+                tmp_mu = ema_ssh_total_mu.cuda() + delta
+                tmp_cov = ema_ssh_total_cov.cuda() + alpha * (delta_pre.t() @ delta_pre - b * ema_ssh_total_cov.cuda()) - delta[:, None] @ delta[None, :]
+
+                with torch.no_grad():
+                    ema_ssh_total_mu = tmp_mu.detach().cpu()
+                    ema_ssh_total_cov = tmp_cov.detach().cpu()
+                source_domain = torch.distributions.MultivariateNormal(mu_src_ssh, cov_src_ssh + template_ssh_cov)
+                target_domain = torch.distributions.MultivariateNormal(tmp_mu, tmp_cov + template_ssh_cov)
+                loss += (torch.distributions.kl_divergence(source_domain, target_domain) + torch.distributions.kl_divergence(target_domain, source_domain)) * loss_scale
+            
+                
+            if args.with_shot:
+                ent_loss = softmax_entropy(logit).mean(0)
+                softmax_out = F.softmax(logit, dim=-1)
+                msoftmax = softmax_out.mean(dim=0)
+                ent_loss += torch.sum(msoftmax * torch.log(msoftmax + 1e-5))
+                loss += ent_loss * loss_scale * 2
+
+            try:
+                loss.backward()
+            except:
+                pass
+            finally:
+                del loss
+
+        if epoch > args.bnepoch:
+            optimizer.step()
+            optimizer.zero_grad()
+
+    err_cls = test(teloader, net)[0]
+    all_err_cls.append(err_cls)
+
+    toc = time.time()
+    print(('Epoch %d/%d (%.0fs):' %(epoch, args.nepoch, toc-tic)).ljust(24) +
+                    '%.2f\t\t' %(err_cls*100))
+    
+    # both components
+    if not is_both_activated and epoch > args.bnepoch:
+        is_both_activated = True
+
+    # termination
+    if epoch > (args.stopepoch + 1) and all_err_cls[-args.stopepoch] < min(all_err_cls[-args.stopepoch+1:]):
+        print("{} Termination: {:.2f}".format(args.corruption, all_err_cls[-args.stopepoch]*100))
+        break
+
+    # save
+    if epoch > args.bnepoch and len(all_err_cls) > 2 and all_err_cls[-1] < min(all_err_cls[:-1]):
+        state = {'net': net.state_dict(), 'head': head.state_dict()}
+        save_file = os.path.join(args.outf, args.corruption + '.pth')
+        torch.save(state, save_file)
+        print('Save model to', save_file)
+
+    # lr decay
+    scheduler.step(err_cls)
+
+
+File Path: cifar/TTAC_onepass.py
+Content:
+import argparse
+
+import torch
+import torch.optim as optim
+import torch.nn.functional as F
+import torch.utils.data as data
+
+from utils.misc import *
+from utils.test_helpers import *
+from utils.prepare_dataset import *
+
+# ----------------------------------
+import copy
+import math
+import random
+import numpy as np
+import torch.backends.cudnn as cudnn
+
+from offline import *
+from utils.contrastive import *
+
+# ----------------------------------
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--dataset', default='cifar10')
+parser.add_argument('--dataroot', default="./data")
+parser.add_argument('--batch_size', default=128, type=int)
+parser.add_argument('--batch_size_align', default=512, type=int)
+parser.add_argument('--workers', default=0, type=int)
+parser.add_argument('--num_sample', default=1000000, type=int)
+parser.add_argument('--lr', default=0.001, type=float)
+parser.add_argument('--iters', default=4, type=int)
+parser.add_argument('--outf', default='.')
+parser.add_argument('--level', default=5, type=int)
+parser.add_argument('--corruption', default='snow')
+parser.add_argument('--resume', default=None, help='directory of pretrained model')
+parser.add_argument('--ckpt', default=None, type=int)
+parser.add_argument('--ssl', default='contrastive', help='self-supervised task')
+parser.add_argument('--temperature', default=0.5, type=float)
+parser.add_argument('--align_ext', action='store_true')
+parser.add_argument('--align_ssh', action='store_true')
+parser.add_argument('--fix_ssh', action='store_true')
+parser.add_argument('--with_ssl', action='store_true', default=False)
+parser.add_argument('--with_shot', action='store_true', default=False)
+parser.add_argument('--without_global', action='store_true', default=False)
+parser.add_argument('--without_mixture', action='store_true', default=False)
+parser.add_argument('--filter', default="ours", choices=['ours', 'posterior', 'none'])
+parser.add_argument('--model', default='resnet50', help='resnet50')
+parser.add_argument('--seed', default=0, type=int)
+
+
+args = parser.parse_args()
+
+print(args)
+
+my_makedir(args.outf)
+
+torch.manual_seed(args.seed)
+random.seed(args.seed)
+np.random.seed(args.seed)
+torch.cuda.manual_seed(args.seed)
+torch.cuda.manual_seed_all(args.seed)
+
+cudnn.benchmark = True
+
+# -------------------------------
+
+net, ext, head, ssh, classifier = build_resnet50(args)
+_, teloader = prepare_test_data(args)
+
+# -------------------------------
+
+args.batch_size = min(args.batch_size, args.num_sample)
+args.batch_size_align = min(args.batch_size_align, args.num_sample)
+
+args_align = copy.deepcopy(args)
+args_align.ssl = None
+args_align.batch_size = args.batch_size_align
+
+tr_dataset, _ = prepare_train_data(args, args.num_sample)
+
+tr_dataset_extra, _ = prepare_test_data(args_align, ttt=True, num_sample=args.num_sample)
+
+# -------------------------------
+
+print('Resuming from %s...' %(args.resume))
+
+load_resnet50(net, head, ssh, classifier, args)
+
+if torch.cuda.device_count() > 1:
+    ext = torch.nn.DataParallel(ext)
+
+# ----------- Test ------------
+
+all_err_cls = []
+all_err_ssh = []
+
+print('Running...')
+
+if args.fix_ssh:
+    optimizer = optim.SGD(ext.parameters(), lr=args.lr, momentum=0.9)
+else:
+    optimizer = optim.SGD(ssh.parameters(), lr=args.lr, momentum=0.9)
+
+criterion = SupConLoss(temperature=args.temperature).cuda()
+# -------------------------------
+
+class_num = 10 if args.dataset == 'cifar10' else 100
+
+# ----------- Offline Feature Summarization ------------
+_, offlineloader = prepare_train_data(args_align)
+
+ext_src_mu, ext_src_cov, ssh_src_mu, ssh_src_cov, mu_src_ext, cov_src_ext, mu_src_ssh, cov_src_ssh = offline(offlineloader, ext, classifier, head, class_num)
+bias = cov_src_ext.max().item() / 30.
+bias2 = cov_src_ssh.max().item() / 30.
+template_ext_cov = torch.eye(2048).cuda() * bias
+template_ssh_cov = torch.eye(128).cuda() * bias2
+
+print('Error (%)\t\ttest')
+err_cls = test(teloader, net)[0]
+print(('Epoch %d:' %(0)).ljust(24) +
+            '%.2f\t\t' %(err_cls*100))
+
+
+# ----------- Improved Test-time Training ------------
+
+ext_src_mu = torch.stack(ext_src_mu)
+ext_src_cov = torch.stack(ext_src_cov) + template_ext_cov[None, :, :]
+
+source_component_distribution = torch.distributions.MultivariateNormal(ext_src_mu, ext_src_cov)
+target_compoent_distribution = torch.distributions.MultivariateNormal(ext_src_mu, ext_src_cov)
+
+sample_predict_ema_logit = torch.zeros(len(tr_dataset), class_num, dtype=torch.float)
+sample_predict_alpha = torch.ones(len(tr_dataset), dtype=torch.float)
+ema_alpha = 0.9
+
+ema_n = torch.zeros(class_num).cuda()
+ema_ext_mu = ext_src_mu.clone()
+ema_ext_cov = ext_src_cov.clone()
+
+ema_ext_total_mu = torch.zeros(2048).float()
+ema_ext_total_cov = torch.zeros(2048, 2048).float()
+
+ema_ssh_total_mu = torch.zeros(128).float()
+ema_ssh_total_cov = torch.zeros(128, 128).float()
+
+
+ema_total_n = 0.
+if class_num == 10:
+    ema_length = 128
+    mini_batch_length = 4096
+else: 
+    ema_length = 64
+    mini_batch_length = 4096
+
+if class_num == 10:
+    loss_scale = 0.05
+else:
+    loss_scale = 0.5
+
+mini_batch_indices = []
+
+correct = []
+for te_batch_idx, (te_inputs, te_labels) in enumerate(teloader):
+    mini_batch_indices.extend(te_inputs[-1].tolist())
+    mini_batch_indices = mini_batch_indices[-mini_batch_length:]
+    print('mini_batch_length:', len(mini_batch_indices))
+    try:
+        del tr_dataset_subset
+        del tr_dataloader
+        del tr_dataset_extra_subset
+        del tr_extra_dataloader
+    except:
+        pass
+    tr_dataset_subset = data.Subset(tr_dataset, mini_batch_indices)
+    tr_dataloader = data.DataLoader(tr_dataset_subset, batch_size=args.batch_size,
+                                        shuffle=True, num_workers=args.workers,
+                                        worker_init_fn=seed_worker, pin_memory=True, drop_last=True)
+    tr_dataset_extra_subset = data.Subset(tr_dataset_extra, mini_batch_indices)
+    tr_extra_dataloader = data.DataLoader(tr_dataset_extra_subset, batch_size=args.batch_size_align,
+                                        shuffle=True, num_workers=args.workers,
+                                        worker_init_fn=seed_worker, pin_memory=True, drop_last=False)
+    try:
+        del tr_extra_dataloader_iter
+        tr_extra_dataloader_iter = iter(tr_extra_dataloader)
+    except:
+        tr_extra_dataloader_iter = iter(tr_extra_dataloader)
+
+    if args.fix_ssh:
+        head.eval()
+    else:
+        head.train()
+    ext.train()
+    classifier.eval()
+
+    for iter_id in range(min(args.iters, int(len(mini_batch_indices) / 256) + 1) + 1):
+        if iter_id > 0:
+            sample_predict_alpha = torch.where(sample_predict_alpha < 1, sample_predict_alpha + 0.2, torch.ones_like(sample_predict_alpha))
+
+        for batch_idx, (inputs, labels) in enumerate(tr_dataloader):
+            optimizer.zero_grad()
+
+            if args.with_ssl:
+                images = torch.cat([inputs[0], inputs[1]], dim=0)
+                images = images.cuda(non_blocking=True)
+                indexes = inputs[-1]
+                bsz = labels.shape[0]
+                backbone_features = ext(images)
+                features = F.normalize(head(backbone_features), dim=1)
+                f1, f2 = torch.split(features, [bsz, bsz], dim=0)
+                features = torch.cat([f1.unsqueeze(1), f2.unsqueeze(1)], dim=1)
+                loss = criterion(features)
+                loss.backward()
+                del loss
+
+            if iter_id > 0:
+                loss = 0.
+                try:
+                    inputs, labels = next(tr_extra_dataloader_iter)
+                except StopIteration:
+                    del tr_extra_dataloader_iter
+                    tr_extra_dataloader_iter = iter(tr_extra_dataloader)
+                    inputs, labels = next(tr_extra_dataloader_iter)
+
+                inputs, indexes = inputs
+                inputs = inputs.cuda()
+
+                feat_ext = ext(inputs)
+                logit = classifier(feat_ext)
+                feat_ssh = head(feat_ext)
+
+                with torch.no_grad():
+                    ext.eval()
+                    origin_images = inputs
+                    origin_image_index = indexes
+                    predict_logit = net(origin_images)
+                    softmax_logit = predict_logit.softmax(dim=1).cpu()
+
+                    old_logit = sample_predict_ema_logit[origin_image_index, :]
+                    max_val, max_pos = softmax_logit.max(dim=1)
+                    old_max_val = old_logit[torch.arange(max_pos.shape[0]), max_pos]
+                    accept_mask = max_val > (old_max_val - 0.001)
+
+                    sample_predict_alpha[origin_image_index] = torch.where(accept_mask, sample_predict_alpha[origin_image_index], torch.zeros_like(accept_mask).float())
+
+                    sample_predict_ema_logit[origin_image_index, :] = \
+                        torch.where(sample_predict_ema_logit[origin_image_index, :] == torch.zeros(class_num), \
+                                    softmax_logit, \
+                                    (1 - ema_alpha) * sample_predict_ema_logit[origin_image_index, :] + ema_alpha * softmax_logit)
+                    
+                    pro, pseudo_label = sample_predict_ema_logit[origin_image_index].max(dim=1)
+                    ext.train()
+                    del predict_logit
+
+                if args.filter == 'ours':
+                    pseudo_label_mask = (sample_predict_alpha[origin_image_index] == 1) & (pro > 0.9)
+                    feat_ext2 = feat_ext[pseudo_label_mask]
+                    feat_ssh2 = feat_ssh[pseudo_label_mask]
+                    pseudo_label2 = pseudo_label[pseudo_label_mask].cuda()
+                elif args.filter == 'none':
+                    feat_ext2 = feat_ext
+                    feat_ssh2 = feat_ssh
+                    pseudo_label2 = pseudo_label.cuda()
+                elif args.filter == 'posterior':
+                    with torch.no_grad():
+                        posterior = target_compoent_distribution.log_prob(feat_ext[:, None, :]) # log prob
+                        posterior_tmp = posterior.max(dim=1, keepdim=True)[0] - math.log((2 ** 127) / 10) # B, K
+                        posterior -= posterior_tmp
+                        posterior = posterior.exp() # prob / exp(posterior_tmp)
+                        posterior /= posterior.sum(dim=1, keepdim=True)
+                        posterior = posterior.transpose(0, 1).detach()  # K, N
+                else:
+                    raise Exception("%s filter type has not yet been implemented." % args.filter)
+
+
+                if args.align_ext:
+                    if not args.without_mixture:
+                        # Mixture Gaussian
+                        if args.filter != 'posterior':
+                            b, d = feat_ext2.shape
+                            feat_ext2_categories = torch.zeros(class_num, b, d).cuda() # K, N, D
+                            feat_ext2_categories.scatter_add_(dim=0, index=pseudo_label2[None, :, None].expand(-1, -1, d), src=feat_ext2[None, :, :])
+
+                            num_categories = torch.zeros(class_num, b, dtype=torch.int).cuda() # K, N
+                            num_categories.scatter_add_(dim=0, index=pseudo_label2[None, :], src=torch.ones_like(pseudo_label2[None, :], dtype=torch.int))
+
+                            ema_n += num_categories.sum(dim=1) # K
+                            alpha = torch.where(ema_n > ema_length, torch.ones(class_num, dtype=torch.float).cuda() / ema_length, 1. / (ema_n + 1e-10))
+
+                            delta_pre = (feat_ext2_categories - ema_ext_mu[:, None, :]) * num_categories[:, :, None] # K, N, D
+                            delta = alpha[:, None] * delta_pre.sum(dim=1) # K, D
+                            new_component_mean = ema_ext_mu + delta
+                            new_component_cov = ema_ext_cov \
+                                                + alpha[:, None, None] * ((delta_pre.permute(0, 2, 1) @ delta_pre) - num_categories.sum(dim=1)[:, None, None] * ema_ext_cov) \
+                                                - delta[:, :, None] @ delta[:, None, :]
+
+                            with torch.no_grad():
+                                ema_ext_mu = new_component_mean.detach()
+                                ema_ext_cov = new_component_cov.detach()
+
+                            if (class_num == 10 or len(mini_batch_indices) >= 4096) and (iter_id > int(args.iters / 2) or args.filter == 'none'):
+                                target_compoent_distribution.loc = new_component_mean
+                                target_compoent_distribution.covariance_matrix = new_component_cov + template_ext_cov
+                                target_compoent_distribution._unbroadcasted_scale_tril = torch.linalg.cholesky(new_component_cov + template_ext_cov)
+                                loss += (torch.distributions.kl_divergence(source_component_distribution, target_compoent_distribution) \
+                                        + torch.distributions.kl_divergence(target_compoent_distribution, source_component_distribution)).mean() * loss_scale
+                        else:
+                            feat_ext2_categories = feat_ext[None, :, :].expand(class_num, -1, -1) # K, N, D
+                            num_categories = posterior # K, N
+                            ema_n += num_categories.sum(dim=1) # K
+                            alpha = torch.where(ema_n > ema_length, torch.ones(class_num, dtype=torch.float).cuda() / ema_length, 1. / (ema_n + 1e-10))
+                            
+                            delta_pre = (feat_ext2_categories - ema_ext_mu[:, None, :]) * num_categories[:, :, None] # K, N, D
+                            delta = alpha[:, None] * delta_pre.sum(dim=1) # K, D
+                            new_component_mean = ema_ext_mu + delta
+                            new_component_cov = ema_ext_cov \
+                                                + alpha[:, None, None] * ((delta_pre.permute(0, 2, 1) @ delta_pre) - num_categories.sum(dim=1)[:, None, None] * ema_ext_cov) \
+                                                - delta[:, :, None] @ delta[:, None, :]
+
+                            with torch.no_grad():
+                                ema_ext_mu = new_component_mean.detach()
+                                ema_ext_cov = new_component_cov.detach()
+
+                            if (class_num == 10 or len(mini_batch_indices) >= 4096) and iter_id > int(args.iters / 2):
+                                target_compoent_distribution.loc = new_component_mean
+                                target_compoent_distribution.covariance_matrix = new_component_cov + template_ext_cov
+                                target_compoent_distribution._unbroadcasted_scale_tril = torch.linalg.cholesky(new_component_cov + template_ext_cov)
+                                loss += (torch.distributions.kl_divergence(source_component_distribution, target_compoent_distribution) \
+                                        + torch.distributions.kl_divergence(target_compoent_distribution, source_component_distribution)).mean() * loss_scale
+
+                    if not args.without_global:
+                        # Global Gaussian
+                        b = feat_ext.shape[0]
+                        ema_total_n += b
+                        alpha = 1. / 1280 if ema_total_n > 1280 else 1. / ema_total_n
+                        delta_pre = (feat_ext - ema_ext_total_mu.cuda())
+                        delta = alpha * delta_pre.sum(dim=0)
+                        tmp_mu = ema_ext_total_mu.cuda() + delta
+                        tmp_cov = ema_ext_total_cov.cuda() + alpha * (delta_pre.t() @ delta_pre - b * ema_ext_total_cov.cuda()) - delta[:, None] @ delta[None, :]
+                        with torch.no_grad():
+                            ema_ext_total_mu = tmp_mu.detach().cpu()
+                            ema_ext_total_cov = tmp_cov.detach().cpu()
+
+                        source_domain = torch.distributions.MultivariateNormal(mu_src_ext, cov_src_ext + template_ext_cov)
+                        target_domain = torch.distributions.MultivariateNormal(tmp_mu, tmp_cov + template_ext_cov)
+                        loss += (torch.distributions.kl_divergence(source_domain, target_domain) + torch.distributions.kl_divergence(target_domain, source_domain)) * loss_scale
+
+                    if args.without_mixture and args.without_global:
+                        logit2 = logit[pseudo_label_mask.cuda()]
+                        loss += F.cross_entropy(logit2, pseudo_label2) * loss_scale * 2
+
+
+                if args.align_ssh:  
+                    b = feat_ssh.shape[0]
+                    alpha = 1. / 1280 if ema_total_n > 1280 else 1. / ema_total_n
+                    delta_pre = (feat_ssh - ema_ssh_total_mu.cuda())
+                    delta = alpha * delta_pre.sum(dim=0)
+                    tmp_mu = ema_ssh_total_mu.cuda() + delta
+                    tmp_cov = ema_ssh_total_cov.cuda() + alpha * (delta_pre.t() @ delta_pre - b * ema_ssh_total_cov.cuda()) - delta[:, None] @ delta[None, :]
+
+                    with torch.no_grad():
+                        ema_ssh_total_mu = tmp_mu.detach().cpu()
+                        ema_ssh_total_cov = tmp_cov.detach().cpu()
+                    source_domain = torch.distributions.MultivariateNormal(mu_src_ssh, cov_src_ssh + template_ssh_cov)
+                    target_domain = torch.distributions.MultivariateNormal(tmp_mu, tmp_cov + template_ssh_cov)
+                    loss += (torch.distributions.kl_divergence(source_domain, target_domain) + torch.distributions.kl_divergence(target_domain, source_domain)) * loss_scale
+            
+                
+                if args.with_shot:
+                    ent_loss = softmax_entropy(logit).mean(0)
+                    softmax_out = F.softmax(logit, dim=-1)
+                    msoftmax = softmax_out.mean(dim=0)
+                    ent_loss += torch.sum(msoftmax * torch.log(msoftmax + 1e-5))
+                    loss += ent_loss * loss_scale * 2
+
+                try:
+                    loss.backward()
+                except:
+                    pass
+                finally:
+                    del loss
+
+            if iter_id > 0:
+                optimizer.step()
+                optimizer.zero_grad()
+
+    #### Test ####
+    net.eval()
+    with torch.no_grad():
+        outputs = net(te_inputs[0].cuda())
+        _, predicted = outputs.max(1)
+        correct.append(predicted.cpu().eq(te_labels))
+    print('real time error:', 1 - torch.cat(correct).numpy().mean())
+    net.train()
+
+print(args.corruption, 'Test time training result:', 1 - torch.cat(correct).numpy().mean())
+File Path: cifar/TTAC_onepass2.py
+Content:
+import argparse
+
+import torch
+import torch.optim as optim
+import torch.nn.functional as F
+import torch.utils.data as data
+
+from utils.misc import *
+from utils.test_helpers import *
+from utils.prepare_dataset import *
+
+# ----------------------------------
+import copy
+import math
+import random
+import numpy as np
+import torch.backends.cudnn as cudnn
+
+from offline import *
+from utils.contrastive import *
+
+# ----------------------------------
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--dataset', default='cifar10')
+parser.add_argument('--dataroot', default="./data")
+parser.add_argument('--batch_size', default=128, type=int)
+parser.add_argument('--batch_size_align', default=512, type=int)
+parser.add_argument('--workers', default=0, type=int)
+parser.add_argument('--num_sample', default=1000000, type=int)
+parser.add_argument('--lr', default=0.001, type=float)
+parser.add_argument('--iters', default=4, type=int)
+parser.add_argument('--outf', default='.')
+parser.add_argument('--level', default=5, type=int)
+parser.add_argument('--corruption', default='snow')
+parser.add_argument('--resume', default=None, help='directory of pretrained model')
+parser.add_argument('--ckpt', default=None, type=int)
+parser.add_argument('--ssl', default='contrastive', help='self-supervised task')
+parser.add_argument('--temperature', default=0.5, type=float)
+parser.add_argument('--align_ext', action='store_true')
+parser.add_argument('--align_ssh', action='store_true')
+parser.add_argument('--fix_ssh', action='store_true')
+parser.add_argument('--with_ssl', action='store_true', default=False)
+parser.add_argument('--with_shot', action='store_true', default=False)
+parser.add_argument('--without_global', action='store_true', default=False)
+parser.add_argument('--without_mixture', action='store_true', default=False)
+parser.add_argument('--filter', default="ours", choices=['ours', 'posterior', 'none'])
+parser.add_argument('--model', default='resnet50', help='resnet50')
+parser.add_argument('--seed', default=0, type=int)
+
+
+args = parser.parse_args()
+
+print(args)
+
+my_makedir(args.outf)
+
+torch.manual_seed(args.seed)
+random.seed(args.seed)
+np.random.seed(args.seed)
+torch.cuda.manual_seed(args.seed)
+torch.cuda.manual_seed_all(args.seed)
+
+cudnn.benchmark = True
+
+# -------------------------------
+
+net, ext, head, ssh, classifier = build_resnet50(args)
+_, teloader = prepare_test_data(args)
+
+# -------------------------------
+
+args.batch_size = min(args.batch_size, args.num_sample)
+args.batch_size_align = min(args.batch_size_align, args.num_sample)
+
+args_align = copy.deepcopy(args)
+args_align.ssl = None
+args_align.batch_size = args.batch_size_align
+
+tr_dataset, _ = prepare_train_data(args, args.num_sample)
+
+tr_dataset_extra, _ = prepare_test_data(args_align, ttt=True, num_sample=args.num_sample)
+
+# -------------------------------
+
+print('Resuming from %s...' %(args.resume))
+
+load_resnet50(net, head, ssh, classifier, args)
+
+if torch.cuda.device_count() > 1:
+    ext = torch.nn.DataParallel(ext)
+
+# ----------- Test ------------
+
+all_err_cls = []
+all_err_ssh = []
+
+print('Running...')
+
+if args.fix_ssh:
+    optimizer = optim.SGD(ext.parameters(), lr=args.lr, momentum=0.9)
+else:
+    optimizer = optim.SGD(ssh.parameters(), lr=args.lr, momentum=0.9)
+
+criterion = SupConLoss(temperature=args.temperature).cuda()
+# -------------------------------
+
+class_num = 10 if args.dataset == 'cifar10' else 100
+
+# ----------- Offline Feature Summarization ------------
+_, offlineloader = prepare_train_data(args_align)
+
+ext_src_mu, ext_src_cov, ssh_src_mu, ssh_src_cov, mu_src_ext, cov_src_ext, mu_src_ssh, cov_src_ssh = offline(offlineloader, ext, classifier, head, class_num)
+bias = cov_src_ext.max().item() / 30.
+bias2 = cov_src_ssh.max().item() / 30.
+template_ext_cov = torch.eye(2048).cuda() * bias
+template_ssh_cov = torch.eye(128).cuda() * bias2
+
+print('Error (%)\t\ttest')
+err_cls = test(teloader, net)[0]
+print(('Epoch %d:' %(0)).ljust(24) +
+            '%.2f\t\t' %(err_cls*100))
+
+
+# ----------- Improved Test-time Training ------------
+
+ext_src_mu = torch.stack(ext_src_mu)
+ext_src_cov = torch.stack(ext_src_cov) + template_ext_cov[None, :, :]
+
+source_component_distribution = torch.distributions.MultivariateNormal(ext_src_mu, ext_src_cov)
+target_compoent_distribution = torch.distributions.MultivariateNormal(ext_src_mu, ext_src_cov)
+
+sample_predict_ema_logit = torch.zeros(len(tr_dataset), class_num, dtype=torch.float)
+sample_predict_alpha = torch.ones(len(tr_dataset), dtype=torch.float)
+ema_alpha = 0.9
+
+ema_n = torch.zeros(class_num).cuda()
+ema_ext_mu = ext_src_mu.clone()
+ema_ext_cov = ext_src_cov.clone()
+
+ema_ext_total_mu = torch.zeros(2048).float()
+ema_ext_total_cov = torch.zeros(2048, 2048).float()
+
+ema_ssh_total_mu = torch.zeros(128).float()
+ema_ssh_total_cov = torch.zeros(128, 128).float()
+
+
+ema_total_n = 0.
+if class_num == 10:
+    ema_length = 128
+    mini_batch_length = 4096
+else: 
+    ema_length = 64
+    mini_batch_length = 4096
+
+if class_num == 10:
+    loss_scale = 0.05
+else:
+    loss_scale = 0.5
+
+mini_batch_indices = []
+
+correct = []
+for te_batch_idx, (te_inputs, te_labels) in enumerate(teloader):
+    mini_batch_indices.extend(te_inputs[-1].tolist())
+    mini_batch_indices = mini_batch_indices[-mini_batch_length:]
+    print('mini_batch_length:', len(mini_batch_indices))
+    try:
+        del tr_dataset_subset
+        del tr_dataloader
+        del tr_dataset_extra_subset
+        del tr_extra_dataloader
+    except:
+        pass
+    tr_dataset_subset = data.Subset(tr_dataset, mini_batch_indices)
+    tr_dataloader = data.DataLoader(tr_dataset_subset, batch_size=args.batch_size,
+                                        shuffle=True, num_workers=args.workers,
+                                        worker_init_fn=seed_worker, pin_memory=True, drop_last=True)
+    tr_dataset_extra_subset = data.Subset(tr_dataset_extra, mini_batch_indices)
+    tr_extra_dataloader = data.DataLoader(tr_dataset_extra_subset, batch_size=args.batch_size_align,
+                                        shuffle=True, num_workers=args.workers,
+                                        worker_init_fn=seed_worker, pin_memory=True, drop_last=False)
+    try:
+        del tr_extra_dataloader_iter
+        tr_extra_dataloader_iter = iter(tr_extra_dataloader)
+    except:
+        tr_extra_dataloader_iter = iter(tr_extra_dataloader)
+
+    if args.fix_ssh:
+        head.eval()
+    else:
+        head.train()
+    ext.train()
+    classifier.eval()
+
+    for iter_id in range(min(args.iters, int(len(mini_batch_indices) / 256) + 1) + 1):
+        if iter_id > 0:
+            sample_predict_alpha = torch.where(sample_predict_alpha < 1, sample_predict_alpha + 0.2, torch.ones_like(sample_predict_alpha))
+
+        for batch_idx, (inputs, labels) in enumerate(tr_dataloader):
+            optimizer.zero_grad()
+
+            if args.with_ssl:
+                images = torch.cat([inputs[0], inputs[1]], dim=0)
+                images = images.cuda(non_blocking=True)
+                indexes = inputs[-1]
+                bsz = labels.shape[0]
+                backbone_features = ext(images)
+                features = F.normalize(head(backbone_features), dim=1)
+                f1, f2 = torch.split(features, [bsz, bsz], dim=0)
+                features = torch.cat([f1.unsqueeze(1), f2.unsqueeze(1)], dim=1)
+                loss = criterion(features)
+                loss.backward()
+                del loss
+
+            if iter_id > 0:
+                loss = 0.
+                try:
+                    inputs, labels = next(tr_extra_dataloader_iter)
+                except StopIteration:
+                    del tr_extra_dataloader_iter
+                    tr_extra_dataloader_iter = iter(tr_extra_dataloader)
+                    inputs, labels = next(tr_extra_dataloader_iter)
+
+                inputs, indexes = inputs
+                inputs = inputs.cuda()
+
+                feat_ext = ext(inputs)
+                logit = classifier(feat_ext)
+                feat_ssh = head(feat_ext)
+
+                with torch.no_grad():
+                    ext.eval()
+                    origin_images = inputs
+                    origin_image_index = indexes
+                    predict_logit = net(origin_images)
+                    softmax_logit = predict_logit.softmax(dim=1).cpu()
+
+                    old_logit = sample_predict_ema_logit[origin_image_index, :]
+                    max_val, max_pos = softmax_logit.max(dim=1)
+                    old_max_val = old_logit[torch.arange(max_pos.shape[0]), max_pos]
+                    accept_mask = max_val > (old_max_val - 0.001)
+
+                    sample_predict_alpha[origin_image_index] = torch.where(accept_mask, sample_predict_alpha[origin_image_index], torch.zeros_like(accept_mask).float())
+
+                    sample_predict_ema_logit[origin_image_index, :] = \
+                        torch.where(sample_predict_ema_logit[origin_image_index, :] == torch.zeros(class_num), \
+                                    softmax_logit, \
+                                    (1 - ema_alpha) * sample_predict_ema_logit[origin_image_index, :] + ema_alpha * softmax_logit)
+                    
+                    pro, pseudo_label = sample_predict_ema_logit[origin_image_index].max(dim=1)
+                    ext.train()
+                    del predict_logit
+
+                if args.filter == 'ours':
+                    pseudo_label_mask = (sample_predict_alpha[origin_image_index] == 1) & (pro > 0.9)
+                    feat_ext2 = feat_ext[pseudo_label_mask]
+                    feat_ssh2 = feat_ssh[pseudo_label_mask]
+                    pseudo_label2 = pseudo_label[pseudo_label_mask].cuda()
+                elif args.filter == 'none':
+                    feat_ext2 = feat_ext
+                    feat_ssh2 = feat_ssh
+                    pseudo_label2 = pseudo_label.cuda()
+                elif args.filter == 'posterior':
+                    with torch.no_grad():
+                        posterior = target_compoent_distribution.log_prob(feat_ext[:, None, :]) # log prob
+                        posterior_tmp = posterior.max(dim=1, keepdim=True)[0] - math.log((2 ** 127) / 10) # B, K
+                        posterior -= posterior_tmp
+                        posterior = posterior.exp() # prob / exp(posterior_tmp)
+                        posterior /= posterior.sum(dim=1, keepdim=True)
+                        posterior = posterior.transpose(0, 1).detach()  # K, N
+                else:
+                    raise Exception("%s filter type has not yet been implemented." % args.filter)
+
+
+                if args.align_ext:
+                    if not args.without_mixture:
+                        # Mixture Gaussian
+                        if args.filter != 'posterior':
+                            for label in pseudo_label2.unique():
+                                feat_ext_per_category = feat_ext2[pseudo_label2 == label, :]
+
+                                b = feat_ext_per_category.shape[0]
+                                ema_n[label] += b
+                                alpha = 1. / ema_length if ema_n[label] > ema_length else 1. / ema_n[label]
+
+                                ema_ext_mu_that = ema_ext_mu[label, :]
+                                ema_ext_cov_that = ema_ext_cov[label, :, :]
+                                delta_pre = feat_ext_per_category - ema_ext_mu_that
+
+                                delta = alpha * delta_pre.sum(dim=0)
+                                tmp_mu = ema_ext_mu_that + delta
+                                tmp_cov = ema_ext_cov_that + alpha * (delta_pre.t() @ delta_pre - b * ema_ext_cov_that) - delta[:, None] @ delta[None, :]
+
+                                with torch.no_grad():
+                                    ema_ext_mu[label, :] = tmp_mu.detach()
+                                    ema_ext_cov[label, :, :] = tmp_cov.detach()
+
+                                if (class_num == 10 or len(mini_batch_indices) >= 4096) and iter_id > int(args.iters / 2):
+                                    source_domain = torch.distributions.MultivariateNormal(ext_src_mu[label, :], ext_src_cov[label, :, :] + template_ext_cov)
+                                    target_domain = torch.distributions.MultivariateNormal(tmp_mu, tmp_cov + template_ext_cov)
+                                    loss += (torch.distributions.kl_divergence(source_domain, target_domain) + torch.distributions.kl_divergence(target_domain, source_domain)) * loss_scale / class_num
+                        else:
+                            feat_ext2_categories = feat_ext[None, :, :].expand(class_num, -1, -1) # K, N, D
+                            num_categories = posterior # K, N
+                            ema_n += num_categories.sum(dim=1) # K
+                            alpha = torch.where(ema_n > ema_length, torch.ones(class_num, dtype=torch.float).cuda() / ema_length, 1. / (ema_n + 1e-10))
+                            
+                            delta_pre = (feat_ext2_categories - ema_ext_mu[:, None, :]) * num_categories[:, :, None] # K, N, D
+                            delta = alpha[:, None] * delta_pre.sum(dim=1) # K, D
+                            new_component_mean = ema_ext_mu + delta
+                            new_component_cov = ema_ext_cov \
+                                                + alpha[:, None, None] * ((delta_pre.permute(0, 2, 1) @ delta_pre) - num_categories.sum(dim=1)[:, None, None] * ema_ext_cov) \
+                                                - delta[:, :, None] @ delta[:, None, :]
+
+                            with torch.no_grad():
+                                ema_ext_mu = new_component_mean.detach()
+                                ema_ext_cov = new_component_cov.detach()
+
+                            if (class_num == 10 or len(mini_batch_indices) >= 4096) and iter_id > int(args.iters / 2):
+                                target_compoent_distribution.loc = new_component_mean
+                                target_compoent_distribution.covariance_matrix = new_component_cov + template_ext_cov
+                                target_compoent_distribution._unbroadcasted_scale_tril = torch.linalg.cholesky(new_component_cov + template_ext_cov)
+                                loss += (torch.distributions.kl_divergence(source_component_distribution, target_compoent_distribution) \
+                                        + torch.distributions.kl_divergence(target_compoent_distribution, source_component_distribution)).mean() * loss_scale
+
+                    if not args.without_global:
+                        # Global Gaussian
+                        b = feat_ext.shape[0]
+                        ema_total_n += b
+                        alpha = 1. / 1280 if ema_total_n > 1280 else 1. / ema_total_n
+                        delta_pre = (feat_ext - ema_ext_total_mu.cuda())
+                        delta = alpha * delta_pre.sum(dim=0)
+                        tmp_mu = ema_ext_total_mu.cuda() + delta
+                        tmp_cov = ema_ext_total_cov.cuda() + alpha * (delta_pre.t() @ delta_pre - b * ema_ext_total_cov.cuda()) - delta[:, None] @ delta[None, :]
+                        with torch.no_grad():
+                            ema_ext_total_mu = tmp_mu.detach().cpu()
+                            ema_ext_total_cov = tmp_cov.detach().cpu()
+
+                        source_domain = torch.distributions.MultivariateNormal(mu_src_ext, cov_src_ext + template_ext_cov)
+                        target_domain = torch.distributions.MultivariateNormal(tmp_mu, tmp_cov + template_ext_cov)
+                        loss += (torch.distributions.kl_divergence(source_domain, target_domain) + torch.distributions.kl_divergence(target_domain, source_domain)) * loss_scale
+
+                    if args.without_mixture and args.without_global:
+                        logit2 = logit[pseudo_label_mask.cuda()]
+                        loss += F.cross_entropy(logit2, pseudo_label2) * loss_scale * 2
+
+
+                if args.align_ssh:  
+                    b = feat_ssh.shape[0]
+                    alpha = 1. / 1280 if ema_total_n > 1280 else 1. / ema_total_n
+                    delta_pre = (feat_ssh - ema_ssh_total_mu.cuda())
+                    delta = alpha * delta_pre.sum(dim=0)
+                    tmp_mu = ema_ssh_total_mu.cuda() + delta
+                    tmp_cov = ema_ssh_total_cov.cuda() + alpha * (delta_pre.t() @ delta_pre - b * ema_ssh_total_cov.cuda()) - delta[:, None] @ delta[None, :]
+
+                    with torch.no_grad():
+                        ema_ssh_total_mu = tmp_mu.detach().cpu()
+                        ema_ssh_total_cov = tmp_cov.detach().cpu()
+                    source_domain = torch.distributions.MultivariateNormal(mu_src_ssh, cov_src_ssh + template_ssh_cov)
+                    target_domain = torch.distributions.MultivariateNormal(tmp_mu, tmp_cov + template_ssh_cov)
+                    loss += (torch.distributions.kl_divergence(source_domain, target_domain) + torch.distributions.kl_divergence(target_domain, source_domain)) * loss_scale
+            
+                
+                if args.with_shot:
+                    ent_loss = softmax_entropy(logit).mean(0)
+                    softmax_out = F.softmax(logit, dim=-1)
+                    msoftmax = softmax_out.mean(dim=0)
+                    ent_loss += torch.sum(msoftmax * torch.log(msoftmax + 1e-5))
+                    loss += ent_loss * loss_scale * 2
+
+                try:
+                    loss.backward()
+                except:
+                    pass
+                finally:
+                    del loss
+
+            if iter_id > 0:
+                optimizer.step()
+                optimizer.zero_grad()
+
+    #### Test ####
+    net.eval()
+    with torch.no_grad():
+        outputs = net(te_inputs[0].cuda())
+        _, predicted = outputs.max(1)
+        correct.append(predicted.cpu().eq(te_labels))
+    print('real time error:', 1 - torch.cat(correct).numpy().mean())
+    net.train()
+
+print(args.corruption, 'Test time training result:', 1 - torch.cat(correct).numpy().mean())
+File Path: cifar/TTAC_onepass2_without_queue.py
+Content:
+import argparse
+
+import torch
+import torch.optim as optim
+import torch.utils.data as data
+
+from utils.misc import *
+from utils.test_helpers import *
+from utils.prepare_dataset import *
+
+# ----------------------------------
+import copy
+import time
+import random
+import numpy as np
+
+from offline import *
+import time
+# ----------------------------------
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--dataset', default='cifar10')
+parser.add_argument('--dataroot', default="./data")
+parser.add_argument('--batch_size', default=128, type=int)
+parser.add_argument('--workers', default=0, type=int)
+parser.add_argument('--num_sample', default=1000000, type=int)
+parser.add_argument('--lr', default=0.001, type=float)
+parser.add_argument('--outf', default='.')
+parser.add_argument('--level', default=5, type=int)
+parser.add_argument('--corruption', default='snow')
+parser.add_argument('--resume', default=None, help='directory of pretrained model')
+parser.add_argument('--ckpt', default=None, type=int)
+parser.add_argument('--ssl', default='contrastive', help='self-supervised task')
+parser.add_argument('--without_global', action='store_true', default=False)
+parser.add_argument('--without_mixture', action='store_true', default=False)
+parser.add_argument('--pro_threshold', default=0.9, type=float)
+parser.add_argument('--model', default='resnet50', help='resnet50')
+parser.add_argument('--seed', default=0, type=int)
+
+args = parser.parse_args()
+
+print(args)
+
+my_makedir(args.outf)
+
+class_num = 10 if args.dataset == 'cifar10' else 100
+
+net, ext, head, ssh, classifier = build_resnet50(args)
+
+teset, _ = prepare_test_data(args)
+teloader = data.DataLoader(teset, batch_size=args.batch_size, shuffle=True, num_workers=args.workers, worker_init_fn=seed_worker, pin_memory=True, drop_last=False)
+
+# -------------------------------
+print('Resuming from %s...' %(args.resume))
+
+load_resnet50(net, head, ssh, classifier, args)
+
+optimizer = optim.SGD(ext.parameters(), lr=args.lr, momentum=0.9)
+
+# ----------- Offline Feature Summarization ------------
+args_align = copy.deepcopy(args)
+args_align.ssl = None
+_, offlineloader = prepare_train_data(args_align)
+ext_src_mu, ext_src_cov, ssh_src_mu, ssh_src_cov, mu_src_ext, cov_src_ext, mu_src_ssh, cov_src_ssh = offline(offlineloader, ext, classifier, head, class_num)
+
+bias = cov_src_ext.max().item() / 30.
+template_ext_cov = torch.eye(2048).cuda() * bias
+
+torch.manual_seed(args.seed)
+random.seed(args.seed)
+np.random.seed(args.seed)
+torch.cuda.manual_seed(args.seed)
+torch.cuda.manual_seed_all(args.seed)
+
+# # ----------- Test ------------
+print('Running...')
+print('Error (%)\t\ttest')
+err_cls = test(teloader, net)[0]
+print(('Epoch %d:' %(0)).ljust(24) +
+            '%.2f\t\t' %(err_cls*100))
+
+# ----------- Improved Test-time Training ------------
+
+ext_src_mu = torch.stack(ext_src_mu)
+ext_src_cov = torch.stack(ext_src_cov)
+
+ema_ext_mu = ext_src_mu.clone()
+ema_ext_cov = ext_src_cov.clone()
+ema_ext_total_mu = torch.zeros(2048).float()
+ema_ext_total_cov = torch.zeros(2048, 2048).float()
+
+ema_n = torch.zeros(class_num).cuda()
+ema_total_n = 0.
+
+if class_num == 10:
+    loss_scale = 0.05
+    ema_length = 128
+else:
+    loss_scale = 0.5
+    ema_length = 64
+
+correct = []
+cumulative_error = []
+
+for te_batch_idx, (te_inputs, te_labels) in enumerate(teloader):
+    
+    classifier.eval()
+    ext.train()
+
+    start = time.time()
+    
+    optimizer.zero_grad()
+
+    loss = 0.
+    
+    inputs = te_inputs[0].cuda()
+
+    feat_ext = ext(inputs)
+    logit = classifier(feat_ext)
+
+    softmax_logit = logit.softmax(dim=-1)
+    pro, pseudo_label = softmax_logit.max(dim=-1)
+    pseudo_label_mask = (pro > args.pro_threshold)
+    feat_ext2 = feat_ext[pseudo_label_mask]
+    pseudo_label2 = pseudo_label[pseudo_label_mask].cuda()
+
+    if not args.without_mixture:
+        # Mixture Gaussian
+        for label in pseudo_label2.unique():
+            feat_ext_per_category = feat_ext2[pseudo_label2 == label, :]
+
+            b = feat_ext_per_category.shape[0]
+            ema_n[label] += b
+            alpha = 1. / ema_length if ema_n[label] > ema_length else 1. / ema_n[label]
+
+            ema_ext_mu_that = ema_ext_mu[label, :]
+            ema_ext_cov_that = ema_ext_cov[label, :, :]
+            delta_pre = feat_ext_per_category - ema_ext_mu_that
+
+            delta = alpha * delta_pre.sum(dim=0)
+            tmp_mu = ema_ext_mu_that + delta
+            tmp_cov = ema_ext_cov_that + alpha * (delta_pre.t() @ delta_pre - b * ema_ext_cov_that) - delta[:, None] @ delta[None, :]
+
+            with torch.no_grad():
+                ema_ext_mu[label, :] = tmp_mu.detach()
+                ema_ext_cov[label, :, :] = tmp_cov.detach()
+            
+            if ema_n[label] >= 16:
+                source_domain = torch.distributions.MultivariateNormal(ext_src_mu[label, :], ext_src_cov[label, :, :] + template_ext_cov)
+                target_domain = torch.distributions.MultivariateNormal(tmp_mu, tmp_cov + template_ext_cov)
+                loss += (torch.distributions.kl_divergence(source_domain, target_domain) + torch.distributions.kl_divergence(target_domain, source_domain)) * loss_scale / class_num
+            
+    if not args.without_global:
+        # Global Gaussian
+        b = feat_ext.shape[0]
+        ema_total_n += b
+        alpha = 1. / 1280 if ema_total_n > 1280 else 1. / ema_total_n
+        delta_pre = (feat_ext - ema_ext_total_mu.cuda())
+        delta = alpha * delta_pre.sum(dim=0)
+        tmp_mu = ema_ext_total_mu.cuda() + delta
+        tmp_cov = ema_ext_total_cov.cuda() + alpha * (delta_pre.t() @ delta_pre - b * ema_ext_total_cov.cuda()) - delta[:, None] @ delta[None, :]
+        with torch.no_grad():
+            ema_ext_total_mu = tmp_mu.detach().cpu()
+            ema_ext_total_cov = tmp_cov.detach().cpu()
+
+        source_domain = torch.distributions.MultivariateNormal(mu_src_ext, cov_src_ext + template_ext_cov)
+        target_domain = torch.distributions.MultivariateNormal(tmp_mu, tmp_cov + template_ext_cov)
+        loss += (torch.distributions.kl_divergence(source_domain, target_domain) + torch.distributions.kl_divergence(target_domain, source_domain)) * loss_scale
+
+    loss.backward()
+    optimizer.step()
+    optimizer.zero_grad()
+
+    #### Test ####
+    net.eval()
+    with torch.no_grad():
+        outputs = net(inputs)
+        _, predicted = outputs.max(1)
+        correct.append(predicted.cpu().eq(te_labels))
+    print('real time error:', 1 - torch.cat(correct).numpy().mean())
+    cumulative_error.append(1 - torch.cat(correct).numpy().mean())
+
+print(args.corruption, 'Test time training result:', 1 - torch.cat(correct).numpy().mean())
+
+File Path: cifar/TTAC_onepass_without_queue.py
+Content:
+import argparse
+
+import torch
+import torch.optim as optim
+import torch.utils.data as data
+
+from utils.misc import *
+from utils.test_helpers import *
+from utils.prepare_dataset import *
+
+# ----------------------------------
+import copy
+import time
+import random
+import numpy as np
+
+from offline import *
+import time
+# ----------------------------------
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--dataset', default='cifar10')
+parser.add_argument('--dataroot', default="./data")
+parser.add_argument('--batch_size', default=128, type=int)
+parser.add_argument('--workers', default=0, type=int)
+parser.add_argument('--num_sample', default=1000000, type=int)
+parser.add_argument('--lr', default=0.001, type=float)
+parser.add_argument('--outf', default='.')
+parser.add_argument('--level', default=5, type=int)
+parser.add_argument('--corruption', default='snow')
+parser.add_argument('--resume', default=None, help='directory of pretrained model')
+parser.add_argument('--ckpt', default=None, type=int)
+parser.add_argument('--ssl', default='contrastive', help='self-supervised task')
+parser.add_argument('--without_global', action='store_true', default=False)
+parser.add_argument('--without_mixture', action='store_true', default=False)
+parser.add_argument('--pro_threshold', default=0.9, type=float)
+parser.add_argument('--model', default='resnet50', help='resnet50')
+parser.add_argument('--seed', default=0, type=int)
+
+args = parser.parse_args()
+
+print(args)
+
+my_makedir(args.outf)
+
+
+class_num = 10 if args.dataset == 'cifar10' else 100
+
+net, ext, head, ssh, classifier = build_resnet50(args)
+
+teset, _ = prepare_test_data(args)
+teloader = data.DataLoader(teset, batch_size=args.batch_size, shuffle=True, num_workers=args.workers, worker_init_fn=seed_worker, pin_memory=True, drop_last=False)
+
+# -------------------------------
+print('Resuming from %s...' %(args.resume))
+
+load_resnet50(net, head, ssh, classifier, args)
+
+optimizer = optim.SGD(ext.parameters(), lr=args.lr, momentum=0.9)
+
+# ----------- Offline Feature Summarization ------------
+args_align = copy.deepcopy(args)
+args_align.ssl = None
+_, offlineloader = prepare_train_data(args_align)
+ext_src_mu, ext_src_cov, ssh_src_mu, ssh_src_cov, mu_src_ext, cov_src_ext, mu_src_ssh, cov_src_ssh = offline(offlineloader, ext, classifier, head, class_num)
+
+bias = cov_src_ext.max().item() / 30.
+template_ext_cov = torch.eye(2048).cuda() * bias
+
+torch.manual_seed(args.seed)
+random.seed(args.seed)
+np.random.seed(args.seed)
+torch.cuda.manual_seed(args.seed)
+torch.cuda.manual_seed_all(args.seed)
+
+# # ----------- Test ------------
+print('Running...')
+print('Error (%)\t\ttest')
+err_cls = test(teloader, net)[0]
+print(('Epoch %d:' %(0)).ljust(24) +
+            '%.2f\t\t' %(err_cls*100))
+
+# ----------- Improved Test-time Training ------------
+
+ext_src_mu = torch.stack(ext_src_mu)
+ext_src_cov = torch.stack(ext_src_cov)
+
+ema_ext_mu = ext_src_mu.clone()
+ema_ext_cov = ext_src_cov.clone()
+ema_ext_total_mu = torch.zeros(2048).float()
+ema_ext_total_cov = torch.zeros(2048, 2048).float()
+
+ema_n = torch.zeros(class_num).cuda()
+ema_total_n = 0.
+
+if class_num == 10:
+    loss_scale = 0.05
+    ema_length = 128
+else:
+    loss_scale = 0.5
+    ema_length = 64
+
+correct = []
+cumulative_error = []
+
+for te_batch_idx, (te_inputs, te_labels) in enumerate(teloader):
+    
+    classifier.eval()
+    ext.train()
+
+    start = time.time()
+    
+    optimizer.zero_grad()
+
+    loss = 0.
+    
+    inputs = te_inputs[0].cuda()
+
+    feat_ext = ext(inputs)
+    logit = classifier(feat_ext)
+
+    softmax_logit = logit.softmax(dim=-1)
+    pro, pseudo_label = softmax_logit.max(dim=-1)
+    pseudo_label_mask = (pro > args.pro_threshold)
+    feat_ext2 = feat_ext[pseudo_label_mask]
+    pseudo_label2 = pseudo_label[pseudo_label_mask].cuda()
+
+    if not args.without_mixture:
+        # Mixture Gaussian
+        b, d = feat_ext2.shape
+        feat_ext2_categories = torch.zeros(class_num, b, d).cuda() # K, N, D
+        feat_ext2_categories.scatter_add_(dim=0, index=pseudo_label2[None, :, None].expand(-1, -1, d), src=feat_ext2[None, :, :])
+
+        num_categories = torch.zeros(class_num, b, dtype=torch.int).cuda() # K, N
+        num_categories.scatter_add_(dim=0, index=pseudo_label2[None, :], src=torch.ones_like(pseudo_label2[None, :], dtype=torch.int))
+
+        ema_n += num_categories.sum(dim=1) # K
+        alpha = torch.where(ema_n > ema_length, torch.ones(class_num, dtype=torch.float).cuda() / ema_length, 1. / (ema_n + 1e-10))
+
+        delta_pre = (feat_ext2_categories - ema_ext_mu[:, None, :]) * num_categories[:, :, None] # K, N, D
+        delta = alpha[:, None] * delta_pre.sum(dim=1) # K, D
+        new_component_mean = ema_ext_mu + delta
+        new_component_cov = ema_ext_cov \
+                            + alpha[:, None, None] * ((delta_pre.permute(0, 2, 1) @ delta_pre) - num_categories.sum(dim=1)[:, None, None] * ema_ext_cov) \
+                            - delta[:, :, None] @ delta[:, None, :]
+
+        with torch.no_grad():
+            ema_ext_mu = new_component_mean.detach()
+            ema_ext_cov = new_component_cov.detach()
+        
+        for label in pseudo_label2.unique():
+            if ema_n[label] >= 16:
+                source_domain = torch.distributions.MultivariateNormal(ext_src_mu[label, :], ext_src_cov[label, :, :] + template_ext_cov)
+                target_domain = torch.distributions.MultivariateNormal(new_component_mean[label, :], new_component_cov[label, :, :] + template_ext_cov)
+                loss += (torch.distributions.kl_divergence(source_domain, target_domain) + torch.distributions.kl_divergence(target_domain, source_domain)) * loss_scale / class_num
+        
+    if not args.without_global:
+        # Global Gaussian
+        b = feat_ext.shape[0]
+        ema_total_n += b
+        alpha = 1. / 1280 if ema_total_n > 1280 else 1. / ema_total_n
+        delta_pre = (feat_ext - ema_ext_total_mu.cuda())
+        delta = alpha * delta_pre.sum(dim=0)
+        tmp_mu = ema_ext_total_mu.cuda() + delta
+        tmp_cov = ema_ext_total_cov.cuda() + alpha * (delta_pre.t() @ delta_pre - b * ema_ext_total_cov.cuda()) - delta[:, None] @ delta[None, :]
+        with torch.no_grad():
+            ema_ext_total_mu = tmp_mu.detach().cpu()
+            ema_ext_total_cov = tmp_cov.detach().cpu()
+
+        source_domain = torch.distributions.MultivariateNormal(mu_src_ext, cov_src_ext + template_ext_cov)
+        target_domain = torch.distributions.MultivariateNormal(tmp_mu, tmp_cov + template_ext_cov)
+        loss += (torch.distributions.kl_divergence(source_domain, target_domain) + torch.distributions.kl_divergence(target_domain, source_domain)) * loss_scale
+
+    loss.backward()
+    optimizer.step()
+    optimizer.zero_grad()
+
+    #### Test ####
+    net.eval()
+    with torch.no_grad():
+        outputs = net(inputs)
+        _, predicted = outputs.max(1)
+        correct.append(predicted.cpu().eq(te_labels))
+    print('real time error:', 1 - torch.cat(correct).numpy().mean())
+    cumulative_error.append(1 - torch.cat(correct).numpy().mean())
+
+print(args.corruption, 'Test time training result:', 1 - torch.cat(correct).numpy().mean())
+
+File Path: cifar/discrepancy.py
+Content:
+import torch
+
+def covariance(features):
+    assert len(features.size()) == 2, "TODO: multi-dimensional feature map covariance"
+    n = features.shape[0]
+    tmp = torch.ones((1, n), device=features.device) @ features
+    cov = (features.t() @ features - (tmp.t() @ tmp) / n) / n
+    return cov
+
+def coral(cs, ct):
+    d = cs.shape[0]
+    loss = (cs - ct).pow(2).sum() / (4. * d ** 2)
+    return loss
+
+
+def linear_mmd(ms, mt):
+    loss = (ms - mt).pow(2).mean()
+    return loss
+
+File Path: cifar/models/BigResNet.py
+Content:
+"""ResNet in PyTorch.
+ImageNet-Style ResNet
+[1] Kaiming He, Xiangyu Zhang, Shaoqing Ren, Jian Sun
+    Deep Residual Learning for Image Recognition. arXiv:1512.03385
+ResNet adapted from: https://github.com/bearpaw/pytorch-classification
+SupConResNet adpated from https://github.com/HobbitLong/SupContrast
+"""
+from functools import partial
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class BasicBlock(nn.Module):
+    expansion = 1
+
+    def __init__(self, in_planes, planes, stride=1, is_last=False):
+        super(BasicBlock, self).__init__()
+        self.is_last = is_last
+        self.conv1 = nn.Conv2d(in_planes, planes, kernel_size=3, stride=stride, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(planes)
+        self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(planes)
+
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_planes != self.expansion * planes:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_planes, self.expansion * planes, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(self.expansion * planes)
+            )
+
+    def forward(self, x):
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out += self.shortcut(x)
+        preact = out
+        out = F.relu(out)
+        if self.is_last:
+            return out, preact
+        else:
+            return out
+
+
+class Bottleneck(nn.Module):
+    expansion = 4
+
+    def __init__(self, in_planes, planes, stride=1, is_last=False):
+        super(Bottleneck, self).__init__()
+        self.is_last = is_last
+        self.conv1 = nn.Conv2d(in_planes, planes, kernel_size=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(planes)
+        self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=stride, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(planes)
+        self.conv3 = nn.Conv2d(planes, self.expansion * planes, kernel_size=1, bias=False)
+        self.bn3 = nn.BatchNorm2d(self.expansion * planes)
+
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_planes != self.expansion * planes:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_planes, self.expansion * planes, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(self.expansion * planes)
+            )
+
+    def forward(self, x):
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = F.relu(self.bn2(self.conv2(out)))
+        out = self.bn3(self.conv3(out))
+        out += self.shortcut(x)
+        preact = out
+        out = F.relu(out)
+        if self.is_last:
+            return out, preact
+        else:
+            return out
+
+
+class ResNet(nn.Module):
+    def __init__(self, block, num_blocks, in_channel=3, zero_init_residual=False):
+        super(ResNet, self).__init__()
+        self.in_planes = 64
+
+        self.conv1 = nn.Conv2d(in_channel, 64, kernel_size=3, stride=1, padding=1,
+                               bias=False)
+        self.bn1 = nn.BatchNorm2d(64)
+        self.layer1 = self._make_layer(block, 64, num_blocks[0], stride=1)
+        self.layer2 = self._make_layer(block, 128, num_blocks[1], stride=2)
+        self.layer3 = self._make_layer(block, 256, num_blocks[2], stride=2)
+        self.layer4 = self._make_layer(block, 512, num_blocks[3], stride=2, is_last=True)
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+
+        # Zero-initialize the last BN in each residual branch,
+        # so that the residual branch starts with zeros, and each residual block behaves
+        # like an identity. This improves the model by 0.2~0.3% according to:
+        # https://arxiv.org/abs/1706.02677
+        if zero_init_residual:
+            for m in self.modules():
+                if isinstance(m, Bottleneck):
+                    nn.init.constant_(m.bn3.weight, 0)
+                elif isinstance(m, BasicBlock):
+                    nn.init.constant_(m.bn2.weight, 0)
+
+    def _make_layer(self, block, planes, num_blocks, stride, is_last=False):
+        strides = [stride] + [1] * (num_blocks - 1)
+        layers = []
+        for i in range(num_blocks):
+            stride = strides[i]
+            layers.append(block(self.in_planes, planes, stride))
+            self.in_planes = planes * block.expansion
+        return nn.Sequential(*layers)
+
+    def forward(self, x, layer=100):
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.layer1(out)
+        out = self.layer2(out)
+        out = self.layer3(out)
+        out = self.layer4(out)
+        out = self.avgpool(out)
+        out = torch.flatten(out, 1)
+        return out
+
+
+def resnet18(**kwargs):
+    return ResNet(BasicBlock, [2, 2, 2, 2], **kwargs)
+
+
+def resnet34(**kwargs):
+    return ResNet(BasicBlock, [3, 4, 6, 3], **kwargs)
+
+
+def resnet50(**kwargs):
+    return ResNet(Bottleneck, [3, 4, 6, 3], **kwargs)
+
+
+def resnet101(**kwargs):
+    return ResNet(Bottleneck, [3, 4, 23, 3], **kwargs)
+
+
+model_dict = {
+    'resnet18': [resnet18, 512],
+    'resnet34': [resnet34, 512],
+    'resnet50': [resnet50, 2048],
+    'resnet101': [resnet101, 2048],
+}
+
+
+class LinearBatchNorm(nn.Module):
+    """Implements BatchNorm1d by BatchNorm2d, for SyncBN purpose"""
+    def __init__(self, dim, affine=True):
+        super(LinearBatchNorm, self).__init__()
+        self.dim = dim
+        self.bn = nn.BatchNorm2d(dim, affine=affine)
+
+    def forward(self, x):
+        x = x.view(-1, self.dim, 1, 1)
+        x = self.bn(x)
+        x = x.view(-1, self.dim)
+        return x
+
+
+class SupConResNet(nn.Module):
+    """backbone + projection head"""
+    def __init__(self, name='resnet50', head='mlp', feat_dim=128):
+        super(SupConResNet, self).__init__()
+        model_fun, dim_in = model_dict[name]
+        self.encoder = model_fun()
+        if head == 'linear':
+            self.head = nn.Linear(dim_in, feat_dim)
+        elif head == 'mlp':
+            self.head = nn.Sequential(
+                nn.Linear(dim_in, dim_in),
+                nn.ReLU(inplace=True),
+                nn.Linear(dim_in, feat_dim)
+            )
+        else:
+            raise NotImplementedError(
+                'head not supported: {}'.format(head))
+        
+    def forward(self, x):
+        feat = self.encoder(x)
+        feat = F.normalize(self.head(feat), dim=1)
+        return feat
+
+
+class LinearClassifier(nn.Module):
+    """Linear classifier"""
+    def __init__(self, name='resnet50', num_classes=10):
+        super(LinearClassifier, self).__init__()
+        _, feat_dim = model_dict[name]
+        self.fc = nn.Linear(feat_dim, num_classes)
+
+    def forward(self, features):
+        return self.fc(features)
+
+File Path: cifar/models/ResNet.py
+Content:
+# Based on the ResNet implementation in torchvision
+# https://github.com/pytorch/vision/blob/master/torchvision/models/resnet.py
+
+import math
+import torch
+from torch import nn
+from torchvision.models.resnet import conv3x3
+
+class BasicBlock(nn.Module):
+    def __init__(self, inplanes, planes, norm_layer, stride=1, downsample=None):
+        super(BasicBlock, self).__init__()
+        self.downsample = downsample
+        self.stride = stride
+        
+        self.bn1 = norm_layer(inplanes)
+        self.relu1 = nn.ReLU(inplace=True)
+        self.conv1 = conv3x3(inplanes, planes, stride)
+        
+        self.bn2 = norm_layer(planes)
+        self.relu2 = nn.ReLU(inplace=True)
+        self.conv2 = conv3x3(planes, planes)
+
+    def forward(self, x):
+        residual = x 
+        residual = self.bn1(residual)
+        residual = self.relu1(residual)
+        residual = self.conv1(residual)
+
+        residual = self.bn2(residual)
+        residual = self.relu2(residual)
+        residual = self.conv2(residual)
+
+        if self.downsample is not None:
+            x = self.downsample(x)
+        return x + residual
+
+class Downsample(nn.Module):
+    def __init__(self, nIn, nOut, stride):
+        super(Downsample, self).__init__()
+        self.avg = nn.AvgPool2d(stride)
+        assert nOut % nIn == 0
+        self.expand_ratio = nOut // nIn
+
+    def forward(self, x):
+        x = self.avg(x)
+        return torch.cat([x] + [x.mul(0)] * (self.expand_ratio - 1), 1)
+
+class ResNetCifar(nn.Module):
+    def __init__(self, depth, width=1, classes=10, channels=3, norm_layer=nn.BatchNorm2d, detach=None):
+        assert (depth - 2) % 6 == 0         # depth is 6N+2
+        self.N = (depth - 2) // 6
+        super(ResNetCifar, self).__init__()
+
+        # Following the Wide ResNet convention, we fix the very first convolution
+        self.conv1 = nn.Conv2d(channels, 16, kernel_size=3, stride=1, padding=1, bias=False)
+        self.inplanes = 16
+        self.layer1 = self._make_layer(norm_layer, 16 * width)
+        self.layer2 = self._make_layer(norm_layer, 32 * width, stride=2)
+        self.layer3 = self._make_layer(norm_layer, 64 * width, stride=2)
+        self.bn = norm_layer(64 * width)
+        self.relu = nn.ReLU(inplace=True)
+        self.avgpool = nn.AvgPool2d(8)
+        self.fc = nn.Linear(64 * width, classes)
+
+        # Task-agnostic encoder
+        self.detach = detach
+
+        # Initialization
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                n = m.kernel_size[0] * m.kernel_size[1] * m.out_channels
+                m.weight.data.normal_(0, math.sqrt(2. / n))
+                
+    def _make_layer(self, norm_layer, planes, stride=1):
+        downsample = None
+        if stride != 1 or self.inplanes != planes:
+            downsample = Downsample(self.inplanes, planes, stride)
+        layers = [BasicBlock(self.inplanes, planes, norm_layer, stride, downsample)]
+        self.inplanes = planes
+        for i in range(self.N - 1):
+            layers.append(BasicBlock(self.inplanes, planes, norm_layer))
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        x = self.conv1(x)
+        x = self.layer1(x)
+        x = self.layer2(x)
+        if self.detach == 'layer2': x = x.detach()        
+        x = self.layer3(x)
+        x = self.bn(x)
+        x = self.relu(x)
+        x = self.avgpool(x)
+        x = x.view(x.size(0), -1)
+        if self.detach == 'layer3': x = x.detach()
+        x = self.fc(x)
+        return x
+        
+File Path: cifar/models/SSHead.py
+Content:
+from torch import nn
+import math
+import copy
+
+class ViewFlatten(nn.Module):
+	def __init__(self):
+		super(ViewFlatten, self).__init__()
+
+	def forward(self, x):
+		return x.view(x.size(0), -1)
+
+class ExtractorHead(nn.Module):
+	def __init__(self, ext, head):
+		super(ExtractorHead, self).__init__()
+		self.ext = ext
+		self.head = head
+
+	def forward(self, x):
+		return self.head(self.ext(x))
+
+def extractor_from_layer3(net):
+	layers = [net.conv1, net.layer1, net.layer2, net.layer3, net.bn, net.relu, net.avgpool, ViewFlatten()]
+	return nn.Sequential(*layers)
+
+def extractor_from_layer2(net):
+	layers = [net.conv1, net.layer1, net.layer2]
+	return nn.Sequential(*layers)
+
+def head_on_layer2(net, width, classes):
+	head = copy.deepcopy([net.layer3, net.bn, net.relu, net.avgpool])
+	head.append(ViewFlatten())
+	head.append(nn.Linear(64 * width, classes))
+	return nn.Sequential(*head)
+
+def task_head_on_layer3(net):
+	layers = [net.fc]
+	return nn.Sequential(*layers)
+
+File Path: cifar/models/WideResNet.py
+Content:
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class BasicBlock(nn.Module):
+    def __init__(self, in_planes, out_planes, stride, dropRate=0.0):
+        super(BasicBlock, self).__init__()
+        self.bn1 = nn.BatchNorm2d(in_planes)
+        self.relu1 = nn.ReLU(inplace=True)
+        self.conv1 = nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride,
+                               padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(out_planes)
+        self.relu2 = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(out_planes, out_planes, kernel_size=3, stride=1,
+                               padding=1, bias=False)
+        self.droprate = dropRate
+        self.equalInOut = (in_planes == out_planes)
+        self.convShortcut = (not self.equalInOut) and nn.Conv2d(in_planes, out_planes, kernel_size=1, stride=stride,
+                                                                padding=0, bias=False) or None
+
+    def forward(self, x):
+        if not self.equalInOut:
+            x = self.relu1(self.bn1(x))
+        else:
+            out = self.relu1(self.bn1(x))
+        out = self.relu2(self.bn2(self.conv1(out if self.equalInOut else x)))
+        if self.droprate > 0:
+            out = F.dropout(out, p=self.droprate, training=self.training)
+        out = self.conv2(out)
+        return torch.add(x if self.equalInOut else self.convShortcut(x), out)
+
+
+class NetworkBlock(nn.Module):
+    def __init__(self, nb_layers, in_planes, out_planes, block, stride, dropRate=0.0):
+        super(NetworkBlock, self).__init__()
+        self.layer = self._make_layer(block, in_planes, out_planes, nb_layers, stride, dropRate)
+
+    def _make_layer(self, block, in_planes, out_planes, nb_layers, stride, dropRate):
+        layers = []
+        for i in range(int(nb_layers)):
+            layers.append(block(i == 0 and in_planes or out_planes, out_planes, i == 0 and stride or 1, dropRate))
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.layer(x)
+
+
+class WideResNet(nn.Module):
+    """ Based on code from https://github.com/yaodongyu/TRADES """
+    def __init__(self, depth=28, num_classes=10, widen_factor=10, sub_block1=False, dropRate=0.0, bias_last=True):
+        super(WideResNet, self).__init__()
+        nChannels = [16, 16 * widen_factor, 32 * widen_factor, 64 * widen_factor]
+        assert ((depth - 4) % 6 == 0)
+        n = (depth - 4) / 6
+        block = BasicBlock
+        # 1st conv before any network block
+        self.conv1 = nn.Conv2d(3, nChannels[0], kernel_size=3, stride=1,
+                               padding=1, bias=False)
+        # 1st block
+        self.block1 = NetworkBlock(n, nChannels[0], nChannels[1], block, 1, dropRate)
+        if sub_block1:
+            # 1st sub-block
+            self.sub_block1 = NetworkBlock(n, nChannels[0], nChannels[1], block, 1, dropRate)
+        # 2nd block
+        self.block2 = NetworkBlock(n, nChannels[1], nChannels[2], block, 2, dropRate)
+        # 3rd block
+        self.block3 = NetworkBlock(n, nChannels[2], nChannels[3], block, 2, dropRate)
+        # global average pooling and classifier
+        self.bn1 = nn.BatchNorm2d(nChannels[3])
+        self.relu = nn.ReLU(inplace=True)
+        self.fc = nn.Linear(nChannels[3], num_classes, bias=bias_last)
+        self.nChannels = nChannels[3]
+
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                n = m.kernel_size[0] * m.kernel_size[1] * m.out_channels
+                m.weight.data.normal_(0, math.sqrt(2. / n))
+            elif isinstance(m, nn.BatchNorm2d):
+                m.weight.data.fill_(1)
+                m.bias.data.zero_()
+            elif isinstance(m, nn.Linear) and not m.bias is None:
+                m.bias.data.zero_()
+
+    def forward(self, x):
+        out = self.conv1(x)
+        out = self.block1(out)
+        out = self.block2(out)
+        out = self.block3(out)
+        out = self.relu(self.bn1(out))
+        out = F.avg_pool2d(out, 8)
+        out = out.view(-1, self.nChannels)
+        return self.fc(out)
+
+File Path: cifar/offline.py
+Content:
+import torch
+from discrepancy import *
+
+
+def offline(trloader, ext, classifier, head, class_num=10):
+    ext.eval()
+    
+    feat_stack = [[] for i in range(class_num)]
+    ssh_feat_stack = [[] for i in range(class_num)]
+
+    with torch.no_grad():
+        for batch_idx, (inputs, labels) in enumerate(trloader):
+
+            feat = ext(inputs.cuda())
+            predict_logit = classifier(feat)
+            ssh_feat = head(feat)
+            
+            pseudo_label = predict_logit.max(dim=1)[1]
+
+            for label in pseudo_label.unique():
+                label_mask = pseudo_label == label
+                feat_stack[label].extend(feat[label_mask, :])
+                ssh_feat_stack[label].extend(ssh_feat[label_mask, :])
+    ext_mu = []
+    ext_cov = []
+    ext_all = []
+
+    ssh_mu = []
+    ssh_cov = []
+    ssh_all = []
+    for feat in feat_stack:
+        ext_mu.append(torch.stack(feat).mean(dim=0))
+        ext_cov.append(covariance(torch.stack(feat)))
+        ext_all.extend(feat)
+    
+    for feat in ssh_feat_stack:
+        ssh_mu.append(torch.stack(feat).mean(dim=0))
+        ssh_cov.append(covariance(torch.stack(feat)))
+        ssh_all.extend(feat)
+    
+    ext_all = torch.stack(ext_all)
+    ext_all_mu = ext_all.mean(dim=0)
+    ext_all_cov = covariance(ext_all)
+
+    ssh_all = torch.stack(ssh_all)
+    ssh_all_mu = ssh_all.mean(dim=0)
+    ssh_all_cov = covariance(ssh_all)
+    return ext_mu, ext_cov, ssh_mu, ssh_cov, ext_all_mu, ext_all_cov, ssh_all_mu, ssh_all_cov
+
+File Path: cifar/utils/augmentation.py
+Content:
+# code in this file is adpated from
+# https://github.com/ildoonet/pytorch-randaugment/blob/master/RandAugment/augmentations.py
+# https://github.com/google-research/fixmatch/blob/master/third_party/auto_augment/augmentations.py
+# https://github.com/google-research/fixmatch/blob/master/libml/ctaugment.py
+import logging
+import random
+
+import numpy as np
+import PIL
+import PIL.ImageOps
+import PIL.ImageEnhance
+import PIL.ImageDraw
+from PIL import Image
+
+logger = logging.getLogger(__name__)
+
+PARAMETER_MAX = 10
+
+
+def AutoContrast(img, **kwarg):
+    return PIL.ImageOps.autocontrast(img)
+
+
+def Brightness(img, v, max_v, bias=0):
+    v = _float_parameter(v, max_v) + bias
+    return PIL.ImageEnhance.Brightness(img).enhance(v)
+
+
+def Color(img, v, max_v, bias=0):
+    v = _float_parameter(v, max_v) + bias
+    return PIL.ImageEnhance.Color(img).enhance(v)
+
+
+def Contrast(img, v, max_v, bias=0):
+    v = _float_parameter(v, max_v) + bias
+    return PIL.ImageEnhance.Contrast(img).enhance(v)
+
+
+def Cutout(img, v, max_v, bias=0):
+    if v == 0:
+        return img
+    v = _float_parameter(v, max_v) + bias
+    v = int(v * min(img.size))
+    return CutoutAbs(img, v)
+
+
+def CutoutAbs(img, v, **kwarg):
+    w, h = img.size
+    x0 = np.random.uniform(0, w)
+    y0 = np.random.uniform(0, h)
+    x0 = int(max(0, x0 - v / 2.))
+    y0 = int(max(0, y0 - v / 2.))
+    x1 = int(min(w, x0 + v))
+    y1 = int(min(h, y0 + v))
+    xy = (x0, y0, x1, y1)
+    # gray
+    color = (127, 127, 127)
+    img = img.copy()
+    PIL.ImageDraw.Draw(img).rectangle(xy, color)
+    return img
+
+
+def Equalize(img, **kwarg):
+    return PIL.ImageOps.equalize(img)
+
+
+def Identity(img, **kwarg):
+    return img
+
+
+def Invert(img, **kwarg):
+    return PIL.ImageOps.invert(img)
+
+
+def Posterize(img, v, max_v, bias=0):
+    v = _int_parameter(v, max_v) + bias
+    return PIL.ImageOps.posterize(img, v)
+
+
+def Rotate(img, v, max_v, bias=0):
+    v = _int_parameter(v, max_v) + bias
+    if random.random() < 0.5:
+        v = -v
+    return img.rotate(v)
+
+
+def Sharpness(img, v, max_v, bias=0):
+    v = _float_parameter(v, max_v) + bias
+    return PIL.ImageEnhance.Sharpness(img).enhance(v)
+
+
+def ShearX(img, v, max_v, bias=0):
+    v = _float_parameter(v, max_v) + bias
+    if random.random() < 0.5:
+        v = -v
+    return img.transform(img.size, PIL.Image.AFFINE, (1, v, 0, 0, 1, 0))
+
+
+def ShearY(img, v, max_v, bias=0):
+    v = _float_parameter(v, max_v) + bias
+    if random.random() < 0.5:
+        v = -v
+    return img.transform(img.size, PIL.Image.AFFINE, (1, 0, 0, v, 1, 0))
+
+
+def Solarize(img, v, max_v, bias=0):
+    v = _int_parameter(v, max_v) + bias
+    return PIL.ImageOps.solarize(img, 256 - v)
+
+
+def SolarizeAdd(img, v, max_v, bias=0, threshold=128):
+    v = _int_parameter(v, max_v) + bias
+    if random.random() < 0.5:
+        v = -v
+    img_np = np.array(img).astype(np.int)
+    img_np = img_np + v
+    img_np = np.clip(img_np, 0, 255)
+    img_np = img_np.astype(np.uint8)
+    img = Image.fromarray(img_np)
+    return PIL.ImageOps.solarize(img, threshold)
+
+
+def TranslateX(img, v, max_v, bias=0):
+    v = _float_parameter(v, max_v) + bias
+    if random.random() < 0.5:
+        v = -v
+    v = int(v * img.size[0])
+    return img.transform(img.size, PIL.Image.AFFINE, (1, 0, v, 0, 1, 0))
+
+
+def TranslateY(img, v, max_v, bias=0):
+    v = _float_parameter(v, max_v) + bias
+    if random.random() < 0.5:
+        v = -v
+    v = int(v * img.size[1])
+    return img.transform(img.size, PIL.Image.AFFINE, (1, 0, 0, 0, 1, v))
+
+
+def _float_parameter(v, max_v):
+    return float(v) * max_v / PARAMETER_MAX
+
+
+def _int_parameter(v, max_v):
+    return int(v * max_v / PARAMETER_MAX)
+
+
+def fixmatch_augment_pool():
+    # FixMatch paper
+    augs = [(AutoContrast, None, None),
+            (Brightness, 0.9, 0.05),
+            (Color, 0.9, 0.05),
+            (Contrast, 0.9, 0.05),
+            (Equalize, None, None),
+            (Identity, None, None),
+            (Posterize, 4, 4),
+            (Rotate, 30, 0),
+            (Sharpness, 0.9, 0.05),
+            (ShearX, 0.3, 0),
+            (ShearY, 0.3, 0),
+            (Solarize, 256, 0),
+            (TranslateX, 0.3, 0),
+            (TranslateY, 0.3, 0)]
+    return augs
+
+
+def my_augment_pool():
+    # Test
+    augs = [(AutoContrast, None, None),
+            (Brightness, 1.8, 0.1),
+            (Color, 1.8, 0.1),
+            (Contrast, 1.8, 0.1),
+            (Cutout, 0.2, 0),
+            (Equalize, None, None),
+            (Invert, None, None),
+            (Posterize, 4, 4),
+            (Rotate, 30, 0),
+            (Sharpness, 1.8, 0.1),
+            (ShearX, 0.3, 0),
+            (ShearY, 0.3, 0),
+            (Solarize, 256, 0),
+            (SolarizeAdd, 110, 0),
+            (TranslateX, 0.45, 0),
+            (TranslateY, 0.45, 0)]
+    return augs
+
+
+class RandAugmentPC(object):
+    def __init__(self, n, m):
+        assert n >= 1
+        assert 1 <= m <= 10
+        self.n = n
+        self.m = m
+        self.augment_pool = my_augment_pool()
+
+    def __call__(self, img):
+        ops = random.choices(self.augment_pool, k=self.n)
+        for op, max_v, bias in ops:
+            prob = np.random.uniform(0.2, 0.8)
+            if random.random() + prob >= 1:
+                img = op(img, v=self.m, max_v=max_v, bias=bias)
+        img = CutoutAbs(img, int(32*0.5))
+        return img
+
+
+class RandAugmentMC(object):
+    def __init__(self, n, m):
+        assert n >= 1
+        assert 1 <= m <= 10
+        self.n = n
+        self.m = m
+        self.augment_pool = fixmatch_augment_pool()
+
+    def __call__(self, img):
+        ops = random.choices(self.augment_pool, k=self.n)
+        for op, max_v, bias in ops:
+            v = np.random.randint(1, self.m)
+            if random.random() < 0.5:
+                img = op(img, v=v, max_v=max_v, bias=bias)
+        img = CutoutAbs(img, int(32*0.5))
+        return img
+File Path: cifar/utils/cifar_new.py
+Content:
+import torch.utils.data as data
+import numpy as np
+from PIL import Image
+
+class CIFAR_New(data.Dataset):
+	def __init__(self, root, transform=None, target_transform=None, version='v6'):
+		self.data = np.load('%s/cifar10.1_%s_data.npy' %(root, version))
+		self.targets = np.load('%s/cifar10.1_%s_labels.npy' %(root, version)).astype('long')
+		self.transform = transform
+		self.target_transform = target_transform
+
+	def __getitem__(self, index):
+		img, target = self.data[index], self.targets[index]
+		img = Image.fromarray(img)
+		if self.transform is not None:
+			img = self.transform(img)
+		if self.target_transform is not None:
+			target = self.target_transform(target)
+		if type(img) == list:
+			img.append(index)
+		else:
+			img = [img, index]
+		return img, target
+
+	def __len__(self):
+		return len(self.targets)
+File Path: cifar/utils/contrastive.py
+Content:
+import torch
+import torch.nn as nn
+
+
+class SupConLoss(nn.Module):
+    """Supervised Contrastive Learning: https://arxiv.org/pdf/2004.11362.pdf.
+    It also supports the unsupervised contrastive loss in SimCLR"""
+    def __init__(self, temperature=0.07, contrast_mode='all',
+                 base_temperature=0.07):
+        super(SupConLoss, self).__init__()
+        self.temperature = temperature
+        self.contrast_mode = contrast_mode
+        self.base_temperature = base_temperature
+
+    def forward(self, features, labels=None, mask=None):
+        """Compute loss for model. If both `labels` and `mask` are None,
+        it degenerates to SimCLR unsupervised loss:
+        https://arxiv.org/pdf/2002.05709.pdf
+
+        Args:
+            features: hidden vector of shape [bsz, n_views, ...].
+            labels: ground truth of shape [bsz].
+            mask: contrastive mask of shape [bsz, bsz], mask_{i,j}=1 if sample j
+                has the same class as sample i. Can be asymmetric.
+        Returns:
+            A loss scalar.
+        """
+        device = (torch.device('cuda')
+                  if features.is_cuda
+                  else torch.device('cpu'))
+
+        if len(features.shape) < 3:
+            raise ValueError('`features` needs to be [bsz, n_views, ...],'
+                             'at least 3 dimensions are required')
+        if len(features.shape) > 3:
+            features = features.view(features.shape[0], features.shape[1], -1)
+
+        batch_size = features.shape[0]
+        if labels is not None and mask is not None:
+            raise ValueError('Cannot define both `labels` and `mask`')
+        elif labels is None and mask is None:
+            mask = torch.eye(batch_size, dtype=torch.float32).to(device)
+        elif labels is not None:
+            labels = labels.contiguous().view(-1, 1)
+            if labels.shape[0] != batch_size:
+                raise ValueError('Num of labels does not match num of features')
+            mask = torch.eq(labels, labels.T).float().to(device)
+        else:
+            mask = mask.float().to(device)
+
+        contrast_count = features.shape[1]
+        contrast_feature = torch.cat(torch.unbind(features, dim=1), dim=0)
+        if self.contrast_mode == 'one':
+            anchor_feature = features[:, 0]
+            anchor_count = 1
+        elif self.contrast_mode == 'all':
+            anchor_feature = contrast_feature
+            anchor_count = contrast_count
+        else:
+            raise ValueError('Unknown mode: {}'.format(self.contrast_mode))
+
+        # compute logits
+        anchor_dot_contrast = torch.div(
+            torch.matmul(anchor_feature, contrast_feature.T),
+            self.temperature)
+        # for numerical stability
+        logits_max, _ = torch.max(anchor_dot_contrast, dim=1, keepdim=True)
+        logits = anchor_dot_contrast - logits_max.detach()
+
+        # tile mask
+        mask = mask.repeat(anchor_count, contrast_count)
+        # mask-out self-contrast cases
+        logits_mask = torch.scatter(
+            torch.ones_like(mask),
+            1,
+            torch.arange(batch_size * anchor_count).view(-1, 1).to(device),
+            0
+        )
+
+        mask = mask * logits_mask
+
+        # compute log_prob
+        exp_logits = torch.exp(logits) * logits_mask
+        log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True))
+
+        # compute mean of log-likelihood over positive
+        mean_log_prob_pos = (mask * log_prob).sum(1) / mask.sum(1)
+
+        # loss
+        loss = - (self.temperature / self.base_temperature) * mean_log_prob_pos
+        loss = loss.view(anchor_count, batch_size).mean()
+
+        return loss
+
+File Path: cifar/utils/misc.py
+Content:
+import os
+import math
+import torch
+from colorama import Fore
+
+def get_grad(params):
+	if isinstance(params, torch.Tensor):
+		params = [params]
+	params = list(filter(lambda p: p.grad is not None, params))
+	grad = [p.grad.data.cpu().view(-1) for p in params]
+	return torch.cat(grad)
+
+def write_to_txt(name, content):
+	with open(name, 'w') as text_file:
+		text_file.write(content)
+
+def my_makedir(name):
+	try:
+		os.makedirs(name)
+	except OSError:
+		pass
+
+def print_args(opt):
+	for arg in vars(opt):
+		print('%s %s' % (arg, getattr(opt, arg)))
+
+def mean(ls):
+	return sum(ls) / len(ls)
+
+def normalize(v):
+	return (v - v.mean()) / v.std()
+
+def flat_grad(grad_tuple):
+    return torch.cat([p.view(-1) for p in grad_tuple])
+
+def print_nparams(model):
+	nparams = sum([param.nelement() for param in model.parameters()])
+	print('number of parameters: %d' % (nparams))
+
+def print_color(color, string):
+	print(getattr(Fore, color) + string + Fore.RESET)
+
+def freeze_params(model):
+    for name, p in model.named_parameters():
+        p.requires_grad = False
+    print("Freeze parameter until", name)
+
+def print_params(model):
+    for name, p in model.named_parameters():
+        print(name)
+
+class AverageMeter(object):
+    """Computes and stores the average and current value"""
+    def __init__(self, name, fmt=':f'):
+        self.name = name
+        self.fmt = fmt
+        self.reset()
+
+    def reset(self):
+        self.val = 0
+        self.avg = 0
+        self.sum = 0
+        self.count = 0
+
+    def update(self, val, n=1):
+        self.val = val
+        self.sum += val * n
+        self.count += n
+        self.avg = self.sum / self.count
+
+    def __str__(self):
+        fmtstr = '{name} {val' + self.fmt + '} ({avg' + self.fmt + '})'
+        return fmtstr.format(**self.__dict__)
+
+def adjust_learning_rate(args, optimizer, epoch):
+    lr = args.lr
+
+    eta_min = lr * (args.lr_decay_rate ** 3)
+    lr = eta_min + (lr - eta_min) * (
+            1 + math.cos(math.pi * epoch / args.nepoch)) / 2
+
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
+
+File Path: cifar/utils/prepare_dataset.py
+Content:
+import torch
+import torch.utils.data
+import torchvision
+import torchvision.transforms as transforms
+import random
+import numpy as np
+from .augmentation import RandAugmentMC
+
+class CIFAR10(torchvision.datasets.CIFAR10):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        return
+    
+    def __getitem__(self, index: int):
+        image, target = super().__getitem__(index)
+        if type(image) == list:
+            image.append(index)
+        else:
+            image = [image, index]
+        return image, target
+
+class CIFAR100(torchvision.datasets.CIFAR100):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        return
+    
+    def __getitem__(self, index: int):
+        image, target = super().__getitem__(index)
+        if type(image) == list:
+            image.append(index)
+        else:
+            image = [image, index]
+        return image, target
+
+
+
+def prepare_transforms(dataset):
+
+    if dataset == 'cifar10':
+        mean = (0.4914, 0.4822, 0.4465)
+        std = (0.2023, 0.1994, 0.2010)
+    elif dataset == 'cifar100':
+        mean = (0.5071, 0.4867, 0.4408)
+        std = (0.2675, 0.2565, 0.2761)
+    else:
+        raise NotImplementedError
+
+    normalize = transforms.Normalize(mean=mean, std=std)
+
+    te_transforms = transforms.Compose([transforms.ToTensor(), normalize])
+
+    tr_transforms = transforms.Compose([
+        transforms.RandomResizedCrop(size=32, scale=(0.2, 1.)),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        normalize])
+
+    simclr_transforms = transforms.Compose([
+        transforms.RandomResizedCrop(size=32, scale=(0.2, 1.)),     # TODO: modify the hard-coded size
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomApply([
+            transforms.ColorJitter(0.4, 0.4, 0.4, 0.1)
+        ], p=0.8),
+        transforms.RandomGrayscale(p=0.2),
+        transforms.ToTensor(),
+        normalize
+    ])
+
+    return tr_transforms, te_transforms, simclr_transforms
+
+class TwoCropTransform:
+    """Create two crops of the same image"""
+    def __init__(self, transform, te_transform):
+        self.transform = transform
+        self.te_transform = te_transform
+
+    def __call__(self, x):
+        return [self.transform(x), self.transform(x), self.te_transform(x)]
+
+# -------------------------
+
+common_corruptions = ['gaussian_noise', 'shot_noise', 'impulse_noise', 'defocus_blur', 'glass_blur',
+                    'motion_blur', 'zoom_blur', 'snow', 'frost', 'fog',
+                    'brightness', 'contrast', 'elastic_transform', 'pixelate', 'jpeg_compression']
+
+def seed_worker(worker_id):
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+def prepare_mix_corruption(args, num_mix, foldername):
+    tesize = 10000
+    if num_mix == 10:
+        ## Contrast
+        teset_c_raw = np.load(foldername + '/contrast.npy')
+        teset_c_raw = teset_c_raw[(args.level-1)*tesize: args.level*tesize][:1000]
+
+        ## De_focus
+        teset_d_raw = np.load(foldername + '/defocus_blur.npy')
+        teset_d_raw = teset_d_raw[(args.level-1)*tesize: args.level*tesize][1000:2000]
+
+        ## Elastic
+        teset_e_raw = np.load(foldername + '/elastic_transform.npy')
+        teset_e_raw = teset_e_raw[(args.level-1)*tesize: args.level*tesize][2000:3000]
+
+        ## Fog
+        teset_f_raw = np.load(foldername + '/fog.npy')
+        teset_f_raw = teset_f_raw[(args.level-1)*tesize: args.level*tesize][3000:4000]
+
+        ## Frost
+        teset_fr_raw = np.load(foldername + '/frost.npy')
+        teset_fr_raw = teset_fr_raw[(args.level-1)*tesize: args.level*tesize][4000:5000]
+
+        ## Gaussian
+        teset_g_raw = np.load(foldername + '/gaussian_noise.npy')
+        teset_g_raw = teset_g_raw[(args.level-1)*tesize: args.level*tesize][5000:6000]
+
+        ## Glass
+        teset_gl_raw = np.load(foldername + '/glass_blur.npy')
+        teset_gl_raw = teset_gl_raw[(args.level-1)*tesize: args.level*tesize][6000:7000]
+
+        ## Impulse
+        teset_i_raw = np.load(foldername + '/impulse_noise.npy')
+        teset_i_raw = teset_i_raw[(args.level-1)*tesize: args.level*tesize][7000:8000]
+
+        ## JPEG
+        teset_j_raw = np.load(foldername + '/jpeg_compression.npy')
+        teset_j_raw = teset_j_raw[(args.level-1)*tesize: args.level*tesize][8000:9000]
+
+        ## Motion
+        teset_m_raw = np.load(foldername + '/motion_blur.npy')
+        teset_m_raw = teset_m_raw[(args.level-1)*tesize: args.level*tesize][9000:]
+
+        teset_mix_raw = np.concatenate([teset_c_raw, teset_d_raw, teset_e_raw, teset_f_raw, teset_fr_raw, teset_g_raw, teset_gl_raw, teset_i_raw, teset_j_raw, teset_m_raw])
+
+    elif num_mix == 5:
+        ## Frost
+        teset_fr_raw = np.load(foldername + '/frost.npy')
+        teset_fr_raw = teset_fr_raw[(args.level-1)*tesize: args.level*tesize][:2000]
+
+        ## Gaussian
+        teset_g_raw = np.load(foldername + '/gaussian_noise.npy')
+        teset_g_raw = teset_g_raw[(args.level-1)*tesize: args.level*tesize][2000:4000]
+
+        ## Glass
+        teset_gl_raw = np.load(foldername + '/glass_blur.npy')
+        teset_gl_raw = teset_gl_raw[(args.level-1)*tesize: args.level*tesize][4000:6000]
+
+        ## Impulse
+        teset_i_raw = np.load(foldername + '/impulse_noise.npy')
+        teset_i_raw = teset_i_raw[(args.level-1)*tesize: args.level*tesize][6000:8000]
+
+        ## JPEG
+        teset_j_raw = np.load(foldername + '/jpeg_compression.npy')
+        teset_j_raw = teset_j_raw[(args.level-1)*tesize: args.level*tesize][8000:]
+
+        teset_mix_raw = np.concatenate([teset_fr_raw, teset_g_raw, teset_gl_raw, teset_i_raw, teset_j_raw])
+    else:
+        raise NotImplementedError
+
+    return teset_mix_raw
+
+def prepare_test_data(args, ttt=False, num_sample=None, align=False):
+
+    tr_transforms, te_transforms, simclr_transforms = prepare_transforms(args.dataset)
+
+    if args.dataset == 'cifar10':
+
+        tesize = 10000
+        if not hasattr(args, 'corruption') or args.corruption == 'original':
+            print('Test on the original test set')
+            teset = torchvision.datasets.CIFAR10(root=args.dataroot,
+                                                train=False, download=True, transform=te_transforms)
+        elif args.corruption in common_corruptions:
+            print('Test on %s level %d' %(args.corruption, args.level))
+            teset_raw = np.load(args.dataroot + '/CIFAR-10-C/%s.npy' %(args.corruption))
+            teset_raw = teset_raw[(args.level-1)*tesize: args.level*tesize]
+            teset = CIFAR10(root=args.dataroot,
+                            train=False, download=True, transform=te_transforms)
+            teset.data = teset_raw
+
+        elif args.corruption == 'cifar_new':
+            from utils.cifar_new import CIFAR_New
+            print('Test on CIFAR-10.1')
+            if align:
+                teset = CIFAR_New(root=args.dataroot + '/CIFAR-10.1/datasets/', transform=tr_transforms)
+            else:
+                teset = CIFAR_New(root=args.dataroot + '/CIFAR-10.1/datasets/', transform=te_transforms)
+            permute = False
+
+        elif args.corruption == 'cifar_mix10':
+            print('Test on mix on 10 noises on level %d' %(args.level))
+            teset_mix_raw = prepare_mix_corruption(args, 10, args.dataroot + '/CIFAR-10-C')
+            teset = torchvision.datasets.CIFAR10(root=args.dataroot,
+                                                train=False, download=True, transform=te_transforms)
+            teset.data = teset_mix_raw
+
+        elif args.corruption == 'cifar_mix5':
+            print('Test on mix on 5 noises on level %d' %(args.level))
+            teset_mix_raw = prepare_mix_corruption(args, 5, args.dataroot + '/CIFAR-10-C')
+            teset = torchvision.datasets.CIFAR10(root=args.dataroot,
+                                                train=False, download=True, transform=te_transforms)
+            teset.data = teset_mix_raw
+
+        else:
+            raise Exception('Corruption not found!')
+
+    elif args.dataset == 'cifar100':
+     
+        tesize = 10000
+        if not hasattr(args, 'corruption') or args.corruption == 'original':
+            print('Test on the original test set')
+            teset = torchvision.datasets.CIFAR100(root=args.dataroot,
+                                                train=False, download=True, transform=te_transforms)
+        elif args.corruption in common_corruptions:
+            print('Test on %s level %d' %(args.corruption, args.level))
+            teset_raw = np.load(args.dataroot + '/CIFAR-100-C/%s.npy' %(args.corruption))
+            teset_raw = teset_raw[(args.level-1)*tesize: args.level*tesize]
+            teset = CIFAR100(root=args.dataroot,
+                                                train=False, download=True, transform=te_transforms)
+            teset.data = teset_raw
+        else:
+            raise Exception('Corruption not found!')
+
+    else:
+        raise Exception('Dataset not found!')
+
+    if not hasattr(args, 'workers') or args.workers < 2:
+        pin_memory = False
+    else:
+        pin_memory = True
+
+    if ttt:
+        shuffle = True
+        drop_last = True
+    else:
+        shuffle = True
+        drop_last = False
+
+    if num_sample and num_sample < teset.data.shape[0]:
+        teset.data = teset.data[:num_sample]
+        print("Truncate the test set to {:d} samples".format(num_sample))
+    try:
+        teloader = torch.utils.data.DataLoader(teset, batch_size=args.batch_size,
+                                            shuffle=shuffle, num_workers=args.workers,
+                                            worker_init_fn=seed_worker, pin_memory=pin_memory, drop_last=drop_last)
+    except:
+        teloader = None
+    return teset, teloader
+
+def prepare_train_data(args, num_sample=None):
+    print('Preparing data...')
+    
+    tr_transforms, te_transforms, simclr_transforms = prepare_transforms(args.dataset)
+
+    if args.dataset == 'cifar10':
+
+        if hasattr(args, 'ssl') and args.ssl == 'contrastive':
+            trset = CIFAR10(root=args.dataroot,
+                            train=False, download=True,
+                            transform=TwoCropTransform(simclr_transforms, te_transforms))
+            if hasattr(args, 'corruption') and args.corruption in common_corruptions:
+                print('Contrastive on %s level %d' %(args.corruption, args.level))
+                tesize = 10000
+                trset_raw = np.load(args.dataroot + '/CIFAR-10-C/%s.npy' %(args.corruption))
+                trset_raw = trset_raw[(args.level-1)*tesize: args.level*tesize]   
+                trset.data = trset_raw
+            elif hasattr(args, 'corruption') and args.corruption == 'cifar_new':
+                from utils.cifar_new import CIFAR_New
+                print('Contrastive on CIFAR-10.1')
+                trset_raw = CIFAR_New(root=args.dataroot + '/CIFAR-10.1/datasets/', transform=te_transforms)
+                trset.data = trset_raw.data
+            elif  hasattr(args, 'corruption') and args.corruption == 'cifar_mix10':
+                print('Test on mix on 10 noises on level %d' %(args.level))
+                trset_mix_raw = prepare_mix_corruption(args, 10, args.dataroot + '/CIFAR-10-C')
+                trset.data = trset_mix_raw
+            elif  hasattr(args, 'corruption') and args.corruption == 'cifar_mix5':
+                print('Test on mix on 5 noises on level %d' %(args.level))
+                trset_mix_raw = prepare_mix_corruption(args, 5, args.dataroot + '/CIFAR-10-C')
+                trset.data = trset_mix_raw
+            else:
+                print('Contrastive on ciar10 training set')
+        else:
+            trset = torchvision.datasets.CIFAR10(root=args.dataroot,
+                                        train=True, download=True, transform=tr_transforms)
+            print('Cifar10 training set')
+
+    elif args.dataset == 'cifar100':
+        if hasattr(args, 'ssl') and args.ssl == 'contrastive':
+            trset = torchvision.datasets.CIFAR100(root=args.dataroot,
+                                         train=True, download=True,
+                                         transform=TwoCropTransform(simclr_transforms, te_transforms))            
+            if hasattr(args, 'corruption') and args.corruption in common_corruptions:
+                print('Contrastive on %s level %d' %(args.corruption, args.level))
+                tesize = 10000
+                trset_raw = np.load(args.dataroot + '/CIFAR-100-C/%s.npy' %(args.corruption))
+                trset_raw = trset_raw[(args.level-1)*tesize: args.level*tesize]   
+                trset.data = trset_raw
+            else:
+                print('Contrastive on ciar10 training set')
+        else:
+            trset = torchvision.datasets.CIFAR100(root=args.dataroot,
+                                            train=True, download=True, transform=tr_transforms)
+            print('Cifar100 training set')
+    else:
+        raise Exception('Dataset not found!')
+
+    if not hasattr(args, 'workers') or args.workers < 2:
+        pin_memory = False
+    else:
+        pin_memory = True
+
+    if num_sample and num_sample < trset.data.shape[0]:
+        trset.data = trset.data[:num_sample]
+        print("Truncate the training set to {:d} samples".format(num_sample))
+
+    trloader = torch.utils.data.DataLoader(trset, batch_size=args.batch_size,
+                                            shuffle=True, num_workers=args.workers,
+                                            worker_init_fn=seed_worker, pin_memory=pin_memory, drop_last=False)
+    return trset, trloader
+
+File Path: cifar/utils/test_helpers.py
+Content:
+import numpy as np
+import torch
+import torch.nn as nn
+from utils.misc import *
+
+
+def load_resnet50(net, head, ssh, classifier, args):
+
+    if args.ckpt:
+        filename = args.resume + '/ckpt_epoch_{:d}.pth'.format(args.ckpt)
+    else:
+        filename = args.resume + '/ckpt.pth'
+    ckpt = torch.load(filename)
+    state_dict = ckpt['model']
+
+    net_dict = {}
+    head_dict = {}
+    for k, v in state_dict.items():
+        if k[:4] == "head":
+            k = k.replace("head.", "")
+            head_dict[k] = v
+        else:
+            k = k.replace("encoder.", "ext.")
+            k = k.replace("fc.", "head.fc.")
+            net_dict[k] = v
+
+    net.load_state_dict(net_dict)
+    head.load_state_dict(head_dict)
+
+    print('Loaded model trained jointly on Classification and SimCLR:', filename)
+
+
+def load_ttt(net, head, ssh, classifier, args, ttt=False):
+    if ttt:
+        filename = args.resume + '/{}_both_2_15.pth'.format(args.corruption)
+    else:
+        filename = args.resume + '/{}_both_15.pth'.format(args.corruption)
+    ckpt = torch.load(filename)
+    net.load_state_dict(ckpt['net'])
+    head.load_state_dict(ckpt['head'])
+    print('Loaded updated model from', filename)
+
+
+def corrupt_resnet50(ext, args):
+    try:
+        # SSL trained encoder
+        simclr = torch.load(args.restore + '/simclr.pth')
+        state_dict = simclr['model']
+
+        ext_dict = {}
+        for k, v in state_dict.items():
+            if k[:7] == "encoder":
+                k = k.replace("encoder.", "")
+                ext_dict[k] = v
+        ext.load_state_dict(ext_dict)
+
+        print('Corrupted encoder trained by SimCLR')
+
+    except:
+        # Jointly trained encoder
+        filename = args.resume + '/ckpt_epoch_{}.pth'.format(args.restore)
+
+        ckpt = torch.load(filename)
+        state_dict = ckpt['model']
+
+        ext_dict = {}
+        for k, v in state_dict.items():
+            if k[:7] == "encoder":
+                k = k.replace("encoder.", "")
+                ext_dict[k] = v
+        # import pdb; pdb.set_trace()
+        # print_params(ext)
+        ext.load_state_dict(ext_dict)
+        print('Corrupted encoder jontly trained on Classification and SimCLR')
+
+
+def build_resnet50(args):
+    from models.BigResNet import SupConResNet, LinearClassifier
+    from models.SSHead import ExtractorHead
+
+    print('Building ResNet50...')
+    if args.dataset == 'cifar10':
+        classes = 10
+    elif args.dataset == 'cifar7':
+        if not hasattr(args, 'modified') or args.modified:
+            classes = 7
+        else:
+            classes = 10
+    elif args.dataset == "cifar100":
+        classes = 100
+
+    classifier = LinearClassifier(num_classes=classes).cuda()
+    ssh = SupConResNet().cuda()
+    head = ssh.head
+    ext = ssh.encoder
+    net = ExtractorHead(ext, classifier).cuda()
+    return net, ext, head, ssh, classifier
+
+
+def build_model(args):
+    from models.ResNet import ResNetCifar as ResNet
+    from models.SSHead import ExtractorHead
+    print('Building model...')
+    if args.dataset == 'cifar10':
+        classes = 10
+    elif args.dataset == 'cifar7':
+        if not hasattr(args, 'modified') or args.modified:
+            classes = 7
+        else:
+            classes = 10
+    elif args.dataset == "cifar100":
+        classes = 100
+
+    if args.group_norm == 0:
+        norm_layer = nn.BatchNorm2d
+    else:
+        def gn_helper(planes):
+            return nn.GroupNorm(args.group_norm, planes)
+        norm_layer = gn_helper
+
+    if hasattr(args, 'detach') and args.detach:
+        detach = args.shared
+    else:
+        detach = None
+    net = ResNet(args.depth, args.width, channels=3, classes=classes, norm_layer=norm_layer, detach=detach).cuda()
+    if args.shared == 'none':
+        args.shared = None
+
+    if args.shared == 'layer3' or args.shared is None:
+        from models.SSHead import extractor_from_layer3
+        ext = extractor_from_layer3(net)
+        if not hasattr(args, 'ssl') or args.ssl == 'rotation':
+            head = nn.Linear(64 * args.width, 4)
+        elif args.ssl == 'contrastive':
+            head = nn.Sequential(
+                nn.Linear(64 * args.width, 64 * args.width),
+                nn.ReLU(inplace=True),
+                nn.Linear(64 * args.width, 16 * args.width)
+            )
+        else:
+            raise NotImplementedError
+    elif args.shared == 'layer2':
+        from models.SSHead import extractor_from_layer2, head_on_layer2
+        ext = extractor_from_layer2(net)
+        head = head_on_layer2(net, args.width, 4)
+    ssh = ExtractorHead(ext, head).cuda()
+
+    if hasattr(args, 'parallel') and args.parallel:
+        net = torch.nn.DataParallel(net)
+        ssh = torch.nn.DataParallel(ssh)
+    return net, ext, head, ssh
+
+
+def test(dataloader, model, **kwargs):
+    criterion = nn.CrossEntropyLoss(reduction='none').cuda()
+    model.eval()
+    correct = []
+    losses = []
+    for batch_idx, (inputs, labels) in enumerate(dataloader):
+        if type(inputs) == list:
+            inputs = inputs[0]
+        inputs, labels = inputs.cuda(), labels.cuda()
+        with torch.no_grad():
+            outputs = model(inputs, **kwargs)
+            loss = criterion(outputs, labels)
+            losses.append(loss.cpu())
+            _, predicted = outputs.max(1)
+            correct.append(predicted.eq(labels).cpu())
+    correct = torch.cat(correct).numpy()
+    losses = torch.cat(losses).numpy()
+    model.train()
+    return 1-correct.mean(), correct, losses
+
+
+def pair_buckets(o1, o2):
+    crr = np.logical_and( o1, o2 )
+    crw = np.logical_and( o1, np.logical_not(o2) )
+    cwr = np.logical_and( np.logical_not(o1), o2 )
+    cww = np.logical_and( np.logical_not(o1), np.logical_not(o2) )
+    return crr, crw, cwr, cww
+
+
+def count_each(tuple):
+    return [item.sum() for item in tuple]
+
+
+def plot_epochs(all_err_cls, all_err_ssh, fname, use_agg=True):
+    import matplotlib.pyplot as plt
+    if use_agg:
+        plt.switch_backend('agg')
+
+    plt.plot(np.asarray(all_err_cls)*100, color='r', label='classifier')
+    plt.plot(np.asarray(all_err_ssh)*100, color='b', label='self-supervised')
+    plt.xlabel('epoch')
+    plt.ylabel('test error (%)')
+    plt.legend()
+    plt.savefig(fname)
+    plt.close()
+
+
+@torch.jit.script
+def softmax_entropy(x: torch.Tensor) -> torch.Tensor:
+    """Entropy of softmax distribution from logits."""
+    return -(x.softmax(1) * x.log_softmax(1)).sum(1)
+
+
+File Path: imagenet/TTAC_onepass.py
+Content:
+import argparse
+
+import torch
+import torch.optim as optim
+import torch.utils.data as data
+# ----------------------------------
+
+import random
+import numpy as np
+import torch.backends.cudnn as cudnn
+
+from utils.test_helpers import build_model, test
+from utils.prepare_dataset import prepare_transforms, create_dataloader, ImageNetCorruption, ImageNet_
+from utils.offline import offline
+
+# ----------------------------------
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--dataroot', default=None)
+parser.add_argument('--batch_size', default=128, type=int)
+parser.add_argument('--workers', default=4, type=int)
+parser.add_argument('--lr', default=0.001, type=float)
+parser.add_argument('--iters', default=2, type=int)
+parser.add_argument('--corruption', default='snow')
+parser.add_argument('--seed', default=0, type=int)
+
+args = parser.parse_args()
+
+print(args)
+
+torch.manual_seed(args.seed)
+random.seed(args.seed)
+np.random.seed(args.seed)
+torch.cuda.manual_seed(args.seed)
+torch.cuda.manual_seed_all(args.seed)
+
+cudnn.benchmark = True
+
+########### build and load model #################
+net, ext, classifier = build_model()
+
+# ########### create dataset and dataloader #################
+train_transform, val_transform, val_corrupt_transform = prepare_transforms()
+
+source_dataset = ImageNet_(args.dataroot, 'val', transform=val_transform, is_carry_index=True)
+
+target_dataset_adapt = ImageNetCorruption(args.dataroot, args.corruption, transform=val_corrupt_transform, is_carry_index=True)
+target_dataset_test = ImageNetCorruption(args.dataroot, args.corruption, transform=val_corrupt_transform, is_carry_index=True)
+
+source_dataloader = create_dataloader(source_dataset, args, True, False)
+target_dataloader_test = create_dataloader(target_dataset_test, args, True, False)
+
+########### summary offline features #################
+ext_mean, ext_cov, ext_mean_categories, ext_cov_categories = offline(source_dataloader, ext, classifier)
+
+bias = ext_cov.max().item() / 30.
+template_ext_cov = torch.eye(2048).cuda() * bias
+
+########### create optimizer #################
+optimizer = optim.SGD(ext.parameters(), lr=args.lr, momentum=0.9)
+
+########### test before TTT #################
+print('Error (%)\t\ttest')
+err_cls = test(target_dataloader_test, net)[0]
+print(('Epoch %d:' %(0)).ljust(24) +
+            '%.2f\t\t' %(err_cls*100))
+# ########### TTT #################
+
+is_both_activated = False
+class_num = 1000
+
+sample_predict_ema_logit = torch.zeros(len(target_dataset_adapt), class_num, dtype=torch.float)
+sample_alpha = torch.ones(len(target_dataset_adapt), dtype=torch.float)
+
+ema_alpha = 0.9
+ema_ext_mu = torch.zeros(class_num, 2048).cuda()
+ema_ext_cov = torch.zeros(class_num, 2048).cuda()
+ema_n = torch.zeros(class_num).cuda()
+ema_ext_total_mu = torch.zeros(2048).cuda()
+ema_ext_total_cov = torch.zeros(2048, 2048).cuda()
+ema_total_n = 0.
+
+class_ema_length = 64
+loss_scale = 0.05
+mini_batch_length = 4096
+
+mini_batch_indices = []
+correct = []
+
+for te_batch_idx, (te_inputs, te_labels) in enumerate(target_dataloader_test):
+    mini_batch_indices.extend(te_inputs[-1].tolist())
+    mini_batch_indices = mini_batch_indices[-mini_batch_length:]
+    print('mini_batch_length:', len(mini_batch_indices))
+    try:
+        del target_adapt_subset
+        del target_dataloader_adapt
+    except:
+        pass
+
+    target_adapt_subset = data.Subset(target_dataset_adapt, mini_batch_indices)
+    target_dataloader_adapt = create_dataloader(target_adapt_subset, args, True, True)
+
+    net.train()
+    for iter_id in range(min(args.iters, int(len(mini_batch_indices) / 256) + 1) + 1):
+        if iter_id > 0:
+            sample_alpha = torch.where(sample_alpha < 1, sample_alpha + 0.2, torch.ones_like(sample_alpha))
+        
+        for batch_idx, (inputs, labels) in enumerate(target_dataloader_adapt):
+            optimizer.zero_grad()
+
+            ####### feature alignment ###########
+            loss = 0.
+            inputs, indexes = inputs
+            inputs = inputs.cuda()
+
+            feat_ext = ext(inputs)
+            with torch.no_grad():
+                net.eval()
+                origin_images = inputs
+                origin_image_index = indexes
+                predict_logit = net(origin_images)
+                softmax_logit = predict_logit.softmax(dim=1).cpu()
+
+                old_logit = sample_predict_ema_logit[origin_image_index, :]
+                max_val, max_pos = softmax_logit.max(dim=1)
+                old_max_val = old_logit[torch.arange(max_pos.shape[0]), max_pos]
+                accept_mask = max_val > (old_max_val - 0.01)
+
+                sample_alpha[origin_image_index] = torch.where(accept_mask, sample_alpha[origin_image_index], torch.zeros_like(accept_mask).float())
+
+                sample_predict_ema_logit[origin_image_index, :] = \
+                    torch.where(sample_predict_ema_logit[origin_image_index, :] == torch.zeros(class_num), \
+                                softmax_logit, \
+                                (1 - ema_alpha) * sample_predict_ema_logit[origin_image_index, :] + ema_alpha * softmax_logit)
+                
+                pro, pseudo_label = sample_predict_ema_logit[origin_image_index].max(dim=1)
+
+                net.train()
+                del predict_logit
+
+            pseudo_label_mask = (pro > 0.9) & (sample_alpha[origin_image_index] == 1)
+            feat_ext2 = feat_ext[pseudo_label_mask]
+            pseudo_label2 = pseudo_label[pseudo_label_mask].cuda()
+
+            # Gaussian Mixture Distribution Alignment
+            b, d = feat_ext2.shape
+            feat_ext2_categories = torch.zeros(class_num, b, d).cuda() # K, N, D
+            feat_ext2_categories.scatter_add_(dim=0, index=pseudo_label2[None, :, None].expand(-1, -1, d), src=feat_ext2[None, :, :])
+
+            num_categories = torch.zeros(class_num, b, dtype=torch.int).cuda() # K, N
+            num_categories.scatter_add_(dim=0, index=pseudo_label2[None, :], src=torch.ones_like(pseudo_label2[None, :], dtype=torch.int))
+
+            ema_n += num_categories.sum(dim=1) # K
+            alpha = torch.where(ema_n > class_ema_length, torch.ones(class_num, dtype=torch.float).cuda() / class_ema_length, 1. / (ema_n + 1e-10))
+
+            delta_pre = (feat_ext2_categories - ema_ext_mu[:, None, :]) * num_categories[:, :, None] # K, N, D
+            delta = alpha[:, None] * delta_pre.sum(dim=1) # K, D
+            ext_mu_categories = ema_ext_mu + delta
+            ext_sigma_categories = ema_ext_cov + alpha[:, None] * ((delta_pre ** 2).sum(dim=1) - num_categories.sum(dim=1)[:, None] * ema_ext_cov) - delta ** 2
+            with torch.no_grad():
+                ema_ext_mu = ext_mu_categories.detach()
+                ema_ext_cov = ext_sigma_categories.detach()
+            
+            if iter_id > int(args.iters / 2):
+                for label in pseudo_label2.unique():
+                    if ema_n[label] > class_ema_length:
+                        source_domain = torch.distributions.MultivariateNormal(ext_mean_categories[label, :], torch.diag_embed(ext_cov_categories[label, :]) + template_ext_cov)
+                        target_domain = torch.distributions.MultivariateNormal(ext_mu_categories[label, :], torch.diag_embed(ext_sigma_categories[label, :]) + template_ext_cov)
+                        loss += (torch.distributions.kl_divergence(source_domain, target_domain) + torch.distributions.kl_divergence(target_domain, source_domain)) * loss_scale / class_num
+            
+            # Gaussian Distribution Alignment
+            b = feat_ext.shape[0]
+            ema_total_n += b
+            alpha = 1. / 1280 if ema_total_n > 1280 else 1. / ema_total_n
+            delta = alpha * (feat_ext - ema_ext_total_mu).sum(dim=0)
+            tmp_mu = ema_ext_total_mu + delta
+            tmp_cov = ema_ext_total_cov + alpha * ((feat_ext - ema_ext_total_mu).t() @ (feat_ext - ema_ext_total_mu) - b * ema_ext_total_cov) - delta[:, None] @ delta[None, :]
+
+            with torch.no_grad():
+                ema_ext_total_mu = tmp_mu.detach()
+                ema_ext_total_cov = tmp_cov.detach()
+            source_domain = torch.distributions.MultivariateNormal(ext_mean, ext_cov + template_ext_cov)
+            target_domain = torch.distributions.MultivariateNormal(tmp_mu, tmp_cov + template_ext_cov)
+            loss += (torch.distributions.kl_divergence(source_domain, target_domain) + torch.distributions.kl_divergence(target_domain, source_domain)) * loss_scale
+
+            loss.backward()
+            del loss
+
+            if iter_id > 0:
+                optimizer.step()
+                optimizer.zero_grad()
+    #### Test ####
+    net.eval()
+    with torch.no_grad():
+        outputs = net(te_inputs[0].cuda())
+        _, predicted = outputs.max(1)
+        correct.append(predicted.cpu().eq(te_labels))
+
+    print('BATCH: %d/%d' % (te_batch_idx + 1, len(target_dataloader_test)), 'instance error:', 1 - torch.cat(correct).numpy().mean())
+    net.train()
+
+print(args.corruption, 'Test time training result:', 1 - torch.cat(correct).numpy().mean())
+
+
+
+
+
+File Path: imagenet/TTAC_onepass_without_queue.py
+Content:
+import argparse
+
+import torch
+import torch.optim as optim
+# ----------------------------------
+
+import random
+import numpy as np
+
+from utils.test_helpers import build_model, test
+from utils.prepare_dataset import prepare_transforms, create_dataloader, ImageNetCorruption, ImageNet_
+from utils.offline import offline
+
+# ----------------------------------
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--dataroot', default=None)
+parser.add_argument('--batch_size', default=128, type=int)
+parser.add_argument('--workers', default=4, type=int)
+parser.add_argument('--lr', default=0.001, type=float)
+parser.add_argument('--corruption', default='snow')
+parser.add_argument('--seed', default=0, type=int)
+
+args = parser.parse_args()
+
+print(args)
+
+torch.manual_seed(args.seed)
+random.seed(args.seed)
+np.random.seed(args.seed)
+torch.cuda.manual_seed(args.seed)
+torch.cuda.manual_seed_all(args.seed)
+
+########### build and load model #################
+net, ext, classifier = build_model()
+
+# ########### create dataset and dataloader #################
+train_transform, val_transform, val_corrupt_transform = prepare_transforms()
+
+source_dataset = ImageNet_(args.dataroot, 'val', transform=val_transform, is_carry_index=True)
+
+target_dataset_adapt = ImageNetCorruption(args.dataroot, args.corruption, transform=val_corrupt_transform, is_carry_index=True)
+target_dataset_test = ImageNetCorruption(args.dataroot, args.corruption, transform=val_corrupt_transform, is_carry_index=True)
+
+source_dataloader = create_dataloader(source_dataset, args, True, False)
+target_dataloader_test = create_dataloader(target_dataset_test, args, True, False)
+
+########### summary offline features #################
+ext_mean, ext_cov, ext_mean_categories, ext_cov_categories = offline(source_dataloader, ext, classifier)
+
+bias = ext_cov.max().item() / 30.
+template_ext_cov = torch.eye(2048).cuda() * bias
+
+########### create optimizer #################
+optimizer = optim.SGD(ext.parameters(), lr=args.lr, momentum=0.9)
+########### test before TTT #################
+print('Error (%)\t\ttest')
+err_cls = test(target_dataloader_test, net)[0]
+print(('Epoch %d:' %(0)).ljust(24) +
+            '%.2f\t\t' %(err_cls*100))
+
+# ########### TTT #################
+
+class_num = 1000
+
+sample_predict_ema_logit = torch.zeros(len(target_dataset_adapt), class_num, dtype=torch.float)
+sample_alpha = torch.ones(len(target_dataset_adapt), dtype=torch.float)
+
+ema_alpha = 0.9
+ema_ext_mu = ext_mean_categories.clone()
+ema_ext_cov = ext_cov_categories.clone()
+ema_ext_total_mu = torch.zeros(2048).cuda()
+ema_ext_total_cov = torch.zeros(2048, 2048).cuda()
+
+class_ema_length = 64
+ema_n = torch.ones(class_num).cuda() * class_ema_length
+ema_total_n = 0.
+
+loss_scale = 0.05
+
+correct = []
+
+for te_batch_idx, (te_inputs, te_labels) in enumerate(target_dataloader_test):
+    net.train()
+    optimizer.zero_grad()
+
+    ####### feature alignment ###########
+    loss = 0.
+    inputs = te_inputs[0].cuda()
+
+    feat_ext = ext(inputs)
+    logit = classifier(feat_ext)
+    softmax_logit = logit.softmax(dim=-1)
+    pro, pseudo_label = softmax_logit.max(dim=-1)
+    pseudo_label_mask = (pro > 0.9)
+    feat_ext2 = feat_ext[pseudo_label_mask]
+    pseudo_label2 = pseudo_label[pseudo_label_mask].cuda()
+
+    # Gaussian Mixture Distribution Alignment
+    b, d = feat_ext2.shape
+    feat_ext2_categories = torch.zeros(class_num, b, d).cuda() # K, N, D
+    feat_ext2_categories.scatter_add_(dim=0, index=pseudo_label2[None, :, None].expand(-1, -1, d), src=feat_ext2[None, :, :])
+
+    num_categories = torch.zeros(class_num, b, dtype=torch.int).cuda() # K, N
+    num_categories.scatter_add_(dim=0, index=pseudo_label2[None, :], src=torch.ones_like(pseudo_label2[None, :], dtype=torch.int))
+
+    ema_n += num_categories.sum(dim=1) # K
+    alpha = torch.where(ema_n > class_ema_length, torch.ones(class_num, dtype=torch.float).cuda() / class_ema_length, 1. / (ema_n + 1e-10))
+
+    delta_pre = (feat_ext2_categories - ema_ext_mu[:, None, :]) * num_categories[:, :, None] # K, N, D
+    delta = alpha[:, None] * delta_pre.sum(dim=1) # K, D
+    ext_mu_categories = ema_ext_mu + delta
+    ext_sigma_categories = ema_ext_cov + alpha[:, None] * ((delta_pre ** 2).sum(dim=1) - num_categories.sum(dim=1)[:, None] * ema_ext_cov) - delta ** 2
+    
+    for label in pseudo_label2.unique():
+        if ema_n[label] > class_ema_length:
+            source_domain = torch.distributions.MultivariateNormal(ext_mean_categories[label, :], torch.diag_embed(ext_cov_categories[label, :]) + template_ext_cov)
+            target_domain = torch.distributions.MultivariateNormal(ext_mu_categories[label, :], torch.diag_embed(ext_sigma_categories[label, :]) + template_ext_cov)
+            loss += (torch.distributions.kl_divergence(source_domain, target_domain) + torch.distributions.kl_divergence(target_domain, source_domain)) * loss_scale
+    with torch.no_grad():
+        ema_ext_mu = ext_mu_categories.detach()
+        ema_ext_cov = ext_sigma_categories.detach()
+
+    # Gaussian Distribution Alignment
+    b = feat_ext.shape[0]
+    ema_total_n += b
+    alpha = 1. / 1280 if ema_total_n > 1280 else 1. / ema_total_n
+    delta = alpha * (feat_ext - ema_ext_total_mu).sum(dim=0)
+    tmp_mu = ema_ext_total_mu + delta
+    tmp_cov = ema_ext_total_cov + alpha * ((feat_ext - ema_ext_total_mu).t() @ (feat_ext - ema_ext_total_mu) - b * ema_ext_total_cov) - delta[:, None] @ delta[None, :]
+
+    with torch.no_grad():
+        ema_ext_total_mu = tmp_mu.detach()
+        ema_ext_total_cov = tmp_cov.detach()
+    source_domain = torch.distributions.MultivariateNormal(ext_mean, ext_cov + template_ext_cov)
+    target_domain = torch.distributions.MultivariateNormal(tmp_mu, tmp_cov + template_ext_cov)
+    loss += (torch.distributions.kl_divergence(source_domain, target_domain) + torch.distributions.kl_divergence(target_domain, source_domain)) * loss_scale
+
+    loss.backward()
+    optimizer.step()
+    optimizer.zero_grad()
+    #### Test ####
+    net.eval()
+    with torch.no_grad():
+        outputs = net(te_inputs[0].cuda())
+        _, predicted = outputs.max(1)
+        correct.append(predicted.cpu().eq(te_labels))
+
+    print('BATCH: %d/%d' % (te_batch_idx + 1, len(target_dataloader_test)), 'instance error:', 1 - torch.cat(correct).numpy().mean())
+    net.train()
+
+print(args.corruption, 'Test time training result:', 1 - torch.cat(correct).numpy().mean())
+
+
+
+
+
+File Path: imagenet/model/resnet.py
+Content:
+import torch.nn as nn
+import torchvision.models as models
+
+
+class SupCEResNet(nn.Module):
+    """official Resnet for image classification, e.g., ImageNet"""
+    def __init__(self, name='resnet50'):
+        super(SupCEResNet, self).__init__()
+        self.encoder = models.__dict__[name](pretrained=True)
+        self.fc = self.encoder.fc
+        self.encoder.fc = nn.Identity()
+
+    def forward(self, x):
+        return self.fc(self.encoder(x))
+
+File Path: imagenet/utils/create_corruption_dataset.py
+Content:
+from imagenet_c import *
+from torchvision.datasets import ImageNet
+import torchvision.transforms as transforms
+from torch.utils.data import DataLoader
+import os
+import torch
+import gorilla
+
+DATA_ROOT = './data'
+CORRUPTION_PATH = './corruption'
+
+
+corruption_tuple = (gaussian_noise, shot_noise, impulse_noise, defocus_blur,
+                    glass_blur, motion_blur, zoom_blur, snow, frost, fog,
+                    brightness, contrast, elastic_transform, pixelate, jpeg_compression)
+
+corruption_dict = {corr_func.__name__: corr_func for corr_func in corruption_tuple}
+
+class corrupt(object):
+    def __init__(self, corruption_name, severity=5):
+        self.corruption_name = corruption_name
+        self.severity = severity
+        return
+    
+    def __call__(self, x):
+        # x: PIL.Image
+        x_corrupted = corruption_dict[self.corruption_name](x, self.severity)
+        return np.uint8(x_corrupted)
+    
+    def __repr__(self):
+        return "Corruption(name=" + self.corruption_name + ", severity=" + str(self.severity) + ")"
+
+
+
+if os.path.exists(os.path.join(DATA_ROOT, CORRUPTION_PATH)) is False:
+    os.mkdir(os.path.join(DATA_ROOT, CORRUPTION_PATH))
+
+
+for corruption in corruption_dict.keys():
+    if os.path.exists(os.path.join(DATA_ROOT, CORRUPTION_PATH, corruption + '.pth')):
+        continue
+    print(corruption)
+    val_transform = transforms.Compose([
+        transforms.Resize(256),
+        transforms.CenterCrop(224),
+        corrupt(corruption, 5)
+    ])
+
+    target_dataset = ImageNet(DATA_ROOT, 'val', transform=val_transform)
+
+    target_dataloader = DataLoader(target_dataset, batch_size=256, shuffle=False, drop_last=False, num_workers=2)
+
+    datas = []
+    for batch in gorilla.track(target_dataloader):
+        datas.append(batch[0])
+    datas = torch.concat(datas)
+    torch.save(datas, os.path.join(DATA_ROOT, CORRUPTION_PATH, corruption + '.pth'))
+
+
+
+File Path: imagenet/utils/offline.py
+Content:
+import torch
+import os
+
+def covariance(features):
+    assert len(features.size()) == 2, "TODO: multi-dimensional feature map covariance"
+    n = features.shape[0]
+    tmp = torch.ones((1, n), device=features.device) @ features
+    cov = (features.t() @ features - (tmp.t() @ tmp) / n) / n
+    return cov
+
+def offline(trloader, ext, classifier, num_classes=1000):
+    if os.path.exists('offline.pth'):
+        data = torch.load('offline.pth')
+        return data
+
+    ext.eval()
+
+    feat_ext_mean = torch.zeros(2048).cuda()
+    feat_ext_variance = torch.zeros(2048, 2048).cuda()
+
+    feat_ext_mean_categories = torch.zeros(num_classes, 2048).cuda() # K, D
+    feat_ext_variance_categories = torch.zeros(num_classes, 2048).cuda()
+
+    ema_n = torch.zeros(num_classes).cuda()
+    ema_total_n = 0
+
+    with torch.no_grad():
+        for batch_idx, (inputs, labels) in enumerate(trloader):
+            feat = ext(inputs[0].cuda()) # N, D
+            b, d = feat.shape
+            labels = classifier(feat).argmax(dim=-1)
+
+            feat_ext_categories = torch.zeros(num_classes, b, d).cuda()
+            feat_ext_categories.scatter_add_(dim=0, index=labels[None, :, None].expand(-1, -1, d), src=feat[None, :, :])
+            
+            num_categories = torch.zeros(num_classes, b, dtype=torch.int).cuda()
+            num_categories.scatter_add_(dim=0, index=labels[None, :], src=torch.ones_like(labels[None, :], dtype=torch.int))
+            ema_n += num_categories.sum(dim=1)
+            alpha_categories = 1 / (ema_n + 1e-10)  # K
+            delta_pre = (feat_ext_categories - feat_ext_mean_categories[:, None, :]) * num_categories[:, :, None] # K, N, D
+            delta = alpha_categories[:, None] * delta_pre.sum(dim=1) # K, D
+            feat_ext_mean_categories += delta
+            feat_ext_variance_categories += alpha_categories[:, None] * ((delta_pre ** 2).sum(dim=1) - num_categories.sum(dim=1)[:, None] * feat_ext_variance_categories) \
+                                          - delta ** 2
+            
+            ema_total_n += b
+            alpha = 1 / (ema_total_n + 1e-10)
+            delta_pre = feat - feat_ext_mean[None, :] # b, d
+            delta = alpha * (delta_pre).sum(dim=0)
+            feat_ext_mean += delta
+            feat_ext_variance += alpha * (delta_pre.t() @ delta_pre - b * feat_ext_variance) - delta[:, None] @ delta[None, :]
+            print('offline process rate: %.2f%%\r' % ((batch_idx + 1) / len(trloader) * 100.), end='')
+
+
+    torch.save((feat_ext_mean, feat_ext_variance, feat_ext_mean_categories, feat_ext_variance_categories), 'offline.pth')
+    return feat_ext_mean, feat_ext_variance, feat_ext_mean_categories, feat_ext_variance_categories
+File Path: imagenet/utils/prepare_dataset.py
+Content:
+import torch
+import random
+import numpy as np
+import torchvision.transforms as transforms
+from torchvision.datasets import ImageNet
+import os
+
+def prepare_transforms():
+    train_transform = transforms.Compose([
+        transforms.RandomResizedCrop(224),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
+    ])
+    val_transform = transforms.Compose([
+        transforms.Resize(256),
+        transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
+    ])
+    val_corrupt_transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
+    ])
+    return train_transform, val_transform, val_corrupt_transform
+
+def seed_worker(worker_id):
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+def create_dataloader(dataset, args, shuffle=False, drop_last=False):
+    return torch.utils.data.DataLoader(dataset, 
+                                batch_size=args.batch_size, 
+                                shuffle=shuffle, 
+                                num_workers=args.workers, 
+                                worker_init_fn=seed_worker, 
+                                pin_memory=True, 
+                                drop_last=drop_last)
+
+
+class ImageNetCorruption(ImageNet):
+    def __init__(self, root, corruption_name="gaussian_noise", transform=None, is_carry_index=False):
+        super().__init__(root, 'val', transform=transform)
+        self.root = root
+        self.corruption_name = corruption_name
+        self.transform = transform
+        self.is_carry_index = is_carry_index
+        self.load_data()
+    
+    def load_data(self):
+        self.data = torch.load(os.path.join(self.root, 'corruption', self.corruption_name + '.pth')).numpy()
+        self.target = [i[1] for i in self.imgs]
+        return
+    
+    def __getitem__(self, index):
+        img = self.data[index, :, :, :]
+        target = self.target[index]
+        if self.transform is not None:
+            img = self.transform(img)
+        if self.is_carry_index:
+            img = [img, index]
+        return img, target
+    
+    def __len__(self):
+        return self.data.shape[0]
+
+class ImageNet_(ImageNet):
+    def __init__(self, *args, is_carry_index=False, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.is_carry_index = is_carry_index
+    
+    def __getitem__(self, index: int):
+        img, target = super().__getitem__(index)
+        if self.is_carry_index:
+            if type(img) == list:
+                img.append(index)
+            else:
+                img = [img, index]
+        return img, target
+
+
+
+File Path: imagenet/utils/test_helpers.py
+Content:
+import torch
+from model.resnet import SupCEResNet
+
+def build_model():
+    print("Building ResNet50...")
+    model = SupCEResNet().cuda()
+    ext = model.encoder
+    classifier = model.fc
+    return model, ext, classifier
+
+
+def test(dataloader, model, **kwargs):
+    model.eval()
+    correct = []
+    for batch_idx, (inputs, labels) in enumerate(dataloader):
+        if type(inputs) == list:
+            inputs = inputs[0]
+        inputs, labels = inputs.cuda(), labels.cuda()
+        with torch.no_grad():
+            outputs = model(inputs, **kwargs)
+            _, predicted = outputs.max(1)
+            correct.append(predicted.eq(labels).cpu())
+    correct = torch.cat(correct).numpy()
+    model.train()
+    return 1-correct.mean(), correct
+
+Output:
+{
+    "experimental_code": "parser = argparse.ArgumentParser()\nparser.add_argument('--dataset', default='cifar10')\nparser.add_argument('--dataroot', default='./data')\nparser.add_argument('--batch_size', default=128, type=int)\nparser.add_argument('--batch_size_align', default=512, type=int)\nparser.add_argument('--workers', default=0, type=int)\nparser.add_argument('--num_sample', default=1000000, type=int)\nparser.add_argument('--lr', default=0.001, type=float)\nparser.add_argument('--iters', default=4, type=int)\nparser.add_argument('--outf', default='.')\nparser.add_argument('--level', default=5, type=int)\nparser.add_argument('--corruption', default='snow')\nparser.add_argument('--resume', default=None, help='directory of pretrained model')\nparser.add_argument('--ckpt', default=None, type=int)\nparser.add_argument('--ssl', default='contrastive', help='self-supervised task')\nparser.add_argument('--temperature', default=0.5, type=float)\nparser.add_argument('--align_ext', action='store_true')\nparser.add_argument('--align_ssh', action='store_true')\nparser.add_argument('--fix_ssh', action='store_true')\nparser.add_argument('--with_ssl', action='store_true', default=False)\nparser.add_argument('--with_shot', action='store_true', default=False)\nparser.add_argument('--without_global', action='store_true', default=False)\nparser.add_argument('--without_mixture', action='store_true', default=False)\nparser.add_argument('--filter', default='ours', choices=['ours', 'posterior', 'none'])\nparser.add_argument('--model', default='resnet50', help='resnet50')\nparser.add_argument('--seed', default=0, type=int)\nargs = parser.parse_args()\n\nclass_num = 10 if args.dataset == 'cifar10' else 100\n\n# Offline Feature Summarization (Source Domain Statistics)\next_src_mu, ext_src_cov, ssh_src_mu, ssh_src_cov, mu_src_ext, cov_src_ext, mu_src_ssh, cov_src_ssh = offline(offlineloader, ext, classifier, head, class_num)\nbias = cov_src_ext.max().item() / 30.\nbias2 = cov_src_ssh.max().item() / 30.\ntemplate_ext_cov = torch.eye(2048).cuda() * bias\ntemplate_ssh_cov = torch.eye(128).cuda() * bias2\n\n# Initialization of Target Domain Gaussians and EMA for Pseudo-labels\next_src_mu = torch.stack(ext_src_mu)\next_src_cov = torch.stack(ext_src_cov) + template_ext_cov[None, :, :]\nsource_component_distribution = torch.distributions.MultivariateNormal(ext_src_mu, ext_src_cov)\ntarget_compoent_distribution = torch.distributions.MultivariateNormal(ext_src_mu, ext_src_cov)\n\nsample_predict_ema_logit = torch.zeros(len(tr_dataset), class_num, dtype=torch.float)\nsample_predict_alpha = torch.ones(len(tr_dataset), dtype=torch.float)\nema_alpha = 0.9\n\nema_n = torch.zeros(class_num).cuda()\nema_ext_mu = ext_src_mu.clone()\nema_ext_cov = ext_src_cov.clone()\n\nema_ext_total_mu = torch.zeros(2048).float()\nema_ext_total_cov = torch.zeros(2048, 2048).float()\n\nema_ssh_total_mu = torch.zeros(128).float()\nema_ssh_total_cov = torch.zeros(128, 128).float()\n\nema_total_n = 0.\nif class_num == 10:\n    ema_length = 128\n    mini_batch_length = 4096\nelse:\n    ema_length = 64\n    mini_batch_length = 4096\n\nif class_num == 10:\n    loss_scale = 0.05\nelse:\n    loss_scale = 0.5\n\nmini_batch_indices = []\n\n# Main adaptation loop for each incoming test batch\nfor te_batch_idx, (te_inputs, te_labels) in enumerate(teloader):\n    # Fixed-length queue for recent test samples\n    mini_batch_indices.extend(te_inputs[-1].tolist())\n    mini_batch_indices = mini_batch_indices[-mini_batch_length:]\n\n    # Dataloader re-creation for subset of recent samples\n    # (Code for tr_dataset_subset, tr_dataloader, tr_dataset_extra_subset, tr_extra_dataloader, tr_extra_dataloader_iter omitted for brevity)\n\n    for iter_id in range(min(args.iters, int(len(mini_batch_indices) / 256) + 1) + 1):\n        if iter_id > 0:\n            sample_predict_alpha = torch.where(sample_predict_alpha < 1, sample_predict_alpha + 0.2, torch.ones_like(sample_predict_alpha))\n\n        for batch_idx, (inputs_dummy, labels_dummy) in enumerate(tr_dataloader): # inputs_dummy/labels_dummy are for SSL, actual inputs for TTAC from tr_extra_dataloader_iter\n            optimizer.zero_grad()\n\n            # If args.with_ssl is True, SSL loss computation happens here (omitted for TTAC core method focus)\n\n            if iter_id > 0: # Actual TTAC adaptation begins after first iteration\n                loss = 0.\n                # Fetch inputs from the extra dataloader (containing current mini-batch samples from queue)\n                try:\n                    inputs, indexes = next(tr_extra_dataloader_iter)\n                except StopIteration:\n                    # Re-initialize iterator if exhausted\n                    tr_extra_dataloader_iter = iter(tr_extra_dataloader)\n                    inputs, indexes = next(tr_extra_dataloader_iter)\n\n                inputs = inputs.cuda()\n\n                feat_ext = ext(inputs)\n                logit = classifier(feat_ext)\n                feat_ssh = head(feat_ext)\n\n                # Pseudo-label generation with temporal consistency filtering\n                with torch.no_grad():\n                    ext.eval()\n                    origin_images = inputs\n                    origin_image_index = indexes\n                    predict_logit = net(origin_images)\n                    softmax_logit = predict_logit.softmax(dim=1).cpu()\n\n                    old_logit = sample_predict_ema_logit[origin_image_index, :]\n                    max_val, max_pos = softmax_logit.max(dim=1)\n                    old_max_val = old_logit[torch.arange(max_pos.shape[0]), max_pos]\n                    accept_mask = max_val > (old_max_val - 0.001)\n\n                    sample_predict_alpha[origin_image_index] = torch.where(accept_mask, sample_predict_alpha[origin_image_index], torch.zeros_like(accept_mask).float())\n\n                    sample_predict_ema_logit[origin_image_index, :] = \\\n                        torch.where(sample_predict_ema_logit[origin_image_index, :] == torch.zeros(class_num), \\\n                                    softmax_logit, \\\n                                    (1 - ema_alpha) * sample_predict_ema_logit[origin_image_index, :] + ema_alpha * softmax_logit)\n\n                    pro, pseudo_label = sample_predict_ema_logit[origin_image_index].max(dim=1)\n                    ext.train()\n                    del predict_logit\n\n                # Pseudo-label filtering mechanism\n                if args.filter == 'ours':\n                    pseudo_label_mask = (sample_predict_alpha[origin_image_index] == 1) & (pro > 0.9)\n                    feat_ext2 = feat_ext[pseudo_label_mask]\n                    feat_ssh2 = feat_ssh[pseudo_label_mask]\n                    pseudo_label2 = pseudo_label[pseudo_label_mask].cuda()\n                elif args.filter == 'posterior':\n                    with torch.no_grad():\n                        posterior = target_compoent_distribution.log_prob(feat_ext[:, None, :]) # log prob\n                        posterior_tmp = posterior.max(dim=1, keepdim=True)[0] - math.log((2 ** 127) / 10) # B, K\n                        posterior -= posterior_tmp\n                        posterior = posterior.exp() # prob / exp(posterior_tmp)\n                        posterior /= posterior.sum(dim=1, keepdim=True)\n                        posterior = posterior.transpose(0, 1).detach()  # K, N\n                # else: args.filter == 'none'\n\n                if args.align_ext:\n                    if not args.without_mixture:\n                        # Mixture Gaussian Alignment (Category-wise KL-Divergence & Iterative Update with Clipping)\n                        if args.filter != 'posterior': # Using pseudo_labels directly\n                            b, d = feat_ext2.shape\n                            feat_ext2_categories = torch.zeros(class_num, b, d).cuda() # K, N, D\n                            feat_ext2_categories.scatter_add_(dim=0, index=pseudo_label2[None, :, None].expand(-1, -1, d), src=feat_ext2[None, :, :])\n\n                            num_categories = torch.zeros(class_num, b, dtype=torch.int).cuda() # K, N\n                            num_categories.scatter_add_(dim=0, index=pseudo_label2[None, :], src=torch.ones_like(pseudo_label2[None, :], dtype=torch.int))\n\n                            ema_n += num_categories.sum(dim=1) # K\n                            alpha = torch.where(ema_n > ema_length, torch.ones(class_num, dtype=torch.float).cuda() / ema_length, 1. / (ema_n + 1e-10))\n\n                            delta_pre = (feat_ext2_categories - ema_ext_mu[:, None, :]) * num_categories[:, :, None] # K, N, D\n                            delta = alpha[:, None] * delta_pre.sum(dim=1) # K, D\n                            new_component_mean = ema_ext_mu + delta\n                            new_component_cov = ema_ext_cov \\\n                                                + alpha[:, None, None] * ((delta_pre.permute(0, 2, 1) @ delta_pre) - num_categories.sum(dim=1)[:, None, None] * ema_ext_cov) \\\n                                                - delta[:, :, None] @ delta[:, None, :]\n\n                            with torch.no_grad():\n                                ema_ext_mu = new_component_mean.detach()\n                                ema_ext_cov = new_component_cov.detach()\n\n                            if (class_num == 10 or len(mini_batch_indices) >= 4096) and (iter_id > int(args.iters / 2) or args.filter == 'none'):\n                                target_compoent_distribution.loc = new_component_mean\n                                target_compoent_distribution.covariance_matrix = new_component_cov + template_ext_cov\n                                target_compoent_distribution._unbroadcasted_scale_tril = torch.linalg.cholesky(new_component_cov + template_ext_cov)\n                                loss += (torch.distributions.kl_divergence(source_component_distribution, target_compoent_distribution) \\\n                                        + torch.distributions.kl_divergence(target_compoent_distribution, source_component_distribution)).mean() * loss_scale\n                        else: # Using posterior probabilities from target_compoent_distribution\n                            feat_ext2_categories = feat_ext[None, :, :].expand(class_num, -1, -1) # K, N, D\n                            num_categories = posterior # K, N (posterior is like soft counts)\n                            ema_n += num_categories.sum(dim=1) # K\n                            alpha = torch.where(ema_n > ema_length, torch.ones(class_num, dtype=torch.float).cuda() / ema_length, 1. / (ema_n + 1e-10))\n\n                            delta_pre = (feat_ext2_categories - ema_ext_mu[:, None, :]) * num_categories[:, :, None] # K, N, D\n                            delta = alpha[:, None] * delta_pre.sum(dim=1) # K, D\n                            new_component_mean = ema_ext_mu + delta\n                            new_component_cov = ema_ext_cov \\\n                                                + alpha[:, None, None] * ((delta_pre.permute(0, 2, 1) @ delta_pre) - num_categories.sum(dim=1)[:, None, None] * ema_ext_cov) \\\n                                                - delta[:, :, None] @ delta[:, None, :]\n\n                            with torch.no_grad():\n                                ema_ext_mu = new_component_mean.detach()\n                                ema_ext_cov = new_component_cov.detach()\n\n                            if (class_num == 10 or len(mini_batch_indices) >= 4096) and iter_id > int(args.iters / 2):\n                                target_compoent_distribution.loc = new_component_mean\n                                target_compoent_distribution.covariance_matrix = new_component_cov + template_ext_cov\n                                target_compoent_distribution._unbroadcasted_scale_tril = torch.linalg.cholesky(new_component_cov + template_ext_cov)\n                                loss += (torch.distributions.kl_divergence(source_component_distribution, target_compoent_distribution) \\\n                                        + torch.distributions.kl_divergence(target_compoent_distribution, source_component_distribution)).mean() * loss_scale\n\n                    if not args.without_global:\n                        # Global Feature Alignment (KL-Divergence & Iterative Update with Clipping)\n                        b = feat_ext.shape[0]\n                        ema_total_n += b\n                        alpha = 1. / 1280 if ema_total_n > 1280 else 1. / ema_total_n\n                        delta_pre = (feat_ext - ema_ext_total_mu.cuda())\n                        delta = alpha * delta_pre.sum(dim=0)\n                        tmp_mu = ema_ext_total_mu.cuda() + delta\n                        tmp_cov = ema_ext_total_cov.cuda() + alpha * (delta_pre.t() @ delta_pre - b * ema_ext_total_cov.cuda()) - delta[:, None] @ delta[None, :]\n                        with torch.no_grad():\n                            ema_ext_total_mu = tmp_mu.detach().cpu()\n                            ema_ext_total_cov = tmp_cov.detach().cpu()\n\n                        source_domain = torch.distributions.MultivariateNormal(mu_src_ext, cov_src_ext + template_ext_cov)\n                        target_domain = torch.distributions.MultivariateNormal(tmp_mu, tmp_cov + template_ext_cov)\n                        loss += (torch.distributions.kl_divergence(source_domain, target_domain) + torch.distributions.kl_divergence(target_domain, source_domain)) * loss_scale\n\n                    if args.without_mixture and args.without_global:\n                        # Fallback: simple cross-entropy if both alignment objectives are disabled\n                        logit2 = logit[pseudo_label_mask.cuda()]\n                        loss += F.cross_entropy(logit2, pseudo_label2) * loss_scale * 2\n\n                if args.align_ssh:\n                    # SSH Global Feature Alignment (similar logic as ext global alignment, omitted for primary focus)\n                    pass\n\n                if args.with_shot:\n                    # SHOT entropy minimization loss (omitted for primary focus)\n                    pass\n\n                # Backpropagation and Optimization\n                try:\n                    loss.backward()\n                except:\n                    pass\n                finally:\n                    del loss\n\n            if iter_id > 0:\n                optimizer.step()\n                optimizer.zero_grad()\n",
+    "experimental_info": "Dataset: cifar10 (default), dataroot='./data'\nBatch sizes: 128 (for adaptation training `tr_dataloader`), 512 (for `tr_extra_dataloader` used for feature alignment)\nWorkers: 0\nNumber of samples: 1,000,000 (default, for `tr_dataset` which tracks all samples for EMA logit/alpha)\nLearning rate: 0.001\nIterations per test batch: 4 (`args.iters`)\nCorruption type: snow (default), level: 5 (default)\nModel: resnet50 (default)\nSeed: 0 (default)\nSSL task: contrastive (default), temperature: 0.5 (for `SupConLoss` if `with_ssl` is True)\nAlignments activated: `--align_ext` is `action='store_true'` (default False in command line, but typically enabled for TTAC), `--align_ssh` is `action='store_true'` (default False)\n\nLoss components: Mixture Gaussian Alignment and Global Feature Alignment (both use KL-Divergence).\nPseudo-label filtering (`args.filter`): 'ours' (default). This combines:\n  - Temporal consistency filtering: based on exponential moving average posteriors (`sample_predict_ema_logit`) with `ema_alpha = 0.9`.\n  - Posterior probability filtering: `pro > 0.9` (pseudo-label confidence threshold) and `sample_predict_alpha[origin_image_index] == 1` (acceptance mask from temporal consistency).\n  - An alternative `posterior` filter mode exists, which uses component posterior probabilities directly.\n\nIterative updating strategy for running statistics:\n  - Category-wise EMA length (`ema_length`): 128 for cifar10, 64 for cifar100 (for `ema_n`).\n  - Global EMA length (implicit in `ema_total_n` clipping): `alpha = 1. / 1280` if `ema_total_n > 1280`.\n  - Initialization bias for covariance matrix (`template_ext_cov`, `template_ssh_cov`): `cov_src_ext.max().item() / 30.` and `cov_src_ssh.max().item() / 30.` respectively.\n\nLoss scale (`loss_scale`): 0.05 for cifar10, 0.5 for cifar100 (applied to KL-Divergence terms).\nFixed-length queue for recent test samples: `mini_batch_length = 4096`. This queue stores indices of `mini_batch_length` most recent test samples. Adaptation is performed using only these samples in each test batch iteration."
+}
