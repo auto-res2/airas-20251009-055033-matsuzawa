@@ -7,5 +7,151 @@
     "gradient-based adaptation speed",
     "meta-learning test-time adaptation speed",
     "TENT convergence acceleration"
+  ],
+  "research_study_list": [
+    {
+      "title": "Test Time Adaptation With Regularized Loss for Weakly Supervised Salient Object Detection"
+    },
+    {
+      "title": "Tent: Fully Test-Time Adaptation by Entropy Minimization"
+    },
+    {
+      "title": "What How and When Should Object Detectors Update in Continually Changing Test Domains?"
+    },
+    {
+      "title": "DELTA: DEGRADATION-FREE FULLY TEST-TIME ADAPTATION"
+    },
+    {
+      "title": "Test-Time Training with Self-Supervision for Generalization under Distribution Shifts"
+    },
+    {
+      "title": "Robust Test-Time Adaptation in Dynamic Scenarios"
+    },
+    {
+      "title": "Evaluation of Test-Time Adaptation Under Computational Time Constraints"
+    },
+    {
+      "title": "Leveraging Proxy of Training Data for Test-Time Adaptation"
+    },
+    {
+      "title": "TTT++: When Does Self-Supervised Test-Time Training Fail or Thrive?"
+    },
+    {
+      "title": "Persistent Test-time Adaptation in Recurring Testing Scenarios"
+    },
+    {
+      "title": "Active Test-Time Adaptation: Theoretical Analyses and An Algorithm"
+    },
+    {
+      "title": "Test Time Adaptation via Conjugate Pseudo-labels"
+    },
+    {
+      "title": "Improved Test-Time Adaptation for Domain Generalization"
+    },
+    {
+      "title": "Robust Test-Time Adaptation in Dynamic Scenarios"
+    },
+    {
+      "title": "Test-Time Training with Self-Supervision for Generalization under Distribution Shifts"
+    },
+    {
+      "title": "Towards Stable Test-time Adaptation in Dynamic Wild World"
+    },
+    {
+      "title": "Active Test-Time Adaptation: Theoretical Analyses and An Algorithm"
+    },
+    {
+      "title": "Leveraging Proxy of Training Data for Test-Time Adaptation"
+    },
+    {
+      "title": "Evaluation of Test-Time Adaptation Under Computational Time Constraints"
+    },
+    {
+      "title": "Improved Test-Time Adaptation for Domain Generalization"
+    },
+    {
+      "title": "Test Time Adaptation via Conjugate Pseudo-labels"
+    },
+    {
+      "title": "Revisiting Realistic Test-Time Training: Sequential Inference and Adaptation by Anchored Clustering"
+    },
+    {
+      "title": "L-TTA: Lightweight Test-Time Adaptation Using a Versatile Stem Layer"
+    },
+    {
+      "title": "AETTA: Label-Free Accuracy Estimation for Test-Time Adaptation"
+    },
+    {
+      "title": "A Bayesian Perspective on Training Speed and Model Selection"
+    },
+    {
+      "title": "The Impact of Neural Network Overparameterization on Gradient Confusion and Stochastic Gradient Descent"
+    },
+    {
+      "title": "Gradient-Based Feature Learning under Structured Data"
+    },
+    {
+      "title": "Knowledge-Adaptation Priors"
+    },
+    {
+      "title": "Directional Smoothness and Gradient Methods: Convergence and Adaptivity"
+    },
+    {
+      "title": "Optimistic Meta-Gradients"
+    },
+    {
+      "title": "Predicting Training Time Without Training "
+    },
+    {
+      "title": "Identifying Policy Gradient Subspaces"
+    },
+    {
+      "title": "Evaluation of Test-Time Adaptation Under Computational Time Constraints"
+    },
+    {
+      "title": "Persistent Test-time Adaptation in Recurring Testing Scenarios"
+    },
+    {
+      "title": "Robust Test-Time Adaptation in Dynamic Scenarios"
+    },
+    {
+      "title": "Bayesian Meta Sampling for Fast Uncertainty Adaptation"
+    },
+    {
+      "title": "Test Time Adaptation via Conjugate Pseudo-labels"
+    },
+    {
+      "title": "Look-ahead Meta Learning for Continual Learning"
+    },
+    {
+      "title": "Look-ahead Meta Learning for Continual Learning"
+    },
+    {
+      "title": "Continuous Meta-Learning without Tasks"
+    },
+    {
+      "title": "Tensor Normal Training for Deep Learning Models"
+    },
+    {
+      "title": "Tensor Normal Training for Deep Learning Models"
+    },
+    {
+      "title": "Analytical Study of Momentum-Based Acceleration Methods in Paradigmatic High-Dimensional Non-Convex Problems"
+    },
+    {
+      "title": "Alternating Local Enumeration (TnALE): Solving Tensor Network Structure Search with Fewer Evaluations"
+    },
+    {
+      "title": "SVDinsTN: A Tensor Network Paradigm for Efficient Structure Search from Regularized Modeling Perspective"
+    },
+    {
+      "title": "TTOpt: A Maximum Volume Quantized Tensor Train-based Optimization and its Application to Reinforcement Learning"
+    },
+    {
+      "title": "On Estimation in Latent Variable Models"
+    },
+    {
+      "title": "Accelerating Hamiltonian Monte Carlo via Chebyshev Integration Time"
+    }
   ]
 }
