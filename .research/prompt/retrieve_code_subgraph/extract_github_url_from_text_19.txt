@@ -1,0 +1,17 @@
+
+Input:
+# Task
+You carefully read the contents of the “Paper Outline” and select one GitHub link from the “GitHub URLs List” that you think is most relevant to the contents.
+# Constraints
+- Output the index number corresponding to the selected GitHub URL.
+- Be sure to select only one GitHub URL.
+- If there is no related GitHub link, output None.
+# Paper Outline
+ITTA improves Test-Time Training (TTT) through two main strategies. First, a learnable consistency loss (Lwcont) is introduced for the TTT auxiliary task. This loss is defined as the L2 norm of the output of a weight subnetwork (fw) applied to the difference between original and augmented feature representations (z - z'). The fw subnetwork, composed of stacked ReLU(a * h + b) layers, allows for flexible consistency measurement. During training, the feature extractor and classifier are optimized using a combined main loss and learnable consistency loss (Lmain + αLwcont). The fw subnetwork is updated by minimizing the difference between the normalized gradients of Lmain and Lwcont with respect to the feature extractor parameters, ensuring alignment. Second, additional adaptive parameter blocks (fΘ) are introduced after each block of the pretrained feature extractor during the test-time adaptation phase. Only these fΘ parameters are updated using the learned consistency loss from the target domain data, following an online adaptation setting. The augmentation strategy used is an existing method that modifies intermediate activations to create augmented feature representations.
+
+# GitHub URLs List
+['https://github.com/liangchen527/ITTA']
+Output:
+{
+    "index": 0
+}
