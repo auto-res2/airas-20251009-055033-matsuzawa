@@ -1,0 +1,17 @@
+
+Input:
+# Task
+You carefully read the contents of the “Paper Outline” and select one GitHub link from the “GitHub URLs List” that you think is most relevant to the contents.
+# Constraints
+- Output the index number corresponding to the selected GitHub URL.
+- Be sure to select only one GitHub URL.
+- If there is no related GitHub link, output None.
+# Paper Outline
+TNT approximates the natural gradient by modeling the covariance of sampling-based gradients using the tensor normal distribution. It assumes a block-diagonal Fisher matrix, with each block corresponding to a tensor variable (W_l), and models the sampling-based gradient (DW_l) for each variable as following a zero-mean Tensor Normal distribution with Kronecker-structured covariance factors (U_1, ..., U_k). The Fisher matrix for W is then approximated as the Kronecker product of these factors: F_W = U_1 ⊗ ... ⊗ U_k. A new identification scheme determines the U_i factors by enforcing a constant average eigenvalue (tr(U_i)/d_i) across dimensions to ensure similar magnitudes and aid damping parameter selection. The natural gradient update direction is computed using the inverse of the Kronecker product of damped (U_i + ϵI) factors, applied via mode-i products. The practical algorithm employs moving averages for gradient momentum and covariance factor estimates, with amortized updates for statistics (frequency T1) and inverses (frequency T2), and includes an additional backward pass for sampling-based gradient computation.
+
+# GitHub URLs List
+['https://github.com/renyiryry/tnt_neurips_2021', 'https://github.com/alecwangcq/KFAC-Pytorch', 'https://github.com/alecwangcq/KFAC-Pytorch', 'https://github.com/alecwangcq/KFAC-Pytorch']
+Output:
+{
+    "index": 0
+}
