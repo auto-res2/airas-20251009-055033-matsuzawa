@@ -1,0 +1,10 @@
+dataset:
+  name: cifar10_c
+  split: train
+model:
+  name: resnet20_gn
+run_id: cifar10c_resnet20_source
+training:
+  batch_size: 128
+  epochs: 1
+  method: source_frozen

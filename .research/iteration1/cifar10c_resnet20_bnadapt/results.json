@@ -1,0 +1,13 @@
+{
+  "run_id": "cifar10c_resnet20_bnadapt",
+  "method": "bn_adapt",
+  "train_history": [
+    {
+      "epoch": 1,
+      "loss": 2.5126933047846745,
+      "acc": 8.630657894736842
+    }
+  ],
+  "val_loss": 2.5125682130913987,
+  "val_acc": 8.541578947368421
+}

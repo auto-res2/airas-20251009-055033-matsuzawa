@@ -15,6 +15,7 @@ Usage examples:
 from __future__ import annotations
 
 import argparse
+import os
 import shutil
 import subprocess
 import sys
@@ -64,7 +65,7 @@ def _launch_train(run_cfg: dict, results_root: Path, python_bin: str = sys.execu
     stdout_f = stdout_path.open("w")
     stderr_f = stderr_path.open("w")
 
-    cmd = [python_bin, "-m", "src.train", "--config-path", str(run_cfg_path),
+    cmd = [python_bin, "-u", "-m", "src.train", "--config-path", str(run_cfg_path),
            "--results-dir", str(run_dir)]
 
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -92,8 +93,8 @@ def _launch_train(run_cfg: dict, results_root: Path, python_bin: str = sys.execu
 def main():
     args = parse_args()
     results_root = Path(args.results_dir).expanduser()
-    if results_root.exists():
-        shutil.rmtree(results_root)
+    # Don't remove the directory - let the wrapper script handle cleanup
+    # This avoids NFS locking issues
     results_root.mkdir(parents=True, exist_ok=True)
 
     cfg_path = CONFIG_DIR / ("smoke_test.yaml" if args.smoke_test else "full_experiment.yaml")

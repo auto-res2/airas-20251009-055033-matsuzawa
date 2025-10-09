@@ -1,0 +1,13 @@
+{
+  "run_id": "cifar10c_resnet20_tent",
+  "method": "tent",
+  "train_history": [
+    {
+      "epoch": 1,
+      "loss": 2.8237046834443746,
+      "acc": 9.507894736842106
+    }
+  ],
+  "val_loss": 3.721459023867155,
+  "val_acc": 9.995263157894737
+}

@@ -1,0 +1,8 @@
+=== [PHASE 2/2] Full experiment start Thu Oct  9 10:52:50 AM UTC 2025 ===
+{"run_id": "cifar10c_resnet20_source", "method": "source_frozen", "train_history": [{"epoch": 1, "loss": 2.5126933047846745, "acc": 8.630657894736842}], "val_loss": 2.5125682130913987, "val_acc": 8.541578947368421}
+{"run_id": "cifar10c_resnet20_bnadapt", "method": "bn_adapt", "train_history": [{"epoch": 1, "loss": 2.5126933047846745, "acc": 8.630657894736842}], "val_loss": 2.5125682130913987, "val_acc": 8.541578947368421}
+{"run_id": "cifar10c_resnet20_tent", "method": "tent", "train_history": [{"epoch": 1, "loss": 2.8237046834443746, "acc": 9.507894736842106}], "val_loss": 3.721459023867155, "val_acc": 9.995263157894737}
+{"run_id": "cifar10c_resnet20_ngfat", "method": "ngfat", "train_history": [{"epoch": 1, "loss": 2.5126933047846745, "acc": 8.630657894736842}], "val_loss": 2.5125682130913987, "val_acc": 8.541578947368421}
+{"run_id": "cifar10c_resnet20_zorro", "method": "zorro_full", "train_history": [{"epoch": 1, "loss": 100.09551715609902, "acc": 9.981447368421053}], "val_loss": 107.59990462517989, "val_acc": 9.99578947368421}
+[{"run_id": "cifar10c_resnet20_ngfat", "val_acc": 8.541578947368421, "val_loss": 2.5125682130913987}, {"run_id": "cifar10c_resnet20_zorro", "val_acc": 9.99578947368421, "val_loss": 107.59990462517989}, {"run_id": "cifar10c_resnet20_tent", "val_acc": 9.995263157894737, "val_loss": 3.721459023867155}, {"run_id": "cifar10c_resnet20_bnadapt", "val_acc": 8.541578947368421, "val_loss": 2.5125682130913987}, {"run_id": "cifar10c_resnet20_source", "val_acc": 8.541578947368421, "val_loss": 2.5125682130913987}]
+=== [PHASE 2/2] Full experiment end Thu Oct  9 11:27:12 AM UTC 2025 ===

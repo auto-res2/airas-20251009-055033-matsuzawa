@@ -3,18 +3,18 @@ name = "zorro-experiments"
 version = "0.1.0"
 description = "ZORRO adaptation experiment suite"
 requires-python = ">=3.9"
-
-[tool.poetry.dependencies]
-python = "^3.9"
-torch = "^2.0"
-torchvision = "^0.15"
-matplotlib = "^3.7"
-seaborn = "^0.12"
-pyyaml = "^6.0"
-pandas = "^2.0"
-scikit-learn = "^1.2"
-datasets = "^2.14"
-tqdm = "^4.0"
+dependencies = [
+    "torch>=2.0",
+    "torchvision>=0.15",
+    "matplotlib>=3.7",
+    "seaborn>=0.12",
+    "pyyaml>=6.0",
+    "pandas>=2.0",
+    "scikit-learn>=1.2",
+    "datasets>=2.14",
+    "tqdm>=4.0"
+]
 
 [build-system]
 requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"

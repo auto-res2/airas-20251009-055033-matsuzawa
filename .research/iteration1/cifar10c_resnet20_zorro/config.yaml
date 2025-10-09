@@ -1,0 +1,12 @@
+dataset:
+  name: cifar10_c
+  split: train
+model:
+  name: resnet20_gn
+run_id: cifar10c_resnet20_zorro
+training:
+  batch_size: 128
+  epochs: 1
+  eps: 0.01
+  lambda: 8
+  method: zorro_full

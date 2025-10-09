@@ -1,0 +1,13 @@
+{
+  "run_id": "cifar10c_resnet20_zorro",
+  "method": "zorro_full",
+  "train_history": [
+    {
+      "epoch": 1,
+      "loss": 100.09551715609902,
+      "acc": 9.981447368421053
+    }
+  ],
+  "val_loss": 107.59990462517989,
+  "val_acc": 9.99578947368421
+}

@@ -175,8 +175,12 @@ def build_model(cfg: Dict):
         def __init__(self, num_classes=10):
             super().__init__()
             self.features = nn.Sequential(
-                nn.Conv2d(3, 32, 3, padding=1), nn.ReLU(),
-                nn.Conv2d(32, 64, 3, padding=1), nn.ReLU(),
+                nn.Conv2d(3, 32, 3, padding=1),
+                nn.BatchNorm2d(32),
+                nn.ReLU(),
+                nn.Conv2d(32, 64, 3, padding=1),
+                nn.BatchNorm2d(64),
+                nn.ReLU(),
                 nn.AdaptiveAvgPool2d((1,1)))
             self.fc = nn.Linear(64, num_classes)
         def forward(self, x):
