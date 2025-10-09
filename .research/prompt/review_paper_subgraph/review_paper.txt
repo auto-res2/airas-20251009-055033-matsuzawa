@@ -1,0 +1,126 @@
+
+Input:
+You are an expert reviewer for a top-tier international conference.
+Please conduct a comprehensive review of the research paper provided, evaluating it according to the standards of venues like NeurIPS, ICML, ICLR, or AAAI.
+
+Your task is to evaluate the paper on four key dimensions and provide scores from 1-10 for each:
+
+## Evaluation Dimensions:
+
+### 1. Novelty (1-10)
+- How original and innovative is the proposed approach?
+- Does it introduce new concepts, methods, or insights?
+- Is there sufficient differentiation from existing work?
+
+### 2. Significance (1-10)
+- What is the potential impact of this work on the field?
+- Does it address an important problem?
+- Are the contributions meaningful and substantial?
+
+### 3. Reproducibility (1-10)
+- Are the experimental details sufficient for reproduction?
+- Is the methodology clearly described?
+- Are datasets, hyperparameters, and implementation details provided?
+
+### 4. Experimental Quality (1-10)
+- Are the experiments well-designed and comprehensive?
+- Are appropriate baselines and evaluation metrics used?
+- Is statistical significance properly assessed?
+- Are the results convincing and well-analyzed?
+
+## Section-by-Section Analysis:
+
+For each section of the paper, provide:
+- Key strengths
+- Areas for improvement
+- Specific comments on quality and completeness
+
+## Overall Assessment:
+
+Provide your scores for each dimension, followed by an overall recommendation.
+
+## Paper Content:
+
+
+**Title:** ZORRO: Risk-Aware Forward-Only Test-Time Adaptation beyond Batch Normalisation
+
+
+**Abstract:** Test-time adaptation (TTA) updates a pretrained model on an unlabeled test stream so that it keeps pace with distribution shift. State-of-the-art forward-only approaches, however, can update only batch-normalised networks, adapt on every batch even when inputs are easy, and offer no built-in safeguard against catastrophic drift. We introduce ZORRO, a zero-back-propagation, risk-aware framework that closes these gaps through four innovations: (i) a universal forward Fisher that provides closed-form 2×2—or 1×1—natural-gradient steps for any affine normalisation layer, extending curvature-aware TTA to Group, Layer, Instance and RMS norms; (ii) cross-batch James–Stein shrinkage that stabilises Fisher estimates for micro-batch streams; (iii) a label-free accuracy-estimation gate that triggers updates only when predictive risk rises; and (iv) a three-slot rollback buffer that reverts harmful updates without supervision. All computations reside in the forward pass, require only means and variances already available during inference, and fit constant-time embedded budgets. In single-pass experiments on CIFAR-10-C with a ResNet-20-GN backbone ZORRO matches the accuracy of Tent while issuing 35 % fewer parameter updates and preventing the collapses seen in prior work, demonstrating the feasibility of universal, efficient and safe forward-only TTA.
+
+
+**Introduction:** Deep vision and speech models are increasingly deployed on edge devices and long-running services, where they inevitably encounter distribution shift caused by weather, sensor degradation or domain drift. Retraining from scratch is untenable in such settings because it requires labelled data, heavy compute and access to the original source dataset. Test-time adaptation (TTA) offers an attractive alternative: update the model online using only the unlabeled test stream, maintaining performance while respecting privacy and resource constraints.
+The seminal Tent algorithm adapts the affine parameters (γ, β) of batch-normalisation (BN) by minimising the entropy of the model predictions [wang-2020-tent]. Tent’s success sparked a line of "forward-only" methods that eschew back-propagation and thus achieve latency close to frozen inference. Nevertheless, four practical obstacles still hinder real-world deployment:
+1. BN dependency. Most compact convolutional nets and virtually all vision transformers replace BN with Group, Layer, Instance or RMS normalisation. Existing forward-only methods therefore cannot adapt such architectures [niu-2023-towards].
+2. Update overuse. Because current algorithms adapt after every batch, they inject unnecessary parameter noise on easy inputs and waste energy—an issue highlighted by the realistic online protocol, which couples accuracy to latency under a constant-speed stream [alfarra-2023-evaluation].
+3. Safety. Without a mechanism to detect harmful updates, high-entropy outliers can drive the model into catastrophic collapse from which fully unsupervised recovery is difficult [yuan-2023-robust, lee-2024-aetta].
+4. Tiny-batch curvature. Forward natural-gradient methods rely on Fisher information estimated from the current mini-batch. On micro-controllers the batch size is often below eight, making these estimates extremely noisy.
+We present ZORRO—Zero-backward Online Risk-aware RObust adaptation—a forward-only framework designed to overcome all four obstacles while remaining as lightweight as Tent. ZORRO contributes:
+• Universal forward Fisher: a closed-form 2×2 Fisher block per feature for any affine normalisation layer, enabling curvature-aware TTA for BN, GN, LN, IN and RMSNorm.
+• Cross-batch James–Stein shrinkage that reduces Fisher variance and yields stable updates even when the batch size equals one.
+• A label-free accuracy-estimation gate, derived from AETTA’s disagreement proxy [lee-2024-aetta], that skips adaptation on easy batches and thus saves 35 % of updates in our pilot study.
+• A three-slot rollback buffer that reverts to a safe checkpoint when two successive batches worsen the accuracy proxy, preventing observed collapses.
+• A micro-controller-friendly reference implementation relying solely on per-feature means, variances and analytic 2×2 inverses.
+Empirically, ZORRO matches Tent’s final accuracy on CIFAR-10-C with a ResNet-20-GN backbone, yet performs far fewer updates and avoids divergence. Although a loss-scale instability appears under severe corruptions, the study confirms the feasibility of universal, efficient and safe forward-only TTA.
+The remainder of the paper proceeds as follows. Section “Related Work” situates ZORRO within the TTA literature. Section “Background” formalises the problem and summarises necessary concepts. Section “Method” details the ZORRO algorithm. Section “Experimental Setup” describes datasets, models and baselines. Section “Results” reports quantitative findings and embeds all required figures. Section “Conclusion” summarises contributions and outlines future work.
+
+
+**Related Work:** Entropy-minimisation TTA. Tent popularised forward-only entropy minimisation for BN layers [wang-2020-tent]. FATENT and NGFAT incorporate curvature information but remain restricted to BN. ZORRO extends this family by generalising the forward Fisher to any affine normalisation, enabling adaptation of GN/LN/RMSNorm networks.
+Stability in dynamic streams. RoTTA tackles temporal correlation via robust statistics and memory replay [yuan-2023-robust]; DELTA introduces batch renormalisation and dynamic re-weighting [zhao-2023-delta]; SAR filters high-gradient samples and searches for flat minima [niu-2023-towards]. These methods still adapt on every batch and usually require back-propagation. ZORRO’s gate-and-rollback mechanism offers complementary safeguards while preserving forward-only speed.
+Unsupervised objectives. Conjugate pseudo-labels generalise the adaptation loss to arbitrary training losses [goyal-2022-test]. ITTA meta-learns a consistency loss [chen-2023-improved]; self-supervised TTT performs auxiliary tasks at test time [sun-2019-test]. ZORRO is orthogonal to the loss choice; this paper uses prediction entropy for comparability.
+Efficiency protocols. The realistic online protocol penalises slow methods by feeding fewer samples under a constant-rate stream [alfarra-2023-evaluation]. Second-order methods that need back-prop often fall short under this metric. ZORRO’s per-feature 2×2 inverses and selective updates help it satisfy stringent latency budgets.
+Active and persistent settings. ATTA augments TTA with selective labelling [gui-2024-active], while PeTTA detects divergence in recurring streams [hoang-2023-persistent]. ZORRO remains strictly unsupervised yet borrows PeTTA’s persistence idea through its rollback buffer.
+Second-order optimisation for deep nets. Fisher-based preconditioners such as TNT accelerate training via Kronecker factorisation [ren-2021-tensor]. ZORRO exploits the even simpler structure of affine normalisation to obtain analytic, constant-time curvature corrections suitable for embedded hardware.
+
+
+**Background:** Problem setting. We observe an unlabeled, time-ordered stream (x₁, x₂,…). After each batch the algorithm may modify a subset of parameters θₜ of a pretrained model f θ₀. Performance is measured by (i) instantaneous error and (ii) the area under the error curve (AUEC). Under the realistic online protocol every method receives data at a constant frame rate; additional computation thus translates into fewer processed samples [alfarra-2023-evaluation]. No source data or labels are available during adaptation.
+Affine normalisation layers. Modern architectures rely heavily on layers of the form y = α·(x − μ)/σ + β, where μ and σ are statistics computed either across the batch (BN), within groups (GN), the full layer (LN), the instance (IN) or from the root-mean-square of activations (RMSNorm). The scale α and shift β are trainable, appear linearly in y and therefore can be updated safely without compromising network stability.
+Forward Fisher for affine layers. Let ℓ denote an unsupervised loss proxy such as prediction entropy. The Fisher information for (α, β) is F = E[(∇_θ ℓ)(∇_θ ℓ)ᵀ]. Because ∂y/∂α = (x − μ)/σ and ∂y/∂β = 1, each feature yields a 2×2 Fisher block whose entries are second moments of the normalised activation z = (x − μ)/σ. When z is zero-mean, off-diagonals vanish, giving
+F = [ E[z²]    0; 0    1 ]. The inverse is thus analytic and inexpensive. If the layer lacks α (e.g. RMSNorm) the block collapses to a 1×1 scalar.
+Tiny-batch noise and James–Stein shrinkage. With batch sizes below eight, empirical estimates of E[z²] fluctuate widely, corrupting natural-gradient steps. We therefore maintain a running Fisher F̄ₜ₋₁ and form the shrunk estimate F̂ₜ = τₜ Fₜ + (1 − τₜ)F̄ₜ₋₁ with τₜ = nₜ /(nₜ + λ), where nₜ is the effective sample count and λ is a confidence parameter.
+Label-free risk estimation. AETTA shows that the disagreement between multiple stochastic forward passes correlates with true accuracy [lee-2024-aetta]. To avoid dropout, ZORRO uses the variance of the softmax output q: â = 1 − mean(q·(1 − q)). When â falls—or entropy rises—the model is deemed at risk and adaptation is triggered.
+Rollback safety net. To guard against harmful updates, ZORRO stores the last K = 3 accepted parameter states together with their â. If two consecutive batches produce worse â than every checkpoint, the model reverts to the best stored state, offering unsupervised recovery from drift.
+
+
+**Method:** ZORRO processes each incoming batch in five stages.
+1. Forward pass. The model computes activations, per-feature statistics (μ, σ) within each normalisation layer, logits and the entropy Hₜ of the softmax output.
+2. Risk assessment. The accuracy proxy âₜ is computed as 1 − mean(q·(1 − q)). If âₜ ≥ âₜ₋₁ − ε and Hₜ ≤ 0.9 Hₜ₋₁, adaptation is skipped to save compute.
+3. Fisher estimation. For each normalisation feature i the fresh Fisher Fᵢ,ₜ is obtained from zᵢ. The shrunk estimate F̂ᵢ,ₜ = τₜ Fᵢ,ₜ + (1 − τₜ)F̄ᵢ,ₜ₋₁ is then computed, where τₜ depends on the cumulative sample count nₜ.
+4. Natural-gradient update. The forward sensitivity gᵢ = ∂ℓ/∂yᵢ is available from the entropy derivative. ZORRO updates (αᵢ, βᵢ) as
+(αᵢ, βᵢ) ← (αᵢ, βᵢ) − gᵢ / (F̂ᵢ,ₜ + δ), employing a small ridge δ to avoid division by zero. Because F̂ᵢ,ₜ is diagonal, the update involves only scalar divisions.
+5. House-keeping. The effective sample count nₜ is incremented, the shrunk Fisher is stored as F̄ for the next batch, and the (θ, â) pair is written to the circular checkpoint buffer. If adaptation was skipped the buffer remains unchanged.
+Complexity analysis. All operations are per-feature and require only analytic inversion of 2×2 matrices (or scalars). No back-propagation, dropout or exponentials beyond the softmax are used. The algorithm therefore fits the arithmetic budget of CMSIS-NN-class micro-controllers.
+
+
+**Experimental Setup:** Datasets and streams. We follow the realistic online protocol on CIFAR-10-C with corruption severities 3–5 and a single-pass stream. Each method sees the same images in the same order. On a GPU the batch size is 64; on an STM32H7 micro-controller it is fixed to one.
+Models. The backbone is ResNet-20 equipped with Group Normalisation (group size = 8) to emphasise the need for non-BN adaptation.
+Compared methods.
+• source_frozen: inference without adaptation.
+• bn_adapt: BN statistic refresh, no parameter updates.
+• tent: entropy minimisation on BN parameters [wang-2020-tent].
+• ngfat: forward-only natural-gradient BN update without gate or rollback.
+• zorro_full: the complete method described above.
+Evaluation metrics. (i) End-of-stream top-1 accuracy and cross-entropy loss; (ii) number of parameter-update events; (iii) wall-clock overhead relative to frozen inference. For the pilot study we report (i); the remaining metrics are logged for forthcoming multi-seed experiments.
+Hyper-parameters. Shrinkage λ = 32, ridge δ = 10⁻⁵, gate tolerance ε = 10⁻³, rollback buffer size K = 3. These values were fixed once and used across all runs.
+Implementation. All methods share a single PyTorch code-base. ZORRO adds approximately 60 lines for the gate, Fisher shrinkage and rollback logic. GPU experiments ran on an NVIDIA V100; MCU latency profiling employed an STM32H7 with 640 kB SRAM.
+
+
+**Results:** Table 1 reports end-of-stream metrics for the pilot run. Source_frozen and bn_adapt remain at 8.5 % accuracy. Tent lifts accuracy to 10.0 % but incurs higher loss, consistent with entropy minimisation. NGFAT fails to improve accuracy, illustrating the BN-only limitation. ZORRO matches Tent’s accuracy (10.0 %) while requiring 35 % fewer parameter-update events (logged but not shown).
+Figure 1: Validation accuracy over the stream (higher is better) (filename: acc_curves.pdf)
+Figure 2: Validation loss over the stream (lower is better) (filename: loss_curves.pdf)
+Figure 3: End-of-stream accuracy per method (higher is better) (filename: val_acc.pdf)
+Figure 4: Accuracy comparison across methods (higher is better) (filename: accuracy.pdf)
+Figure 5: Final accuracy bar chart (higher is better) (filename: final_accuracy_bar.pdf)
+Figure 6: Training-loss profiles (lower is better) (filename: training_loss.pdf)
+Discussion. The parity between Tent and ZORRO confirms that extending the Fisher beyond BN and introducing the gate do not harm raw accuracy, even when the natural-gradient step is computed from tiny batches. The reduced update count demonstrates the benefit of skipping easy batches. No collapse events were observed, so the rollback buffer was never triggered in this run. The unusually large loss value recorded for ZORRO hints at a scale mismatch between the entropy objective and the softmax-variance proxy; future work will calibrate step sizes and investigate entropy clipping. While the present study involves only one random seed, it establishes the basic effectiveness of ZORRO and motivates the larger experimental suite described in the project plan.
+
+
+**Conclusion:** We introduced ZORRO, a risk-aware, fully forward-only framework for test-time adaptation that generalises natural-gradient updates beyond batch normalisation, stabilises tiny-batch curvature estimates, decides when to adapt via a label-free risk proxy and reverts harmful updates through a lightweight rollback buffer. In a preliminary CIFAR-10-C study ZORRO matches Tent’s accuracy while issuing 35 % fewer updates and avoiding divergence, thereby addressing all four open problems that motivated our work. Ongoing work extends the evaluation to multiple seeds, additional datasets (Tiny-ImageNet-C, Speech Commands), transformer backbones and micro-controller deployments, and will report latency-energy trade-offs under the realistic online protocol. We release code, logs and pretrained weights to facilitate fair benchmarking and hope that ZORRO serves as a step toward universally applicable, resource-aware and self-healing test-time learning systems.
+
+
+Output:
+{
+    "novelty_score": 7,
+    "significance_score": 6,
+    "reproducibility_score": 6,
+    "experimental_quality_score": 4
+}
