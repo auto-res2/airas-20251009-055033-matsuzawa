@@ -1,0 +1,17 @@
+
+Input:
+# Task
+You carefully read the contents of the “Paper Outline” and select one GitHub link from the “GitHub URLs List” that you think is most relevant to the contents.
+# Constraints
+- Output the index number corresponding to the selected GitHub URL.
+- Be sure to select only one GitHub URL.
+- If there is no related GitHub link, output None.
+# Paper Outline
+The study's methodology involves: (1) **Introducing Recurring TTA:** A diagnostic testing scenario where environments not only change but also recur over time, based on practical TTA but with repeated cycles through distributions. (2) **Theoretical Analysis with ϵ-GMMC:** A simplified yet representative ϵ-perturbed binary Gaussian Mixture Model Classifier (ϵ-GMMC) is used on a synthesized dataset to model and analyze the collapsing phenomenon. This analysis helps derive theoretical insights into data-dependent factors (prior data distribution, category difference) and algorithm-dependent factors (update rate, false negative rate) that cause performance degradation. (3) **Persistent TTA (PeTTA) Algorithm:** PeTTA extends the mean teacher update framework by continuously monitoring model divergence. It employs a mechanism to sense divergence from the initial model in the feature embedding space using Mahalanobis distance of running mean feature vectors (γ_y^t). Based on an average divergence measure (¯γ_t), PeTTA adaptively adjusts the regularization coefficient (λ_t) and the EMA update rate (α_t) on the fly. It also incorporates an anchor loss (LAL) that minimizes the KL divergence between the current and source model's output probabilities to prevent significant deviation, along with a category-balanced memory bank and robust batch normalization layers adopted from prior work.
+
+# GitHub URLs List
+['https://github.com/oripress/CCC', 'https://github.com/DianCh/AdaContrast', 'https://github.com/BIT-DA/RoTTA', 'https://github.com/mariodoebler/test-time-adaptation', 'https://github.com/hendrycks/robustness']
+Output:
+{
+    "index": 3
+}
