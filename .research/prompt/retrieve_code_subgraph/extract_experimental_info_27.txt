@@ -1,0 +1,1616 @@
+
+Input:
+You are a researcher with expertise in engineering in the field of machine learning.
+
+# Instructions
+- The content described in “Repository Content” corresponds to the GitHub repository of the method described in “Method.”
+- Please extract the following two pieces of information from “Repository Content”:
+    - experimental_code：Extract the implementation sections that are directly related to the method described in “Method.”
+    - experimental_info：Extract and output the experimental settings related to the method described in “Method.”
+
+# Method
+K-priors are defined as a class of priors using both weight and function-space regularizers, specifically K(w; w*,M) = Df(f(w)||f(w*)) + τDw(w||w*), where Df and Dw are Bregman divergences. The core principle is to reconstruct the gradients of the past training objective. For Generalized Linear Models (GLMs), an L2 regularizer is used for Dw and a Bregman divergence with the log-partition function A(f) for Df, which exactly recovers past gradients when the full past data is used. For limited memory, a practical approximation involves choosing examples with the highest derivative h'(fi w*) (referred to as 'memorable past') to minimize gradient-reconstruction error. For deep learning, K-priors extend Knowledge Distillation by adding a weight-space term, allowing general link functions, and using a small number of memory examples. Adaptation is achieved by minimizing new objectives regularized by the K-prior (e.g., for adding/removing data, changing regularizers, or changing model classes).
+
+# Repository Content
+File Path: adamreg.py
+Content:
+import math
+import torch
+from torch.optim.optimizer import Optimizer
+from torch.nn.utils import parameters_to_vector, vector_to_parameters
+
+
+# For registering forward hooks
+def update_input(self, input, output):
+    self.input = input[0].data
+    self.output = output
+
+
+# Check if device of param is the same as old_param_device, and warn if not
+def _check_param_device(param, old_param_device):
+    if old_param_device is None:
+        old_param_device = param.get_device() if param.is_cuda else -1
+    else:
+        warn = False
+        if param.is_cuda:  # check if in same gpu
+            warn = (param.get_device() != old_param_device)
+        else:  # check if in cpu
+            warn = (old_param_device != -1)
+        if warn:
+            raise TypeError('Found two parameters on different devices, this is currently not supported.')
+    return old_param_device
+
+
+# Convert from parameters to a matrix
+def parameters_to_matrix(parameters):
+    param_device = None
+    mat = []
+    for param in parameters:
+        param_device = _check_param_device(param, param_device)
+        m = param.shape[0]
+        mat.append(param.view(m, -1))
+    return torch.cat(mat, dim=-1)
+
+
+# Get parameter gradients as a vector
+def parameters_grads_to_vector(parameters):
+    param_device = None
+    vec = []
+    for param in parameters:
+        param_device = _check_param_device(param, param_device)
+        if param.grad is None:
+            raise ValueError('Gradient not available')
+        vec.append(param.grad.data.view(-1))
+    return torch.cat(vec, dim=-1)
+
+
+# The AdamReg optimiser. Started from torch.optim.adam
+class AdamReg(Optimizer):
+
+    def __init__(self, model, lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=0, prior_prec=1e-3,
+                 prior_prec_old=0., amsgrad=False):
+        if not 0.0 <= lr:
+            raise ValueError("Invalid learning rate: {}".format(lr))
+        if not 0.0 <= eps:
+            raise ValueError("Invalid epsilon value: {}".format(eps))
+        if not 0.0 <= betas[0] < 1.0:
+            raise ValueError("Invalid beta parameter at index 0: {}".format(betas[0]))
+        if not 0.0 <= betas[1] < 1.0:
+            raise ValueError("Invalid beta parameter at index 1: {}".format(betas[1]))
+        if not 0.0 <= prior_prec:
+            raise ValueError("invalid prior precision: {}".format(prior_prec))
+        if not 0.0 <= prior_prec_old:
+            raise ValueError("invalid prior precision: {}".format(prior_prec_old))
+        defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay, prior_prec=prior_prec,
+                        prior_prec_old=prior_prec_old, amsgrad=amsgrad)
+        super(AdamReg, self).__init__(model.parameters(), defaults)
+
+        # State initialisation
+        parameters = self.param_groups[0]['params']
+        p = parameters_to_vector(parameters)
+        self.state['mu'] = p.clone().detach()
+        self.state['hessian_ggn'] = torch.zeros_like(self.state['mu'])
+        self.state['step'] = 0
+        self.state['exp_avg'] = torch.zeros_like(self.state['mu'])
+        self.state['exp_avg_sq'] = torch.zeros_like(self.state['mu'])
+        if amsgrad:
+            self.state['max_exp_avg_sq'] = torch.zeros_like(self.state['mu'])
+
+        # Additional for K-priors and Replay
+        self.memory_labels = None
+        self.model = model
+        self.previous_weights = None
+        self.prior_prec_old = None
+        self.train_set_size = 0
+
+    # Iteration step for this optimiser
+    def step(self, closure_data, closure_memory=None, adaptation_method=None):
+
+        parameters = self.param_groups[0]['params']
+        p = parameters_to_vector(parameters)
+        self.state['mu'] = p.clone().detach()
+        mu = self.state['mu']
+        self.total_datapoints_this_iter = 0
+
+        # Normal loss term over current task's data
+        if closure_data is not None:
+            vector_to_parameters(mu, parameters)
+            train_nll = closure_data()
+            train_nll.backward()
+            grad = parameters_grads_to_vector(parameters).detach()
+        else:
+            grad = torch.zeros_like(mu)
+            train_nll = 0.
+
+        # Multiply by train set size
+        if self.train_set_size > 0:
+            grad.mul_(self.train_set_size)
+            self.total_datapoints_this_iter += self.train_set_size
+
+        # Loss term over memory points (only if K-priors or Replay)
+        if closure_memory is not None:
+            # Forward pass through memory points
+            preds = closure_memory()
+            self.total_datapoints_this_iter += len(preds)
+
+            # Softmax on output
+            preds_soft = torch.softmax(preds, dim=-1)
+
+            # Calculate the vector that will be premultiplied by the Jacobian, of size M x 2
+            delta_logits = preds_soft.detach() - self.memory_labels
+
+            # Autograd
+            grad_message = torch.autograd.grad(preds, self.model.parameters(), grad_outputs=delta_logits)
+
+            # Convert grad_message into a vector
+            grad_vec = []
+            for i in range(len(grad_message)):
+                grad_vec.append(grad_message[i].data.view(-1))
+            grad_vec = torch.cat(grad_vec, dim=-1)
+
+            # Add to gradient
+            grad.add_(grad_vec.detach())
+
+            # Weight regularisation
+            if adaptation_method == "K-priors" and self.prior_prec_old is not None:
+                grad.add_(self.previous_weights, alpha=-self.prior_prec_old)
+
+        # Add l2 regularisation
+        if self.param_groups[0]['weight_decay'] != 0:
+            grad.add_(mu, alpha=self.param_groups[0]['weight_decay'])
+
+        # Divide by train set size
+        if self.total_datapoints_this_iter > 0:
+            grad.div_(self.total_datapoints_this_iter)
+
+        # Update equations
+        lr = self.param_groups[0]['lr']
+
+        # Adam update
+        exp_avg, exp_avg_sq = self.state['exp_avg'], self.state['exp_avg_sq']
+        beta1, beta2 = self.param_groups[0]['betas']
+        amsgrad = self.param_groups[0]['amsgrad']
+        if amsgrad:
+            max_exp_avg_sq = self.state['max_exp_avg_sq']
+
+        self.state['step'] += 1
+        bias_correction1 = 1 - beta1 ** self.state['step']
+        bias_correction2 = 1 - beta2 ** self.state['step']
+
+        # Decay the first and second moment running average coefficient
+        exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
+        exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
+        if amsgrad:
+            # Maintains the maximum of all 2nd moment running avg. till now
+            torch.max(max_exp_avg_sq, exp_avg_sq, out=max_exp_avg_sq)
+            # Use the max. for normalizing running avg. of gradient
+            denom = (max_exp_avg_sq.sqrt() / math.sqrt(bias_correction2)).add_(self.param_groups[0]['eps'])
+        else:
+            denom = (exp_avg_sq.sqrt() / math.sqrt(bias_correction2)).add_(self.param_groups[0]['eps'])
+
+        step_size = lr / bias_correction1
+        mu.addcdiv_(exp_avg, denom, value=-step_size)
+        vector_to_parameters(mu, parameters)
+
+        return train_nll
+
+File Path: data_generators.py
+Content:
+import torch
+import numpy as np
+from sklearn.datasets import load_svmlight_file
+from sklearn.preprocessing import PolynomialFeatures
+from torchvision import datasets
+
+
+# Binary classification with Adult UCI dataset, https://www.csie.ntu.edu.tw/~cjlin/libsvmtools/datasets/binary.html
+# adaptation_task options: {add_data, remove_data, change_regulariser, change_model}
+class UCIDataGenerator():
+    def __init__(self, adaptation_task="add_data", seed=1):
+
+        self.adaptation_task = adaptation_task
+        np.random.seed(seed)
+
+        # Load UCI Adult data
+        data = load_svmlight_file("data/UCI/a7a", n_features=123)
+        X_train_initial = data[0].todense().astype(np.float32)
+        self.labels_train = data[1].astype(int)
+
+        # Randomly choose 10% of data for all adaptation tasks except "remove_data"
+        if self.adaptation_task == "remove_data":
+            num_datapoints = (int)(X_train_initial.shape[0])
+            perm_inds = list(range(X_train_initial.shape[0]))
+        else:
+            num_datapoints = (int)(X_train_initial.shape[0] * 0.01)
+            perm_inds = list(range(X_train_initial.shape[0]))
+            np.random.shuffle(perm_inds)
+
+        self.X_train_initial = X_train_initial[perm_inds[:num_datapoints]]
+        self.labels_train = self.labels_train[perm_inds[:num_datapoints]]
+
+        data_test = load_svmlight_file("data/UCI/a7a_test", n_features=123)
+        self.X_test_initial = torch.from_numpy(data_test[0].todense().astype(np.float32))
+        self.labels_test = torch.tensor(data_test[1], dtype=torch.long)
+
+        # Convert from classes {-1, 1} to {0, 1}
+        self.labels_train[self.labels_train < 0] = 0
+        self.labels_test[self.labels_test<0] = 0
+
+
+    # Base task to train on first
+    def base_task_data(self):
+
+        # If "change_model", polynomial degree 2, else degree 1
+        if self.adaptation_task == "change_model":
+            self.update_polynomial_degree(2)
+        else:
+            self.update_polynomial_degree(1)
+
+        # If "add_data", choose 90% of the data for base task
+        if self.adaptation_task == "add_data":
+            num_datapoints_base_task = (int)(self.X_train.shape[0] * 0.9)
+            X_train = self.X_train[:num_datapoints_base_task]
+            labels_train = self.labels_train[:num_datapoints_base_task]
+        else:
+            X_train = self.X_train
+            labels_train = self.labels_train
+
+        self.number_base_points = len(X_train)
+
+        return (torch.from_numpy(X_train), torch.from_numpy(labels_train).reshape(-1)), \
+               (self.X_test, self.labels_test.reshape(-1))
+
+
+    # Adaptation task (second task) to train on
+    def adaptation_task_data(self):
+
+        # If "change_model", convert polynomial degree to 1
+        if self.adaptation_task == "change_model":
+            self.update_polynomial_degree(1)
+
+        # If "add_data", choose 10% of the data for adaptation task
+        if self.adaptation_task == "add_data":
+            num_datapoints_base_task = (int)(self.X_train.shape[0] * 0.9)
+            X_train = self.X_train[num_datapoints_base_task:]
+            labels_train = self.labels_train[num_datapoints_base_task:]
+
+            return (torch.from_numpy(X_train), torch.from_numpy(labels_train).reshape(-1)), \
+                   (self.X_test, self.labels_test.reshape(-1))
+        else:
+            return None, (self.X_test, self.labels_test.reshape(-1))
+
+
+    # Update polynomial degree
+    def update_polynomial_degree(self, polynomial_degree=1):
+        self.poly = PolynomialFeatures(polynomial_degree)
+        self.X_train = self.poly.fit_transform(self.X_train_initial)
+        self.X_test = self.poly.fit_transform(self.X_test_initial)
+        self.X_test = torch.from_numpy(self.X_test.astype(np.float32))
+        self.dimensions = self.X_train.shape[1]
+
+
+
+# USPS odd vs even dataset (binary classification)
+# adaptation_task options: {add_data, remove_data, change_regulariser, change_model}
+class USPSDataGenerator():
+    def __init__(self, adaptation_task="add_data", polynomial_degree=None, seed=0, path=None):
+
+        self.adaptation_task = adaptation_task
+        self.polynomial_degree = polynomial_degree
+        np.random.seed(seed)
+
+        # Load USPS data
+        train_dataset = datasets.USPS(root='./data', train=True)
+        test_dataset = datasets.USPS(root='./data', train=False)
+
+        self.X_train_initial = np.array(train_dataset.data)
+        self.labels_train = np.array(train_dataset.targets)
+        self.X_test_initial = np.array(test_dataset.data)
+        self.labels_test = np.array(test_dataset.targets)
+
+
+    # Base task to train on first
+    def base_task_data(self):
+        # If "change_model" and GLM, polynomial degree 2, else degree 1
+        if self.polynomial_degree is not None:
+            if self.adaptation_task == "change_model":
+                self.update_polynomial_degree(2)
+            else:
+                self.update_polynomial_degree(1)
+
+        else:
+            self.X_train = self.X_train_initial
+            self.X_test = self.X_test_initial
+            self.dimensions = self.X_train.shape[1]
+
+        # If "add_data", all digits except the digit '9' is base task
+        if self.adaptation_task == "add_data":
+            return self.data_split(digit_set=[0,1,2,3,4,5,6,7,8])
+        else:
+            return self.data_split(digit_set=[0,1,2,3,4,5,6,7,8,9])
+
+
+    # Adaptation task (second task) to train on
+    def adaptation_task_data(self):
+
+        # If "change_model" and GLM, convert polynomial degree to 1
+        if self.polynomial_degree is not None and self.adaptation_task == "change_model":
+            self.update_polynomial_degree(1)
+
+        # If "add_data", add digit '9'
+        if self.adaptation_task == "add_data":
+            train_data, _ = self.data_split(digit_set=[9])
+            _, test_data = self.data_split(digit_set=[0,1,2,3,4,5,6,7,8,9])
+            return train_data, test_data
+
+        # If "remove_data", remove digit '8'
+        elif self.adaptation_task == "remove_data":
+            train_data, _ = self.data_split(digit_set=[8])
+            _, test_data = self.data_split(digit_set=[0,1,2,3,4,5,6,7,9])
+            return train_data, test_data
+
+        else:
+            _, test_data = self.data_split(digit_set=[0,1,2,3,4,5,6,7,8,9])
+            return None, test_data
+
+
+    # Update polynomial degree
+    def update_polynomial_degree(self, polynomial_degree=None):
+        if polynomial_degree is not None:
+            self.poly = PolynomialFeatures(polynomial_degree)
+            self.X_train = self.poly.fit_transform(self.X_train_initial)
+            self.X_test = self.poly.fit_transform(self.X_test_initial).astype(np.float32)
+            self.dimensions = self.X_train.shape[1]
+
+
+    # Return trainloader and testloader for a specific split_ind
+    def data_split(self, digit_set=[]):
+        next_x_train = None
+        next_y_train = None
+        next_x_test = None
+        next_y_test = None
+
+        # Loop over all classes in current iteration
+        for digit in digit_set:
+
+            # Find the correct set of training inputs, and stack
+            train_id = np.where(self.labels_train == digit)[0]
+            if next_x_train is None:
+                next_x_train = self.X_train[train_id]
+            else:
+                next_x_train = np.vstack((next_x_train, self.X_train[train_id]))
+
+            # Only interested in binary classification
+            next_y_train_interm = np.abs(digit)*np.ones(len(train_id), dtype=np.int64)
+            next_y_train_interm = next_y_train_interm % 2
+
+            if next_y_train is None:
+                next_y_train = next_y_train_interm
+            else:
+                next_y_train = np.hstack((next_y_train, next_y_train_interm))
+
+            # Repeat above process for test inputs
+            test_id = np.where(self.labels_test == digit)[0]
+            if next_x_test is None:
+                next_x_test = self.X_test[test_id]
+            else:
+                next_x_test = np.vstack((next_x_test, self.X_test[test_id]))
+
+            # Only interested in binary classification
+            next_y_test_interm = np.abs(digit)*np.ones(len(test_id), dtype=np.int64)
+            next_y_test_interm = next_y_test_interm % 2
+
+            if next_y_test is None:
+                next_y_test = next_y_test_interm
+            else:
+                next_y_test = np.hstack((next_y_test, next_y_test_interm))
+
+        if next_x_train is not None:
+            inputs_train = torch.from_numpy(next_x_train)
+            labels_train = torch.from_numpy(next_y_train)
+            inputs_test = torch.from_numpy(next_x_test)
+            labels_test = torch.from_numpy(next_y_test)
+
+            self.number_base_points = len(inputs_train)
+
+            return (inputs_train, labels_train), (inputs_test, labels_test)
+        else:
+            return (None, None)
+
+File Path: lbfgsreg.py
+Content:
+import torch
+from functools import reduce
+from torch.optim.optimizer import Optimizer
+from torch.nn.utils import parameters_to_vector, vector_to_parameters
+
+
+def _cubic_interpolate(x1, f1, g1, x2, f2, g2, bounds=None):
+    # ported from https://github.com/torch/optim/blob/master/polyinterp.lua
+    # Compute bounds of interpolation area
+    if bounds is not None:
+        xmin_bound, xmax_bound = bounds
+    else:
+        xmin_bound, xmax_bound = (x1, x2) if x1 <= x2 else (x2, x1)
+
+    # Code for most common case: cubic interpolation of 2 points
+    #   w/ function and derivative values for both
+    # Solution in this case (where x2 is the farthest point):
+    #   d1 = g1 + g2 - 3*(f1-f2)/(x1-x2);
+    #   d2 = sqrt(d1^2 - g1*g2);
+    #   min_pos = x2 - (x2 - x1)*((g2 + d2 - d1)/(g2 - g1 + 2*d2));
+    #   t_new = min(max(min_pos,xmin_bound),xmax_bound);
+    d1 = g1 + g2 - 3 * (f1 - f2) / (x1 - x2)
+    d2_square = d1**2 - g1 * g2
+    if d2_square >= 0:
+        d2 = d2_square.sqrt()
+        if x1 <= x2:
+            min_pos = x2 - (x2 - x1) * ((g2 + d2 - d1) / (g2 - g1 + 2 * d2))
+        else:
+            min_pos = x1 - (x1 - x2) * ((g1 + d2 - d1) / (g1 - g2 + 2 * d2))
+        return min(max(min_pos, xmin_bound), xmax_bound)
+    else:
+        return (xmin_bound + xmax_bound) / 2.
+
+
+def _strong_wolfe(obj_func,
+                  x,
+                  t,
+                  d,
+                  f,
+                  g,
+                  gtd,
+                  c1=1e-4,
+                  c2=0.9,
+                  tolerance_change=1e-9,
+                  max_ls=25):
+    # ported from https://github.com/torch/optim/blob/master/lswolfe.lua
+    d_norm = d.abs().max()
+    g = g.clone(memory_format=torch.contiguous_format)
+    # evaluate objective and gradient using initial step
+    f_new, g_new = obj_func(x, t, d)
+    ls_func_evals = 1
+    gtd_new = g_new.dot(d)
+
+    # bracket an interval containing a point satisfying the Wolfe criteria
+    t_prev, f_prev, g_prev, gtd_prev = 0, f, g, gtd
+    done = False
+    ls_iter = 0
+    while ls_iter < max_ls:
+        # check conditions
+        if f_new > (f + c1 * t * gtd) or (ls_iter > 1 and f_new >= f_prev):
+            bracket = [t_prev, t]
+            bracket_f = [f_prev, f_new]
+            bracket_g = [g_prev, g_new.clone(memory_format=torch.contiguous_format)]
+            bracket_gtd = [gtd_prev, gtd_new]
+            break
+
+        if abs(gtd_new) <= -c2 * gtd:
+            bracket = [t]
+            bracket_f = [f_new]
+            bracket_g = [g_new]
+            done = True
+            break
+
+        if gtd_new >= 0:
+            bracket = [t_prev, t]
+            bracket_f = [f_prev, f_new]
+            bracket_g = [g_prev, g_new.clone(memory_format=torch.contiguous_format)]
+            bracket_gtd = [gtd_prev, gtd_new]
+            break
+
+        # interpolate
+        min_step = t + 0.01 * (t - t_prev)
+        max_step = t * 10
+        tmp = t
+        t = _cubic_interpolate(
+            t_prev,
+            f_prev,
+            gtd_prev,
+            t,
+            f_new,
+            gtd_new,
+            bounds=(min_step, max_step))
+
+        # next step
+        t_prev = tmp
+        f_prev = f_new
+        g_prev = g_new.clone(memory_format=torch.contiguous_format)
+        gtd_prev = gtd_new
+        f_new, g_new = obj_func(x, t, d)
+        ls_func_evals += 1
+        gtd_new = g_new.dot(d)
+        ls_iter += 1
+
+    # reached max number of iterations?
+    if ls_iter == max_ls:
+        bracket = [0, t]
+        bracket_f = [f, f_new]
+        bracket_g = [g, g_new]
+
+    # zoom phase: we now have a point satisfying the criteria, or
+    # a bracket around it. We refine the bracket until we find the
+    # exact point satisfying the criteria
+    insuf_progress = False
+    # find high and low points in bracket
+    low_pos, high_pos = (0, 1) if bracket_f[0] <= bracket_f[-1] else (1, 0)
+    while not done and ls_iter < max_ls:
+        # line-search bracket is so small
+        if abs(bracket[1] - bracket[0]) * d_norm < tolerance_change:
+            break
+
+        # compute new trial value
+        t = _cubic_interpolate(bracket[0], bracket_f[0], bracket_gtd[0],
+                               bracket[1], bracket_f[1], bracket_gtd[1])
+
+        # test that we are making sufficient progress:
+        # in case `t` is so close to boundary, we mark that we are making
+        # insufficient progress, and if
+        #   + we have made insufficient progress in the last step, or
+        #   + `t` is at one of the boundary,
+        # we will move `t` to a position which is `0.1 * len(bracket)`
+        # away from the nearest boundary point.
+        eps = 0.1 * (max(bracket) - min(bracket))
+        if min(max(bracket) - t, t - min(bracket)) < eps:
+            # interpolation close to boundary
+            if insuf_progress or t >= max(bracket) or t <= min(bracket):
+                # evaluate at 0.1 away from boundary
+                if abs(t - max(bracket)) < abs(t - min(bracket)):
+                    t = max(bracket) - eps
+                else:
+                    t = min(bracket) + eps
+                insuf_progress = False
+            else:
+                insuf_progress = True
+        else:
+            insuf_progress = False
+
+        # Evaluate new point
+        f_new, g_new = obj_func(x, t, d)
+        ls_func_evals += 1
+        gtd_new = g_new.dot(d)
+        ls_iter += 1
+
+        if f_new > (f + c1 * t * gtd) or f_new >= bracket_f[low_pos]:
+            # Armijo condition not satisfied or not lower than lowest point
+            bracket[high_pos] = t
+            bracket_f[high_pos] = f_new
+            bracket_g[high_pos] = g_new.clone(memory_format=torch.contiguous_format)
+            bracket_gtd[high_pos] = gtd_new
+            low_pos, high_pos = (0, 1) if bracket_f[0] <= bracket_f[1] else (1, 0)
+        else:
+            if abs(gtd_new) <= -c2 * gtd:
+                # Wolfe conditions satisfied
+                done = True
+            elif gtd_new * (bracket[high_pos] - bracket[low_pos]) >= 0:
+                # old high becomes new low
+                bracket[high_pos] = bracket[low_pos]
+                bracket_f[high_pos] = bracket_f[low_pos]
+                bracket_g[high_pos] = bracket_g[low_pos]
+                bracket_gtd[high_pos] = bracket_gtd[low_pos]
+
+            # new point becomes new low
+            bracket[low_pos] = t
+            bracket_f[low_pos] = f_new
+            bracket_g[low_pos] = g_new.clone(memory_format=torch.contiguous_format)
+            bracket_gtd[low_pos] = gtd_new
+
+    # return stuff
+    t = bracket[low_pos]
+    f_new = bracket_f[low_pos]
+    g_new = bracket_g[low_pos]
+    return f_new, g_new, t, ls_func_evals
+
+# The LBFGS optimiser. Started from the PyTorch default implementation
+class LBFGSReg(Optimizer):
+    """Implements L-BFGS algorithm, heavily inspired by `minFunc
+    <https://www.cs.ubc.ca/~schmidtm/Software/minFunc.html>`.
+
+    .. warning::
+        This optimizer doesn't support per-parameter options and parameter
+        groups (there can be only one).
+
+    .. warning::
+        Right now all parameters have to be on a single device. This will be
+        improved in the future.
+
+    .. note::
+        This is a very memory intensive optimizer (it requires additional
+        ``param_bytes * (history_size + 1)`` bytes). If it doesn't fit in memory
+        try reducing the history size, or use a different algorithm.
+
+    Arguments:
+        lr (float): learning rate (default: 1)
+        max_iter (int): maximal number of iterations per optimization step
+            (default: 20)
+        max_eval (int): maximal number of function evaluations per optimization
+            step (default: max_iter * 1.25).
+        tolerance_grad (float): termination tolerance on first order optimality
+            (default: 1e-5).
+        tolerance_change (float): termination tolerance on function
+            value/parameter changes (default: 1e-9).
+        history_size (int): update history size (default: 100).
+        line_search_fn (str): either 'strong_wolfe' or None (default: None).
+    """
+
+    def __init__(self,
+                 model,
+                 lr=1,
+                 max_iter=1,
+                 max_eval=None,
+                 tolerance_grad=1e-8,
+                 tolerance_change=1e-9,
+                 history_size=100,
+                 line_search_fn=None,
+                 weight_decay=0,
+                 prior_prec_old=0.):
+        if max_eval is None:
+            max_eval = max_iter * 5 // 4
+        params = model.parameters()
+        defaults = dict(
+            lr=lr,
+            max_iter=max_iter,
+            max_eval=max_eval,
+            tolerance_grad=tolerance_grad,
+            tolerance_change=tolerance_change,
+            history_size=history_size,
+            line_search_fn=line_search_fn,
+            weight_decay=weight_decay,
+            prior_prec_old=prior_prec_old)
+        super(LBFGSReg, self).__init__(params, defaults)
+
+        if len(self.param_groups) != 1:
+            raise ValueError("LBFGS doesn't support per-parameter options "
+                             "(parameter groups)")
+
+        self._params = self.param_groups[0]['params']
+        self._numel_cache = None
+
+        # Additional for K-priors and Replay
+        self.memory_labels = None
+        self.model = model
+        self.previous_weights = None
+        self.prior_prec_old = None
+        self.train_set_size = 0
+
+    def _numel(self):
+        if self._numel_cache is None:
+            self._numel_cache = reduce(lambda total, p: total + p.numel(), self._params, 0)
+        return self._numel_cache
+
+    def _gather_flat_grad(self):
+        views = []
+        for p in self._params:
+            if p.grad is None:
+                view = p.new(p.numel()).zero_()
+            elif p.grad.is_sparse:
+                view = p.grad.to_dense().view(-1)
+            else:
+                view = p.grad.view(-1)
+            views.append(view)
+        return torch.cat(views, 0)
+
+    def _add_grad(self, step_size, update):
+        offset = 0
+        for p in self._params:
+            numel = p.numel()
+            # view as to avoid deprecated pointwise semantics
+            p.add_(update[offset:offset + numel].view_as(p), alpha=step_size)
+            offset += numel
+        assert offset == self._numel()
+
+    def _clone_param(self):
+        return [p.clone(memory_format=torch.contiguous_format) for p in self._params]
+
+    def _set_param(self, params_data):
+        for p, pdata in zip(self._params, params_data):
+            p.copy_(pdata)
+
+    def _directional_evaluate(self, closure, x, t, d):
+        self._add_grad(t, d)
+        loss = float(closure())
+        flat_grad = self._gather_flat_grad()
+        self._set_param(x)
+        return loss, flat_grad
+
+    # Update the train set size to new task's dataset size
+    def update_train_set_size(self, size):
+        self.defaults['train_set_size'] = size
+
+    @torch.no_grad()
+    def step(self, closure_data, closure_memory=None, adaptation_method=None):
+        """Performs a single optimization step.
+
+        Arguments:
+            closure (callable): A closure that reevaluates the model
+                and returns the loss.
+            closure_memory_points (callable): A closure that reevaluates
+                the model and returns the loss on stored (memory) points
+            adaptation_method: A string that is either "K-priors" or
+                "Replay", only used if closure_memorable_points is not None
+        """
+        assert len(self.param_groups) == 1
+
+        # Make sure the closure is always called with grad enabled
+        if closure_data is not None:
+            closure_data = torch.enable_grad()(closure_data)
+        if closure_memory is not None:
+            closure_memory = torch.enable_grad()(closure_memory)
+
+        group = self.param_groups[0]
+        lr = group['lr']
+        max_iter = group['max_iter']
+        max_eval = group['max_eval']
+        tolerance_grad = group['tolerance_grad']
+        tolerance_change = group['tolerance_change']
+        line_search_fn = group['line_search_fn']
+        history_size = group['history_size']
+
+        parameters = self.param_groups[0]['params']
+        p = parameters_to_vector(parameters)
+        mu = p.clone().detach()
+
+        # NOTE: LBFGS has only global state, but we register it as state for
+        # the first param, because this helps with casting in load_state_dict
+        state = self.state[self._params[0]]
+        state.setdefault('func_evals', 0)
+        state.setdefault('n_iter', 0)
+
+        # evaluate initial f(x) and df/dx
+        self.total_datapoints_this_iter = 0
+        if closure_data is not None:
+            orig_loss = closure_data()
+            orig_loss.backward()
+            loss = float(orig_loss)
+        else:
+            orig_loss = 0.
+            loss = 0.
+
+        current_evals = 1
+        state['func_evals'] += 1
+
+        flat_grad = self._gather_flat_grad()
+
+        # Multiply by train set size
+        if self.train_set_size > 0:
+            flat_grad.mul_(self.train_set_size)
+            self.total_datapoints_this_iter += self.train_set_size
+
+        # Loss term over memory points (only if K-priors or Replay)
+        if closure_memory is not None:
+            # Forward pass through memory points
+            preds = closure_memory()
+            self.total_datapoints_this_iter += len(preds)
+
+            # Softmax on output
+            preds_soft = torch.softmax(preds, dim=-1)
+
+            # Calculate the vector that will be premultiplied by the Jacobian, of size M x 2
+            delta_logits = preds_soft.detach() - self.memory_labels
+
+            # Autograd
+            grad_message = torch.autograd.grad(preds, self.model.parameters(), grad_outputs=delta_logits)
+
+            # Convert grad_message into a vector
+            grad_vec = []
+            for i in range(len(grad_message)):
+                grad_vec.append(grad_message[i].data.view(-1))
+            grad_vec = torch.cat(grad_vec, dim=-1)
+
+            # Add to gradient
+            flat_grad.add_(grad_vec.detach())
+
+            # Weight regularisation
+            if adaptation_method == "K-priors" and self.prior_prec_old is not None:
+                flat_grad.add_(self.previous_weights, alpha=-self.prior_prec_old)
+
+        # Add l2 regularisation
+        if self.param_groups[0]['weight_decay'] != 0:
+            flat_grad.add_(mu, alpha=self.param_groups[0]['weight_decay'])
+
+        # Divide by train set size
+        if self.total_datapoints_this_iter > 0:
+            flat_grad.div_(self.total_datapoints_this_iter)
+
+        # Check if converged
+        opt_cond = flat_grad.abs().max() <= tolerance_grad
+
+        # optimal condition
+        if opt_cond:
+            return orig_loss
+
+        # tensors cached in state (for tracing)
+        d = state.get('d')
+        t = state.get('t')
+        old_dirs = state.get('old_dirs')
+        old_stps = state.get('old_stps')
+        ro = state.get('ro')
+        H_diag = state.get('H_diag')
+        prev_flat_grad = state.get('prev_flat_grad')
+        prev_loss = state.get('prev_loss')
+
+        n_iter = 0
+        # optimize for a max of max_iter iterations
+        while n_iter < max_iter:
+            # keep track of nb of iterations
+            n_iter += 1
+            state['n_iter'] += 1
+
+            ############################################################
+            # compute gradient descent direction
+            ############################################################
+            if state['n_iter'] == 1:
+                d = flat_grad.neg()
+                old_dirs = []
+                old_stps = []
+                ro = []
+                H_diag = 1
+            else:
+                # do lbfgs update (update memory)
+                y = flat_grad.sub(prev_flat_grad)
+                s = d.mul(t)
+                ys = y.dot(s)  # y*s
+                if ys > 1e-10:
+                    # updating memory
+                    if len(old_dirs) == history_size:
+                        # shift history by one (limited-memory)
+                        old_dirs.pop(0)
+                        old_stps.pop(0)
+                        ro.pop(0)
+
+                    # store new direction/step
+                    old_dirs.append(y)
+                    old_stps.append(s)
+                    ro.append(1. / ys)
+
+                    # update scale of initial Hessian approximation
+                    H_diag = ys / y.dot(y)  # (y*y)
+
+                # compute the approximate (L-BFGS) inverse Hessian
+                # multiplied by the gradient
+                num_old = len(old_dirs)
+
+                if 'al' not in state:
+                    state['al'] = [None] * history_size
+                al = state['al']
+
+                # iteration in L-BFGS loop collapsed to use just one buffer
+                q = flat_grad.neg()
+                for i in range(num_old - 1, -1, -1):
+                    al[i] = old_stps[i].dot(q) * ro[i]
+                    q.add_(old_dirs[i], alpha=-al[i])
+
+                # multiply by initial Hessian
+                # r/d is the final direction
+                d = r = torch.mul(q, H_diag)
+                for i in range(num_old):
+                    be_i = old_dirs[i].dot(r) * ro[i]
+                    r.add_(old_stps[i], alpha=al[i] - be_i)
+
+            if prev_flat_grad is None:
+                prev_flat_grad = flat_grad.clone(memory_format=torch.contiguous_format)
+            else:
+                prev_flat_grad.copy_(flat_grad)
+            prev_loss = loss
+
+            ############################################################
+            # compute step length
+            ############################################################
+            # reset initial guess for step size
+            if state['n_iter'] == 1:
+                t = min(1., 1. / flat_grad.abs().sum()) * lr
+            else:
+                t = lr
+
+            # directional derivative
+            gtd = flat_grad.dot(d)  # g * d
+
+            # directional derivative is below tolerance
+            if gtd > -tolerance_change:
+                break
+
+            # optional line search: user function
+            ls_func_evals = 0
+            if line_search_fn is not None:
+                # perform line search, using user function
+                if line_search_fn != "strong_wolfe":
+                    raise RuntimeError("only 'strong_wolfe' is supported")
+                else:
+                    x_init = self._clone_param()
+
+                    def obj_func(x, t, d):
+                        return self._directional_evaluate(closure_data, x, t, d)
+
+                    loss, flat_grad, t, ls_func_evals = _strong_wolfe(
+                        obj_func, x_init, t, d, loss, flat_grad, gtd)
+                self._add_grad(t, d)
+                opt_cond = flat_grad.abs().max() <= tolerance_grad
+            else:
+                # no line search, simply move with fixed-step
+                self._add_grad(t, d)
+                if n_iter != max_iter:
+                    # re-evaluate function only if not in last iteration
+                    # the reason we do this: in a stochastic setting,
+                    # no use to re-evaluate that function here
+                    with torch.enable_grad():
+                        # evaluate initial f(x) and df/dx
+                        self.total_datapoints_this_iter = 0
+                        if closure_data is not None:
+                            orig_loss = closure_data()
+                            orig_loss.backward()
+                            loss = float(orig_loss)
+                        else:
+                            orig_loss = 0.
+                            loss = 0.
+
+                    flat_grad = self._gather_flat_grad()
+                    print('unexpected?')
+
+                    # Multiply by train set size
+                    if self.train_set_size > 0:
+                        flat_grad.mul_(self.train_set_size)
+                        self.total_datapoints_this_iter += self.train_set_size
+
+                    # Loss term over memory points (only if K-priors or Replay)
+                    if closure_memory is not None:
+                        # Forward pass through memory points
+                        preds = closure_memory()
+                        self.total_datapoints_this_iter += len(preds)
+
+                        # Softmax on output
+                        preds_soft = torch.softmax(preds, dim=-1)
+
+                        # Calculate the vector that will be premultiplied by the Jacobian, of size M x 2
+                        delta_logits = preds_soft.detach() - self.memory_labels
+
+                        # Autograd
+                        grad_message = torch.autograd.grad(preds, self.model.parameters(), grad_outputs=delta_logits)
+
+                        # Convert grad_message into a vector
+                        grad_vec = []
+                        for i in range(len(grad_message)):
+                            grad_vec.append(grad_message[i].data.view(-1))
+                        grad_vec = torch.cat(grad_vec, dim=-1)
+
+                        # Add to gradient
+                        flat_grad.add_(grad_vec.detach())
+
+                        # Weight regularisation
+                        if adaptation_method == "K-priors" and self.prior_prec_old is not None:
+                            flat_grad.add_(self.previous_weights, alpha=-self.prior_prec_old)
+
+                    # Add l2 regularisation
+                    if self.param_groups[0]['weight_decay'] != 0:
+                        parameters = self.param_groups[0]['params']
+                        p = parameters_to_vector(parameters)
+                        mu = p.clone().detach()
+
+                        flat_grad.add_(mu, alpha=self.param_groups[0]['weight_decay'])
+
+                    # Divide by train set size
+                    flat_grad.div_(self.total_datapoints_this_iter)
+
+                    # Check if converged
+                    opt_cond = flat_grad.abs().max() <= tolerance_grad
+                    ls_func_evals = 1
+
+            # update func eval
+            current_evals += ls_func_evals
+            state['func_evals'] += ls_func_evals
+
+            ############################################################
+            # check conditions
+            ############################################################
+            if n_iter == max_iter:
+                break
+
+            if current_evals >= max_eval:
+                break
+
+            # optimal condition
+            if opt_cond:
+                break
+
+            # lack of progress
+            if d.mul(t).abs().max() <= tolerance_change:
+                break
+
+            if abs(loss - prev_loss) < tolerance_change:
+                break
+
+        state['d'] = d
+        state['t'] = t
+        state['old_dirs'] = old_dirs
+        state['old_stps'] = old_stps
+        state['ro'] = ro
+        state['H_diag'] = H_diag
+        state['prev_flat_grad'] = prev_flat_grad
+        state['prev_loss'] = prev_loss
+
+        return orig_loss
+
+File Path: main.py
+Content:
+import argparse
+import torch
+import numpy as np
+import copy
+from data_generators import UCIDataGenerator, USPSDataGenerator
+import utils
+import train
+from models import LinearModel, MLP
+from lbfgsreg import LBFGSReg
+from adamreg import AdamReg
+
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--path', type=str, default='',
+                    help='Path to where to store plots; use \'None\' if want default matplotlib view')
+parser.add_argument('--seed_init', type=int, default=43, help='what random seed to use')
+parser.add_argument('--num_runs', type=int, default=3, help='how many runs to do (each with a  different random seed)')
+parser.add_argument('--dataset', type=str, default='usps_binary', help='what dataset to use: {adult, usps_binary}')
+parser.add_argument('--network_type', type=str, default='MLP', help='what network type: {Linear, MLP}')
+parser.add_argument('--adaptation_task', type=str, default='add_data',
+                    help='which adaptation task: {add_data, remove_data, change_regulariser, change_model}')
+
+args = parser.parse_args()
+
+# Only consider use_cuda if MLP
+use_cuda = False
+if args.network_type == "MLP":
+    use_cuda = True if torch.cuda.is_available() else False
+
+# Which methods to run
+adaptation_methods = ['Replay','K-priors']
+
+# For storing and plotting test accuracies
+test_accuracies_to_plot = {}
+test_accuracies_to_plot['Replay'] = []
+test_accuracies_to_plot['K-priors'] = []
+
+
+# Settings for UCI Adult experiments
+if args.dataset == "adult":
+    polynomial_degree = 1
+    remove_data_bool = False
+    prior_prec = 5
+    args.network_type = "Linear"  # Always Linear model with adult dataset
+    learning_rate = 0.005
+    num_epochs = 1000
+
+    # What proportion of points to store; run many times
+    fraction_points_stored_list = [1., 0.5, 0.2, 0.1, 0.07, 0.05, 0.02]
+
+    # Settings for different adaptation tasks
+    if args.adaptation_task == "remove_data":
+        num_points_to_remove = 100  # These are chosen as the points with highest h'(f)
+    elif args.adaptation_task == "change_regulariser":
+        prior_prec_old = 50  # Reduce from 50 to 5 in adaptation task
+        prior_prec = prior_prec_old
+        prior_prec_new = 5
+
+
+# Settings for UCI Adult experiments
+if args.dataset == "usps_binary":
+    remove_data_bool = False
+    prior_prec = 50
+    if args.network_type == "Linear":
+        polynomial_degree = 1
+        learning_rate = 0.1
+        num_epochs = 300
+    elif args.network_type == "MLP":
+        polynomial_degree = None
+        hidden_sizes = [100]  # MLP architecture
+        learning_rate = 0.005
+        num_epochs = 1000
+
+    # What proportion of points to store; run many times
+    fraction_points_stored_list = [1., 0.5, 0.2, 0.1, 0.07, 0.05, 0.02]
+
+    # Settings for different adaptation tasks
+    if args.adaptation_task == "change_regulariser":
+        if args.network_type == "Linear":
+            prior_prec_old = 50  # Reduce from 50 to 5 in adaptation task
+            prior_prec = prior_prec_old
+            prior_prec_new = 5
+        elif args.network_type == "MLP":
+            prior_prec_old = 5  # Reduce from 50 to 5 in adaptation task
+            prior_prec = prior_prec_old
+            prior_prec_new = 10
+
+    if args.adaptation_task == "change_model" and args.network_type == "MLP":
+        hidden_sizes = [100, 100]  # Go from two-hidden-layers to one-hidden-layer
+
+
+# Repeat over many random seeds
+for random_run in range(args.num_runs):
+
+    seed = args.seed_init + random_run
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    print('')
+
+    # Data generator
+    if args.dataset == "adult":
+        data_generator = UCIDataGenerator(adaptation_task=args.adaptation_task, seed=seed)
+    elif args.dataset == "usps_binary":
+        data_generator = USPSDataGenerator(adaptation_task=args.adaptation_task, polynomial_degree=polynomial_degree,
+                                           seed=seed)
+
+    # Load base task data
+    base_train_data, base_test_data = data_generator.base_task_data()
+
+    # Model and optimiser
+    if args.network_type == "Linear":
+        base_model = LinearModel(D_in=data_generator.dimensions, D_out=2)
+        base_optimiser = LBFGSReg(base_model, lr=learning_rate, weight_decay=prior_prec)
+    elif args.network_type == "MLP":
+        base_model = MLP(D_in=data_generator.dimensions, hidden_sizes=hidden_sizes, D_out=2)
+        base_model = base_model.cuda() if use_cuda else base_model
+        base_optimiser = AdamReg(base_model, lr=learning_rate, weight_decay=prior_prec)
+    else:
+        raise ValueError("Incorrect network type: %s" % args.network_type)
+
+    # Train on base task
+    print('Training on base task...')
+    train.train_model(base_model, base_optimiser, base_train_data, num_epochs=num_epochs, use_cuda=use_cuda)
+    test_accuracy = train.test_model(base_model, base_test_data, use_cuda=use_cuda)
+    print('Test accuracy on base task data: %f' % (test_accuracy))
+
+    # Loop over fraction_points_stored_list for K-priors and Replay
+    for num_points_counter in range(len(fraction_points_stored_list)):
+
+        # Number of points to store for K-priors and Replay
+        num_points_to_store = (int)(fraction_points_stored_list[num_points_counter]*data_generator.number_base_points)
+        additional_memory_data = None
+
+        # If remove_data task, then store the removed points too, for both K-priors and Replay
+        if args.adaptation_task == "remove_data":
+            if args.dataset == "adult":
+                # Points to remove are picked by h'(f), so can simply add this number to num_points_to_store
+                num_points_to_store += num_points_to_remove
+            elif args.dataset == "usps_binary":
+                # All of digit '8' is removed, so need to pick points that are not '8', and then add examples of '8' later
+                base_train_data, _ = data_generator.data_split(digit_set=[0,1,2,3,4,5,6,7,9])
+                additional_memory_data, _ = data_generator.data_split(digit_set=[8])
+
+        # Select points
+        memory_points = utils.select_memory_points(base_train_data, base_model, num_points_to_store,
+                                                   additional_memory_data=additional_memory_data, use_cuda=use_cuda)
+
+        # Load data for adaptation task
+        adapt_train_data, adapt_test_data = data_generator.adaptation_task_data()
+
+        # Train on adaptation task while regularising using K-priors or Replay
+        for adaptation_method in adaptation_methods:
+
+            # New model and optimiser
+            if args.network_type == "Linear":
+                model = copy.deepcopy(base_model)
+                optimiser = LBFGSReg(model, lr=learning_rate, weight_decay=prior_prec)
+                optimiser.previous_weights = base_model.return_parameters()
+            elif args.network_type == "MLP":
+                model = copy.deepcopy(base_model)
+                model = model.cuda() if use_cuda else model
+                optimiser = AdamReg(model, lr=learning_rate, weight_decay=prior_prec)
+                optimiser.previous_weights = base_model.return_parameters()
+
+            # Soft labels in K-priors, hard (true) labels in Replay
+            if adaptation_method == "K-priors":
+                memory_points['labels'] = memory_points['soft_labels']
+            elif adaptation_method == "Replay":
+                memory_points['labels'] = torch.nn.functional.one_hot(memory_points['true_labels'])
+
+            # If change_model task, then need new model
+            if args.adaptation_task == "change_model":
+                if args.network_type == "Linear":
+                    model = LinearModel(D_in=data_generator.dimensions, D_out=2)
+                    optimiser = LBFGSReg(model, lr=learning_rate, weight_decay=prior_prec)
+
+                    # Correct the memorable inputs to be of correct dimension as polynomial_degree has changed
+                    if args.dataset == "adult":
+                        adapt_train_inputs = torch.from_numpy(data_generator.X_train)
+                        memory_points['inputs'] = adapt_train_inputs[memory_points['indices']]
+                    elif args.dataset == "usps_binary":
+                        adapt_train_data_interm,_ = data_generator.data_split(digit_set=[0,1,2,3,4,5,6,7,8,9])
+                        memory_points['inputs'] = adapt_train_data_interm[0][memory_points['indices']]
+
+                    optimiser.prior_prec_old = prior_prec
+
+                    # Set correct previous_weights as polynomial_degree has changed
+                    if args.dataset == "usps_binary":
+                        num_parameters_poly1 = 257  # Poly degree 1 for USPS
+                        num_parameters_poly2 = 33153  # Poly degree 2 for USPS
+                    elif args.dataset == "adult":
+                        num_parameters_poly1 = 124  # Poly degree 1 for Adult
+                        num_parameters_poly2 = 7750  # Poly degree 2 for Adult
+                    optimiser.previous_weights = torch.zeros(2 * num_parameters_poly1)
+                    optimiser.previous_weights[:num_parameters_poly1] = base_model.upper.weight.data[0, :num_parameters_poly1]
+                    optimiser.previous_weights[num_parameters_poly1:num_parameters_poly1 + num_parameters_poly1] = \
+                        base_model.upper.weight.data[1, :num_parameters_poly1]
+
+                    if use_cuda:
+                        optimiser.previous_weights = optimiser.previous_weights.cuda()
+
+                elif args.network_type == "MLP":
+                    new_hidden_sizes = [100]
+                    model = MLP(D_in=data_generator.dimensions, hidden_sizes=new_hidden_sizes, D_out=2)
+                    model = model.cuda() if use_cuda else model
+                    optimiser = AdamReg(model, lr=learning_rate, weight_decay=prior_prec)
+                    optimiser.prior_prec_old = None
+
+                else:
+                    raise ValueError("Incorrect network type: %s" % args.network_type)
+
+            # If change_regulariser task, then new prior_prec
+            elif args.adaptation_task == "change_regulariser":
+                optimiser.prior_prec_old = prior_prec_old
+                prior_prec = prior_prec_new
+
+            if args.adaptation_task == "remove_data":
+                optimiser.prior_prec_old = prior_prec
+                remove_data_bool = True
+
+                # If Adult dataset, need to find points to remove (the points with highest h'(f))
+                if args.dataset == "adult":
+                    remove_points = utils.select_memory_points(base_train_data, base_model, num_points_to_remove, use_cuda=use_cuda)
+                    adapt_train_data = (remove_points['inputs'], remove_points['true_labels'])
+
+            if args.adaptation_task == "add_data":
+                optimiser.prior_prec_old = prior_prec
+
+            # Store past memory labels
+            optimiser.memory_labels = memory_points['labels']
+
+            # Train model
+            print('Training on adaptation task using '+adaptation_method+' and fraction of past data of '+
+                  str(fraction_points_stored_list[num_points_counter]))
+            train.train_model(model, optimiser, adapt_train_data, num_epochs=num_epochs, memory_data=memory_points,
+                              adaptation_method=adaptation_method, remove_data_bool=remove_data_bool, use_cuda=use_cuda)
+
+            # Test model
+            test_accuracy = train.test_model(model, adapt_test_data, use_cuda=use_cuda)
+            test_accuracies_to_plot[adaptation_method].append(test_accuracy)
+            print('Test accuracy on adaptation task data: %f' % (test_accuracy))
+
+
+# Plot test accuracy figures
+if len(adaptation_methods) > 1 or len(fraction_points_stored_list) > 1:
+    plot_title = args.dataset+"_"+args.adaptation_task
+    utils.plot_increasing_past_size(test_accuracies_to_plot, fraction_points_stored_list,
+                                    plot_title=plot_title, path=args.path)
+
+File Path: models.py
+Content:
+import torch
+import torch.nn as nn
+import numpy as np
+
+
+# A linear model, such as for logistic regression
+class LinearModel(torch.nn.Module):
+    def __init__(self, D_in, D_out):
+        super(LinearModel, self).__init__()
+
+        # Upper layer
+        self.upper = nn.Linear(D_in, D_out, bias=False)
+
+        torch.nn.init.zeros_(self.upper.weight)
+
+    # If output_range is not None, then only output some classes' values (cf a multi-head setup)
+    def forward(self, x):
+        h_act = x
+        y_pred = self.upper(h_act)
+
+        return y_pred
+
+    # Return all parameters as a vector
+    def return_parameters(self):
+        num_params = sum([np.prod(p.size()) for p in self.parameters()])
+        means = torch.zeros(num_params)
+
+        start_ind = 0
+        for p in self.parameters():
+            num = np.prod(p.size())
+            means[start_ind:start_ind+num] = p.data.reshape(-1)
+            start_ind += num
+
+        return means
+
+
+# A deterministic MLP with hidden layer size: hidden_sizes[0], ..., hidden_sizes[-1]
+class MLP(torch.nn.Module):
+    def __init__(self, D_in, hidden_sizes, D_out, act_func="relu"):
+        super(MLP, self).__init__()
+
+        # Hidden layers
+        self.linear = torch.nn.ModuleList()
+        weight_matrix = [D_in] + hidden_sizes
+        for i in range(len(hidden_sizes)):
+            self.linear.append(nn.Linear(weight_matrix[i], weight_matrix[i+1]))
+
+        # Upper layer
+        self.upper = nn.Linear(hidden_sizes[-1], D_out)
+
+        # Set activation function
+        if act_func == "relu":
+            self.act_function = torch.nn.ReLU()
+        elif act_func == "sigmoid":
+            self.act_function = torch.nn.Sigmoid()
+        elif act_func == "tanh":
+            self.act_function = torch.nn.Tanh()
+        else:
+            raise ValueError("Cannot yet implement activation %s" % act_func)
+
+
+    # If output_range is not None, then only output some classes' values (cf a multi-head setup)
+    def forward(self, x, output_range=None):
+        x = x.squeeze()
+        h_act = x
+        for i in range(len(self.linear)):
+            h_act = self.linear[i](h_act)
+            h_act = self.act_function(h_act)
+
+        y_pred = self.upper(h_act)
+
+        return y_pred
+
+    # Return all parameters as a vector
+    def return_parameters(self):
+        num_params = sum([np.prod(p.size()) for p in self.parameters()])
+        means = torch.zeros(num_params)
+
+        start_ind = 0
+        for p in self.parameters():
+            num = np.prod(p.size())
+            means[start_ind:start_ind+num] = p.data.reshape(-1)
+            start_ind += num
+
+        return means
+
+File Path: train.py
+Content:
+import torch
+import torch.nn as nn
+
+
+# Train model using optimiser on data for num_epochs
+def train_model(model, optimiser, training_data, num_epochs, memory_data=None,
+                adaptation_method=None, remove_data_bool=False, use_cuda=False):
+
+    # Criterion for loss
+    criterion = nn.CrossEntropyLoss()
+
+    if use_cuda:
+        model = model.cuda()
+
+    # Train for num_epochs
+    model.train()
+    for epoch in range(num_epochs):
+
+        # Closure over training data
+        if training_data is not None:
+            inputs, labels = training_data
+            optimiser.train_set_size = len(inputs)
+
+            if use_cuda:
+                inputs, labels = inputs.cuda(), labels.cuda()
+
+            def closure_main():
+                optimiser.zero_grad()
+                logits = model.forward(inputs)
+                loss = criterion(torch.squeeze(logits, dim=-1), labels)
+
+                # For removing data (instead of adding data)
+                if remove_data_bool:
+                    loss = -loss
+                    # optimiser.total_datapoints_this_iter -= 2*optimiser.train_set_size
+
+                return loss
+        else:
+            closure_main = None
+
+        # Closure over datapoints in memory (for K-priors and Replay only)
+        if memory_data is not None:
+            def closure_memory():
+                memory_inputs = memory_data['inputs']
+                if use_cuda:
+                    memory_inputs = memory_inputs.cuda()
+                    optimiser.memory_labels = optimiser.memory_labels.cuda()
+                    if optimiser.previous_weights is not None:
+                        optimiser.previous_weights = optimiser.previous_weights.cuda()
+
+                optimiser.zero_grad()
+                logits = model.forward(memory_inputs)
+
+                return logits
+        else:
+            closure_memory = None
+
+        # Take an optimiser step
+        train_nll = optimiser.step(closure_data=closure_main, closure_memory=closure_memory,
+                                   adaptation_method=adaptation_method)
+
+        # Print during training if desired
+        print_during_training = False
+        if print_during_training and epoch % 100 == 0:
+            print('Epoch[%d]: Train nll: %f' % (epoch + 1, train_nll))
+
+
+# Test model on testing_data, return test accuracy
+def test_model(model, testing_data, use_cuda=False):
+
+    correct = 0
+    with torch.no_grad():
+        model.eval()
+
+        # Test data inputs and labels
+        inputs, labels = testing_data
+        if use_cuda:
+            inputs, labels = inputs.cuda(), labels.cuda()
+
+        # Find predictions from model
+        logits = model.forward(inputs)
+
+        # Calculate predicted classes
+        pred = logits.data.max(1, keepdim=True)[1]
+
+        # Count number of correctly predicted datapoints and calculate test accuracy
+        correct += pred.eq(labels.data.view_as(pred)).sum()
+        test_accuracy = 100.0 * float(correct) / len(inputs)
+
+    return test_accuracy
+
+File Path: utils.py
+Content:
+import torch
+import torch.nn.functional as F
+import numpy as np
+import matplotlib.pyplot as plt
+
+
+def softmax_hessian(f):
+    s = F.softmax(f, dim=-1)
+    return s - s*s
+
+
+# Select memory points ordered by their h'(f) (==lambda) values (descending=True picks most important points)
+def select_memory_points(dataloader, model, num_points, additional_memory_data=None, use_cuda=False, descending=True):
+
+    memory_points_list = {}
+    points_indices = {}
+
+    # Data
+    data, target = dataloader
+
+    # Choose number of points per class correctly weighted
+    num_points_per_class = [int(num_points/2),int(num_points/2)]
+    if torch.sum(target==0) < num_points_per_class[0]:
+        num_points_per_class[0] = torch.sum(target==0).numpy()
+        num_points_per_class[1] = num_points - num_points_per_class[0]
+    elif torch.sum(target==1) < num_points_per_class[1]:
+        num_points_per_class[1] = torch.sum(target==1).numpy()
+        num_points_per_class[0] = num_points - num_points_per_class[1]
+
+    # Forward pass through all data
+    if use_cuda:
+        data_in = data.cuda()
+    else:
+        data_in = data
+
+    preds = model.forward(data_in)
+
+    # h'(f) (== lambda) on output
+    lamb = softmax_hessian(preds)
+    if use_cuda:
+        lamb = lamb.cpu()
+    lamb = torch.sum(lamb, dim=-1)
+    lamb = lamb.detach()
+
+    for cid in range(2):
+        p_c = data[target == cid]
+        indices_for_points = np.argwhere(target == cid)[0].numpy()
+        if len(p_c) > 0:
+            scores = lamb[target == cid]
+            _, indices = scores.sort(descending=descending)
+            memory_points_list[cid] = p_c[indices[:num_points_per_class[cid]]]
+            points_indices[cid] = indices_for_points[indices[:num_points_per_class[cid]]]
+
+    r_points = []
+    r_labels = []
+    r_indices = []
+    for cid in range(2):
+        r_points.append(memory_points_list[cid])
+        r_labels.append(cid*torch.ones(memory_points_list[cid].shape[0], dtype=torch.long,
+                                   device=memory_points_list[cid].device))
+        r_indices.append(points_indices[cid])
+
+    memory_points = {}
+    memory_points['inputs'] = torch.cat(r_points, dim=0)
+    memory_points['true_labels'] = torch.cat(r_labels, dim=0)
+    if np.sum(num_points_per_class) > 2:
+        memory_points['indices'] = np.concatenate(np.array(r_indices), axis=0)
+    else:
+        memory_points['indices'] = r_indices
+
+    # If there is additional_memory_data, add that to memory_points['inputs']
+    if additional_memory_data is not None:
+        memory_points['inputs'] = torch.cat((memory_points['inputs'], additional_memory_data[0]))
+        memory_points['true_labels'] = torch.cat((memory_points['true_labels'], additional_memory_data[1]))
+
+    # Soft labels in K-priors
+    if use_cuda:
+        memory_points['inputs'] = memory_points['inputs'].cuda()
+    memory_points['soft_labels'] = torch.softmax(model.forward(memory_points['inputs']), dim=-1)
+
+    return memory_points
+
+
+# Plot results with increasing memory size
+def plot_increasing_past_size(test_accuracies, num_points_list, plot_title=None, path=None):
+
+    # Plot
+    plt.rcParams.update({'font.size': 22})
+    plt.figure(figsize=(6, 6))
+    axs = plt.subplot(1, 1, 1)
+
+    for adaptation_method in test_accuracies:
+
+        linestyle = 'solid'
+        linewidth = 7
+        marker = None
+        if adaptation_method == "Replay":
+            colour = 'b'
+            marker = 'o'
+            zorder = 2
+        elif adaptation_method == "K-priors":
+            colour = 'r'
+            marker = 's'
+            zorder = 3
+
+        # Different random seeds
+        accuracies_array = np.array(test_accuracies[adaptation_method]).reshape(-1, (len(num_points_list)))
+        accuracies_mean = np.mean(accuracies_array, axis=0)
+        accuracies_std = np.std(accuracies_array, axis=0)
+
+        plt.plot(num_points_list, accuracies_mean, color=colour, linewidth=linewidth,
+                 linestyle=linestyle, marker=marker, mfc='w', ms=17, mew=3, zorder=zorder, label=adaptation_method)
+
+        if len(accuracies_array) > 1:
+            plt.fill_between(num_points_list, accuracies_mean - accuracies_std, accuracies_mean + accuracies_std,
+                             alpha=0.2, color=colour, zorder=zorder)
+
+
+
+    # Batch result is exactly Replay with 100% of past data
+    if num_points_list[0] == 1. and 'Replay' in test_accuracies:
+        accuracies_array = np.array(test_accuracies['Replay']).reshape(-1, (len(num_points_list)))
+        batch_test_accuracy = np.mean(accuracies_array, axis=0)[0]
+        plt.plot(num_points_list, [batch_test_accuracy]*len(num_points_list), color='gray', linewidth=15,
+                 linestyle='solid', zorder=1, label='Batch')
+
+    plt.legend()
+    plt.minorticks_off()
+    plt.grid()
+    axs.spines['right'].set_visible(False)
+    axs.spines['top'].set_visible(False)
+    plt.xscale("log")
+    plt.xticks(num_points_list, labels=[(int)(100*i) for i in num_points_list])
+
+    plt.xlabel("Memory size (% of past data)")
+    plt.ylabel("Validation acc (%)")
+    if plot_title is not None:
+        plt.title(plot_title)
+
+    # Save figure if desired
+    if path is not None:
+        save_path = path + plot_title + '.pdf'
+        plt.savefig(save_path, bbox_inches='tight', pad_inches=0)
+    else:
+        plt.show()
+
+Output:
+{
+    "experimental_code": "def select_memory_points(dataloader, model, num_points, additional_memory_data=None, use_cuda=False, descending=True):\n    memory_points_list = {}\n    points_indices = {}\n    data, target = dataloader\n    num_points_per_class = [int(num_points/2),int(num_points/2)]\n    if torch.sum(target==0) < num_points_per_class[0]:\n        num_points_per_class[0] = torch.sum(target==0).numpy()\n        num_points_per_class[1] = num_points - num_points_per_class[0]\n    elif torch.sum(target==1) < num_points_per_class[1]:\n        num_points_per_class[1] = torch.sum(target==1).numpy()\n        num_points_per_class[0] = num_points - num_points_per_class[1]\n    if use_cuda:\n        data_in = data.cuda()\n    else:\n        data_in = data\n    preds = model.forward(data_in)\n    lamb = softmax_hessian(preds)\n    if use_cuda:\n        lamb = lamb.cpu()\n    lamb = torch.sum(lamb, dim=-1)\n    lamb = lamb.detach()\n    for cid in range(2):\n        p_c = data[target == cid]\n        indices_for_points = np.argwhere(target == cid)[0].numpy()\n        if len(p_c) > 0:\n            scores = lamb[target == cid]\n            _, indices = scores.sort(descending=descending)\n            memory_points_list[cid] = p_c[indices[:num_points_per_class[cid]]]\n            points_indices[cid] = indices_for_points[indices[:num_points_per_class[cid]]]\n    r_points = []\n    r_labels = []\n    r_indices = []\n    for cid in range(2):\n        r_points.append(memory_points_list[cid])\n        r_labels.append(cid*torch.ones(memory_points_list[cid].shape[0], dtype=torch.long,\n                                   device=memory_points_list[cid].device))\n        r_indices.append(points_indices[cid])\n    memory_points = {}\n    memory_points['inputs'] = torch.cat(r_points, dim=0)\n    memory_points['true_labels'] = torch.cat(r_labels, dim=0)\n    if np.sum(num_points_per_class) > 2:\n        memory_points['indices'] = np.concatenate(np.array(r_indices), axis=0)\n    else:\n        memory_points['indices'] = r_indices\n    if additional_memory_data is not None:\n        memory_points['inputs'] = torch.cat((memory_points['inputs'], additional_memory_data[0]))\n        memory_points['true_labels'] = torch.cat((memory_points['true_labels'], additional_memory_data[1]))\n    if use_cuda:\n        memory_points['inputs'] = memory_points['inputs'].cuda()\n    memory_points['soft_labels'] = torch.softmax(model.forward(memory_points['inputs']), dim=-1)\n    return memory_points\n\n# Code for AdamReg and LBFGSReg optimizers (logic in step method)\n# Differentiates K-priors/Replay and applies weight-space regularization\n# This logic is present in both AdamReg.step and LBFGSReg.step\n\n# ... (inside AdamReg.step or LBFGSReg.step)\n# Loss term over memory points (only if K-priors or Replay)\nif closure_memory is not None:\n    preds = closure_memory()\n    self.total_datapoints_this_iter += len(preds)\n    preds_soft = torch.softmax(preds, dim=-1)\n    delta_logits = preds_soft.detach() - self.memory_labels\n    grad_message = torch.autograd.grad(preds, self.model.parameters(), grad_outputs=delta_logits)\n    grad_vec = []\n    for i in range(len(grad_message)):\n        grad_vec.append(grad_message[i].data.view(-1))\n    grad_vec = torch.cat(grad_vec, dim=-1)\n    grad.add_(grad_vec.detach())\n    # Weight regularisation\n    if adaptation_method == \"K-priors\" and self.prior_prec_old is not None:\n        grad.add_(self.previous_weights, alpha=-self.prior_prec_old)\n\n# Code from main.py for setting up memory labels and previous weights\noptimiser.previous_weights = base_model.return_parameters()\nif adaptation_method == \"K-priors\":\n    memory_points['labels'] = memory_points['soft_labels']\nelif adaptation_method == \"Replay\":\n    memory_points['labels'] = torch.nn.functional.one_hot(memory_points['true_labels'])\noptimiser.memory_labels = memory_points['labels']",
+    "experimental_info": "The experiments evaluate K-priors and Replay methods on adaptation tasks for both Generalized Linear Models (GLMs) and Deep Learning models.\n\n**Datasets:**\n*   **Adult:** UCI Adult dataset for binary classification.\n*   **USPS Binary:** USPS dataset, classifying odd vs. even digits.\n\n**Network Architectures:**\n*   **Linear Model (GLM):** Logistic Regression, used for the Adult dataset and some USPS experiments. Uses `LBFGSReg` optimizer.\n*   **MLP (Multi-Layer Perceptron):** Deep learning model with one or two hidden layers of 100 units, used for USPS experiments. Uses `AdamReg` optimizer.\n\n**Adaptation Tasks:**\n*   **Add Data:** New data (or classes, e.g., digit '9' for USPS) is added to the training set.\n*   **Remove Data:** A subset of data (e.g., digit '8' for USPS, or top `h'(f)` points for Adult) is removed.\n*   **Change Regulariser:** The L2 regularization strength (weight_decay/prior_prec) is changed.\n    *   Adult/USPS Linear: From 50 to 5.\n    *   USPS MLP: From 5 to 10.\n*   **Change Model:** The model architecture is changed.\n    *   Linear Model: Polynomial degree of features changes from 2 to 1.\n    *   MLP: Number of hidden layers changes (e.g., from two 100-unit layers to one 100-unit layer).\n\n**Memory Selection Strategy:**\n*   For limited memory, 'memorable past' examples are selected based on the highest derivative `h'(f)` (calculated as `softmax_hessian` sum over the output dimension) from the *base model* (model trained on the initial task).\n\n**Memory Sizes:**\n*   The fraction of base task data stored in memory is varied in experiments: [1.0, 0.5, 0.2, 0.1, 0.07, 0.05, 0.02].\n\n**Regularization Parameters:**\n*   **`prior_prec` (L2 weight_decay):**\n    *   Adult: 5\n    *   USPS Linear: 50\n    *   USPS MLP: 5\n*   **`prior_prec_old` (for K-priors weight-space term `Dw(w||w*)`):** Set to the `prior_prec` of the base task, or specifically adjusted for 'change_regulariser' tasks.\n\n**K-prior vs. Replay Distinction:**\n*   **K-priors:** Use soft labels (output of `softmax(model.forward(memory_inputs))` from the base model) as targets for the function-space regularizer (`Df`). They also include a weight-space L2 regularizer towards the previous weights `w*` (`Dw`).\n*   **Replay:** Uses hard (true, one-hot encoded) labels for the function-space regularizer. It does not include the explicit weight-space regularizer towards `w*` (`Dw`).\n\n**Optimization:**\n*   **Optimizers:** LBFGS (`LBFGSReg`) for Linear models, Adam (`AdamReg`) for MLPs.\n*   **Learning Rate:** 0.005 for Adult/USPS MLP, 0.1 for USPS Linear.\n*   **Epochs:** 1000 for Adult/USPS MLP, 300 for USPS Linear.\n\n**Evaluation:**\n*   Each experiment is repeated for 3 runs with different random seeds (`seed_init + random_run`).\n*   Test accuracy is reported on the adaptation task's test set."
+}
