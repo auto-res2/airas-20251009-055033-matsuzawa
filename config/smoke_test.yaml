@@ -1,0 +1,33 @@
+# Lightweight configuration used by CI smoke tests.  
+# Uses synthetic data so that full pipeline can run under <30 sec.
+
+experiments:
+  - run_id: smoke_source
+    seed: 123
+    dataset:
+      name: SYNTHETIC_CLASSIFICATION_PLACEHOLDER  # PLACEHOLDER: Will be replaced
+      num_samples: 512
+      num_classes: 10
+      input_shape: [3, 32, 32]
+    model:
+      name: SIMPLE_CNN_PLACEHOLDER               # PLACEHOLDER: Will be replaced
+    training:
+      epochs: 1
+      batch_size: 64
+      learning_rate: 0.001
+      method: source
+
+  - run_id: smoke_zorro
+    seed: 123
+    dataset:
+      name: SYNTHETIC_CLASSIFICATION_PLACEHOLDER  # PLACEHOLDER
+      num_samples: 512
+      num_classes: 10
+      input_shape: [3, 32, 32]
+    model:
+      name: SIMPLE_CNN_PLACEHOLDER               # PLACEHOLDER
+    training:
+      epochs: 1
+      batch_size: 64
+      learning_rate: 0.001
+      method: zorro
