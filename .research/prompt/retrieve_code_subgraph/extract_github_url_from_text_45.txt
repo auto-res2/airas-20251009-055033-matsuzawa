@@ -1,0 +1,17 @@
+
+Input:
+# Task
+You carefully read the contents of the “Paper Outline” and select one GitHub link from the “GitHub URLs List” that you think is most relevant to the contents.
+# Constraints
+- Output the index number corresponding to the selected GitHub URL.
+- Be sure to select only one GitHub URL.
+- If there is no related GitHub link, output None.
+# Paper Outline
+TTOpt discretizes continuous optimization problems by introducing a grid for each parameter, effectively representing the objective function as an implicit d-dimensional tensor. This tensor is then approximated using the Tensor Train (TT) format to overcome the curse of dimensionality. The optimization process is reformulated as finding the maximal elements of this tensor, guided by a generalized maximum volume principle. This involves iteratively searching for maximal volume submatrices in column and row spaces during 'sweeps' (forward and backward) across tensor modes. For stability, QR decomposition is applied before the maxvol algorithm, and `rect_maxvol` is used for adaptive rank selection. A continuous, smooth, and strictly monotone mapping function, `g(x) = pi/2 - atan(J(x) - Jmin)`, transforms objective values to enable finding global minimum/maximum by searching for maximum modulus. Crucially, the method employs quantization of tensor modes (reshaping the original tensor into a 'long' one with smaller mode sizes like P=2) to significantly boost accuracy and reduce complexity for fine grids.
+
+# GitHub URLs List
+['https://github.com/AndreiChertkov/ttopt', 'https://github.com/CMA-ES/pycma', 'https://github.com/rfeinman/pytorch-minimize', 'https://github.com/Eiii/opt_cmp']
+Output:
+{
+    "index": 0
+}
