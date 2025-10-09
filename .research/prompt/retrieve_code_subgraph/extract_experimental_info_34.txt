@@ -1,0 +1,1245 @@
+
+Input:
+You are a researcher with expertise in engineering in the field of machine learning.
+
+# Instructions
+- The content described in “Repository Content” corresponds to the GitHub repository of the method described in “Method.”
+- Please extract the following two pieces of information from “Repository Content”:
+    - experimental_code：Extract the implementation sections that are directly related to the method described in “Method.”
+    - experimental_info：Extract and output the experimental settings related to the method described in “Method.”
+
+# Method
+The proposed Robust Test-Time Adaptation (RoTTA) method comprises three key components: 1) Robust Batch Normalization (RBN): It replaces traditional batch normalization statistics with global running mean and variance, initialized from the pre-trained model and updated via exponential moving average (EMA) using statistics from a memory bank, to handle correlatively sampled test data streams. 2) Category-Balanced Sampling with Timeliness and Uncertainty (CSTU) for the Memory Bank: A memory bank is maintained using pseudo-labels from model predictions. Its capacity is equally distributed among categories. Samples are prioritized based on a heuristic score that combines their age (timeliness, increasing over time) and uncertainty (entropy of prediction), ensuring that newer and more confident samples are kept while maintaining category balance. 3) Time-Aware Robust Training with a Teacher-Student Model: A teacher-student architecture is used, where the student model is updated by minimizing a robust loss on memory bank samples, and the teacher model is updated via EMA of the student's parameters. A timeliness reweighting strategy is applied to the loss, giving less weight to older samples to stabilize adaptation and reduce error accumulation. For efficiency and stability, only affine parameters in RBN are trained during adaptation.
+
+# Repository Content
+File Path: core/__init__.py
+Content:
+
+File Path: core/adapter/__init__.py
+Content:
+from .build import build_adapter
+
+File Path: core/adapter/base_adapter.py
+Content:
+from copy import deepcopy
+import torch
+import torch.nn as nn
+import logging
+
+
+class BaseAdapter(nn.Module):
+    def __init__(self, cfg, model, optimizer):
+        super().__init__()
+        self.logger = logging.getLogger("TTA.adapter")
+        self.cfg = cfg
+        self.model = self.configure_model(model)
+
+        params, param_names = self.collect_params(self.model)
+        if len(param_names) == 0:
+            self.optimizer = None
+        else:
+            self.optimizer = optimizer(params)
+
+        self.steps = self.cfg.OPTIM.STEPS
+        assert self.steps > 0, "requires >= 1 step(s) to forward and update"
+
+    def forward(self, x):
+        for _ in range(self.steps):
+            outputs = self.forward_and_adapt(x, self.model, self.optimizer)
+
+        return outputs
+
+    def forward_and_adapt(self, *args):
+        raise NotImplementedError("implement forward_and_adapt by yourself!")
+
+    def configure_model(self, model):
+        raise NotImplementedError("implement configure_model by yourself!")
+
+    def collect_params(self, model: nn.Module):
+        names = []
+        params = []
+
+        for n, p in model.named_parameters():
+            if p.requires_grad:
+                names.append(n)
+                params.append(p)
+
+        return params, names
+
+    def check_model(self, model):
+        pass
+
+    def before_tta(self, *args, **kwargs):
+        pass
+
+    @staticmethod
+    def build_ema(model):
+        ema_model = deepcopy(model)
+        for param in ema_model.parameters():
+            param.detach_()
+        return ema_model
+
+
+
+@torch.jit.script
+def softmax_entropy(x, x_ema):
+    return -(x_ema.softmax(1) * x.log_softmax(1)).sum(1)
+
+File Path: core/adapter/build.py
+Content:
+from .base_adapter import BaseAdapter
+from .rotta import RoTTA
+
+
+def build_adapter(cfg) -> type(BaseAdapter):
+    if cfg.ADAPTER.NAME == "rotta":
+        return RoTTA
+    else:
+        raise NotImplementedError("Implement your own adapter")
+
+
+File Path: core/adapter/rotta.py
+Content:
+import torch
+import torch.nn as nn
+from ..utils import memory
+from .base_adapter import BaseAdapter
+from copy import deepcopy
+from .base_adapter import softmax_entropy
+from ..utils.bn_layers import RobustBN1d, RobustBN2d
+from ..utils.utils import set_named_submodule, get_named_submodule
+from ..utils.custom_transforms import get_tta_transforms
+
+
+class RoTTA(BaseAdapter):
+    def __init__(self, cfg, model, optimizer):
+        super(RoTTA, self).__init__(cfg, model, optimizer)
+        self.mem = memory.CSTU(capacity=self.cfg.ADAPTER.RoTTA.MEMORY_SIZE, num_class=cfg.CORRUPTION.NUM_CLASS, lambda_t=cfg.ADAPTER.RoTTA.LAMBDA_T, lambda_u=cfg.ADAPTER.RoTTA.LAMBDA_U)
+        self.model_ema = self.build_ema(self.model)
+        self.transform = get_tta_transforms(cfg)
+        self.nu = cfg.ADAPTER.RoTTA.NU
+        self.update_frequency = cfg.ADAPTER.RoTTA.UPDATE_FREQUENCY  # actually the same as the size of memory bank
+        self.current_instance = 0
+
+    @torch.enable_grad()
+    def forward_and_adapt(self, batch_data, model, optimizer):
+        # batch data
+        with torch.no_grad():
+            model.eval()
+            self.model_ema.eval()
+            ema_out = self.model_ema(batch_data)
+            predict = torch.softmax(ema_out, dim=1)
+            pseudo_label = torch.argmax(predict, dim=1)
+            entropy = torch.sum(- predict * torch.log(predict + 1e-6), dim=1)
+
+        # add into memory
+        for i, data in enumerate(batch_data):
+            p_l = pseudo_label[i].item()
+            uncertainty = entropy[i].item()
+            current_instance = (data, p_l, uncertainty)
+            self.mem.add_instance(current_instance)
+            self.current_instance += 1
+
+            if self.current_instance % self.update_frequency == 0:
+                self.update_model(model, optimizer)
+
+        return ema_out
+
+    def update_model(self, model, optimizer):
+        model.train()
+        self.model_ema.train()
+        # get memory data
+        sup_data, ages = self.mem.get_memory()
+        l_sup = None
+        if len(sup_data) > 0:
+            sup_data = torch.stack(sup_data)
+            strong_sup_aug = self.transform(sup_data)
+            ema_sup_out = self.model_ema(sup_data)
+            stu_sup_out = model(strong_sup_aug)
+            instance_weight = timeliness_reweighting(ages)
+            l_sup = (softmax_entropy(stu_sup_out, ema_sup_out) * instance_weight).mean()
+
+        l = l_sup
+        if l is not None:
+            optimizer.zero_grad()
+            l.backward()
+            optimizer.step()
+
+        self.update_ema_variables(self.model_ema, self.model, self.nu)
+
+    @staticmethod
+    def update_ema_variables(ema_model, model, nu):
+        for ema_param, param in zip(ema_model.parameters(), model.parameters()):
+            ema_param.data[:] = (1 - nu) * ema_param[:].data[:] + nu * param[:].data[:]
+        return ema_model
+
+    def configure_model(self, model: nn.Module):
+
+        model.requires_grad_(False)
+        normlayer_names = []
+
+        for name, sub_module in model.named_modules():
+            if isinstance(sub_module, nn.BatchNorm1d) or isinstance(sub_module, nn.BatchNorm2d):
+                normlayer_names.append(name)
+
+        for name in normlayer_names:
+            bn_layer = get_named_submodule(model, name)
+            if isinstance(bn_layer, nn.BatchNorm1d):
+                NewBN = RobustBN1d
+            elif isinstance(bn_layer, nn.BatchNorm2d):
+                NewBN = RobustBN2d
+            else:
+                raise RuntimeError()
+
+            momentum_bn = NewBN(bn_layer,
+                                self.cfg.ADAPTER.RoTTA.ALPHA)
+            momentum_bn.requires_grad_(True)
+            set_named_submodule(model, name, momentum_bn)
+        return model
+
+
+def timeliness_reweighting(ages):
+    if isinstance(ages, list):
+        ages = torch.tensor(ages).float().cuda()
+    return torch.exp(-ages) / (1 + torch.exp(-ages))
+
+
+File Path: core/configs/__init__.py
+Content:
+from .defaults import _C as cfg
+from .defaults import _CFG_DEFAULT as d_cfg
+
+File Path: core/configs/defaults.py
+Content:
+from yacs.config import CfgNode as CN
+
+
+_C = CN()
+cfg = _C
+
+
+# ----------------------------- Model options ------------------------------- #
+_C.MODEL = CN()
+
+_C.MODEL.ARCH = 'Standard'
+
+_C.MODEL.EPISODIC = False
+
+_C.MODEL.PROJECTION = CN()
+
+_C.MODEL.PROJECTION.HEAD = "linear"
+_C.MODEL.PROJECTION.EMB_DIM = 2048
+_C.MODEL.PROJECTION.FEA_DIM = 128
+
+# ----------------------------- Corruption options -------------------------- #
+_C.CORRUPTION = CN()
+
+_C.CORRUPTION.DATASET = 'cifar10'
+_C.CORRUPTION.SOURCE = ''
+_C.CORRUPTION.TYPE = ['gaussian_noise', 'shot_noise', 'impulse_noise',
+                      'defocus_blur', 'glass_blur', 'motion_blur', 'zoom_blur',
+                      'snow', 'frost', 'fog', 'brightness', 'contrast',
+                      'elastic_transform', 'pixelate', 'jpeg_compression']
+_C.CORRUPTION.SEVERITY = [5, 4, 3, 2, 1]
+_C.CORRUPTION.NUM_EX = 10000
+_C.CORRUPTION.NUM_CLASS = -1
+
+# ----------------------------- Input options -------------------------- #
+_C.INPUT = CN()
+
+_C.INPUT.SIZE = (32, 32)
+_C.INPUT.INTERPOLATION = "bilinear"
+_C.INPUT.PIXEL_MEAN = [0.485, 0.456, 0.406]
+_C.INPUT.PIXEL_STD = [0.229, 0.224, 0.225]
+_C.INPUT.TRANSFORMS = ("normalize", )
+
+# ----------------------------- loader options -------------------------- #
+_C.LOADER = CN()
+
+_C.LOADER.SAMPLER = CN()
+_C.LOADER.SAMPLER.TYPE = "sequence"
+_C.LOADER.SAMPLER.GAMMA = 0.1
+
+_C.LOADER.NUM_WORKS = 2
+
+
+# ------------------------------- Batch norm options ------------------------ #
+_C.BN = CN()
+_C.BN.EPS = 1e-5
+_C.BN.MOM = 0.1
+
+# ------------------------------- Optimizer options ------------------------- #
+_C.OPTIM = CN()
+_C.OPTIM.STEPS = 1
+_C.OPTIM.LR = 1e-3
+
+_C.OPTIM.METHOD = 'Adam'
+_C.OPTIM.BETA = 0.9
+_C.OPTIM.MOMENTUM = 0.9
+_C.OPTIM.DAMPENING = 0.0
+_C.OPTIM.NESTEROV = True
+_C.OPTIM.WD = 0.0
+
+# ------------------------------- Testing options --------------------------- #
+_C.TEST = CN()
+_C.TEST.BATCH_SIZE = 64
+
+# --------------------------------- CUDNN options --------------------------- #
+_C.CUDNN = CN()
+_C.CUDNN.BENCHMARK = True
+
+# ---------------------------------- Misc options --------------------------- #
+
+_C.DESC = ""
+_C.SEED = -1
+_C.OUTPUT_DIR = "./output"
+_C.DATA_DIR = "./datasets"
+_C.CKPT_DIR = "./ckpt"
+_C.LOG_DEST = "log.txt"
+
+_C.LOG_TIME = ''
+_C.DEBUG = 0
+
+# tta method specific
+_C.ADAPTER = CN()
+
+_C.ADAPTER.NAME = "rotta"
+
+_C.ADAPTER.RoTTA = CN()
+_C.ADAPTER.RoTTA.MEMORY_SIZE = 64
+_C.ADAPTER.RoTTA.UPDATE_FREQUENCY = 64
+_C.ADAPTER.RoTTA.NU = 0.001
+_C.ADAPTER.RoTTA.ALPHA = 0.05
+_C.ADAPTER.RoTTA.LAMBDA_T = 1.0
+_C.ADAPTER.RoTTA.LAMBDA_U = 1.0
+
+# --------------------------------- Default config -------------------------- #
+_CFG_DEFAULT = _C.clone()
+_CFG_DEFAULT.freeze()
+
+
+File Path: core/data/__init__.py
+Content:
+from .build import build_loader
+
+File Path: core/data/build.py
+Content:
+from .datasets.common_corruption import CorruptionCIFAR
+from .ttasampler import build_sampler
+from torch.utils.data import DataLoader
+from ..utils.result_precess import AvgResultProcessor
+
+
+def build_loader(cfg, ds_name, all_corruptions, all_severity):
+    if ds_name == "cifar10" or ds_name == "cifar100":
+        dataset_class = CorruptionCIFAR
+    else:
+        raise NotImplementedError(f"Not Implement for dataset: {cfg.CORRUPTION.DATASET}")
+
+    ds = dataset_class(cfg, all_corruptions, all_severity)
+    sampler = build_sampler(cfg, ds.data_source)
+
+    loader = DataLoader(ds, cfg.TEST.BATCH_SIZE, sampler=sampler, num_workers=cfg.LOADER.NUM_WORKS)
+
+    result_processor = AvgResultProcessor(ds.domain_id_to_name)
+
+    return loader, result_processor
+
+File Path: core/data/datasets/__init__.py
+Content:
+
+File Path: core/data/datasets/base_dataset.py
+Content:
+from ...utils.utils import check_isfile
+import torch
+from torch.utils.data import Dataset as TorchDataset
+from typing import List
+import torchvision.transforms as T
+from PIL import Image
+
+
+INTERPOLATION_MODES = {
+    "bilinear": Image.BILINEAR,
+    "bicubic": Image.BICUBIC,
+    "nearest": Image.NEAREST,
+}
+
+
+class DatumBase:
+    def __init__(self, img=None,  label=0, domain=0, classname=""):
+        self._img = img
+        self._label = label
+        self._domain = domain
+        self._classname = classname
+
+    @property
+    def img(self):
+        return self._img
+
+    @property
+    def label(self):
+        return self._label
+
+    @property
+    def domain(self):
+        return self._domain
+
+    @property
+    def classname(self):
+        return self._classname
+
+
+class DatumList(DatumBase):
+    def __init__(self, img="", label=0, domain=0, classname=""):
+        assert isinstance(img, str)
+        assert check_isfile(img)
+        super().__init__(img, label, domain, classname)
+
+
+class DatumRaw(DatumBase):
+    def __init__(self, img=None, label=0, domain=0, classname=""):
+        assert isinstance(img, torch.Tensor), f"error type for DatumRaw: {type(img)}"
+        super().__init__(img, label, domain, classname)
+
+
+class TTADatasetBase(TorchDataset):
+    dataset_dir = ""
+    domains = []
+
+    def __init__(self, cfg, data_source: List[DatumBase]):
+        self.cfg = cfg
+        self.data_source = data_source
+        self.datum_type = type(data_source[0])
+
+        interp_mode = INTERPOLATION_MODES[cfg.INPUT.INTERPOLATION]
+        to_tensor = []
+        to_tensor += [T.Resize(cfg.INPUT.SIZE, interpolation=interp_mode)]
+        to_tensor += [T.ToTensor()]
+        if "normalize" in cfg.INPUT.TRANSFORMS:
+            normalize = T.Normalize(
+                mean=cfg.INPUT.PIXEL_MEAN, std=cfg.INPUT.PIXEL_STD
+            )
+            to_tensor += [normalize]
+        self.to_tensor = T.Compose(to_tensor)
+
+    def __len__(self):
+        return len(self.data_source)
+
+    def __getitem__(self, item):
+        if self.datum_type == DatumList:
+            return self.__get_from_path(item)
+        elif self.datum_type == DatumRaw:
+            return self.__get_from_raw(item)
+        else:
+            raise RuntimeError(f"error type of datum: {self.datum_type}")
+
+    def __get_from_path(self, index):
+        item = self.data_source[index]
+
+        ret_data = {
+            "label": item.label,
+            "domain": item.domain
+        }
+
+        img = Image.open(item.img).convert("RGB")
+
+        ret_data["image"] = self.to_tensor(img)
+
+        return ret_data
+
+    def __get_from_raw(self, index):
+        item = self.data_source[index]
+
+        ret_data = {
+            "label": item.label,
+            "domain": item.domain,
+            "image": item.img
+        }
+
+        return ret_data
+
+
+File Path: core/data/datasets/common_corruption.py
+Content:
+from .base_dataset import TTADatasetBase, DatumRaw
+from robustbench.data import load_cifar10c, load_cifar100c
+
+
+class CorruptionCIFAR(TTADatasetBase):
+    def __init__(self, cfg, all_corruption, all_severity):
+        all_corruption = [all_corruption] if not isinstance(all_corruption, list) else all_corruption
+        all_severity = [all_severity] if not isinstance(all_severity, list) else all_severity
+
+        self.corruptions = all_corruption
+        self.severity = all_severity
+        self.load_image = None
+        if cfg.CORRUPTION.DATASET == "cifar10":
+            self.load_image = load_cifar10c
+        elif cfg.CORRUPTION.DATASET == "cifar100":
+            self.load_image = load_cifar100c
+        self.domain_id_to_name = {}
+        data_source = []
+        for i_s, severity in enumerate(self.severity):
+            for i_c, corruption in enumerate(self.corruptions):
+                d_name = f"{corruption}_{severity}"
+                d_id = i_s * len(self.corruptions) + i_c
+                self.domain_id_to_name[d_id] = d_name
+                x, y = self.load_image(cfg.CORRUPTION.NUM_EX,
+                                       severity,
+                                       cfg.DATA_DIR,
+                                       False,
+                                       [corruption])
+                for i in range(len(y)):
+                    data_item = DatumRaw(x[i], y[i].item(), d_id)
+                    data_source.append(data_item)
+
+        super().__init__(cfg, data_source)
+
+File Path: core/data/ttasampler.py
+Content:
+import numpy as np
+from torch.utils.data.sampler import Sampler
+from .datasets.base_dataset import DatumBase
+from typing import List
+from collections import defaultdict
+from numpy.random import dirichlet
+
+
+class LabelDirichletDomainSequence(Sampler):
+    def __init__(self, data_source: List[DatumBase], gamma, batch_size, slots=None):
+
+        self.domain_dict = defaultdict(list)
+        self.classes = set()
+        for i, item in enumerate(data_source):
+            self.domain_dict[item.domain].append(i)
+            self.classes.add(item.label)
+        self.domains = list(self.domain_dict.keys())
+        self.domains.sort()
+
+        self.data_source = data_source
+        self.gamma = gamma
+        self.batch_size = batch_size
+        self.num_class = len(self.classes)
+        if slots is not None:
+            self.num_slots = slots
+        else:
+            self.num_slots = self.num_class if self.num_class <= 100 else 100
+
+    def __len__(self):
+        return len(self.data_source)
+
+    def __iter__(self):
+        final_indices = []
+        for domain in self.domains:
+            indices = np.array(self.domain_dict[domain])
+            labels = np.array([self.data_source[i].label for i in indices])
+
+            class_indices = [np.argwhere(labels == y).flatten() for y in range(self.num_class)]
+            slot_indices = [[] for _ in range(self.num_slots)]
+
+            label_distribution = dirichlet([self.gamma] * self.num_slots, self.num_class)
+
+            for c_ids, partition in zip(class_indices, label_distribution):
+                for s, ids in enumerate(np.split(c_ids, (np.cumsum(partition)[:-1] * len(c_ids)).astype(int))):
+                    slot_indices[s].append(ids)
+
+            for s_ids in slot_indices:
+                permutation = np.random.permutation(range(len(s_ids)))
+                ids = []
+                for i in permutation:
+                    ids.extend(s_ids[i])
+                final_indices.extend(indices[ids])
+
+        return iter(final_indices)
+
+
+def build_sampler(
+        cfg,
+        data_source: List[DatumBase],
+        **kwargs
+):
+    if cfg.LOADER.SAMPLER.TYPE == "temporal":
+        return LabelDirichletDomainSequence(data_source, cfg.LOADER.SAMPLER.GAMMA, cfg.TEST.BATCH_SIZE, **kwargs)
+    else:
+        raise NotImplementedError()
+
+File Path: core/model/__init__.py
+Content:
+from .build import build_model
+
+File Path: core/model/build.py
+Content:
+from robustbench.model_zoo.enums import ThreatModel
+from robustbench.utils import load_model
+
+
+def build_model(cfg):
+    if cfg.CORRUPTION.DATASET in ["cifar10", "cifar100"]:
+        base_model = load_model(cfg.MODEL.ARCH, cfg.CKPT_DIR,
+                                cfg.CORRUPTION.DATASET, ThreatModel.corruptions).cuda()
+    else:
+        raise NotImplementedError()
+
+    return base_model
+
+File Path: core/optim/__init__.py
+Content:
+from .build import build_optimizer
+
+
+File Path: core/optim/build.py
+Content:
+import torch.optim as optim
+
+
+def build_optimizer(cfg):
+    def optimizer(params):
+        if cfg.OPTIM.METHOD == 'Adam':
+            return optim.Adam(params,
+                              lr=cfg.OPTIM.LR,
+                              betas=(cfg.OPTIM.BETA, 0.999),
+                              weight_decay=cfg.OPTIM.WD)
+        elif cfg.OPTIM.METHOD == 'SGD':
+            return optim.SGD(params,
+                             lr=cfg.OPTIM.LR,
+                             momentum=cfg.OPTIM.MOMENTUM,
+                             dampening=cfg.OPTIM.DAMPENING,
+                             weight_decay=cfg.OPTIM.WD,
+                             nesterov=cfg.OPTIM.NESTEROV)
+        else:
+            raise NotImplementedError
+
+    return optimizer
+
+File Path: core/utils/__init__.py
+Content:
+from .logger import setup_logger
+from .utils import set_random_seed, mkdir
+File Path: core/utils/bn_layers.py
+Content:
+import torch
+import torch.nn as nn
+from copy import deepcopy
+
+
+class MomentumBN(nn.Module):
+    def __init__(self, bn_layer: nn.BatchNorm2d, momentum):
+        super().__init__()
+        self.num_features = bn_layer.num_features
+        self.momentum = momentum
+        if bn_layer.track_running_stats and bn_layer.running_var is not None and bn_layer.running_mean is not None:
+            self.register_buffer("source_mean", deepcopy(bn_layer.running_mean))
+            self.register_buffer("source_var", deepcopy(bn_layer.running_var))
+            self.source_num = bn_layer.num_batches_tracked
+        self.weight = deepcopy(bn_layer.weight)
+        self.bias = deepcopy(bn_layer.bias)
+
+        self.register_buffer("target_mean", torch.zeros_like(self.source_mean))
+        self.register_buffer("target_var", torch.ones_like(self.source_var))
+        self.eps = bn_layer.eps
+
+        self.current_mu = None
+        self.current_sigma = None
+
+    def forward(self, x):
+        raise NotImplementedError
+
+
+class RobustBN1d(MomentumBN):
+    def forward(self, x):
+        if self.training:
+            b_var, b_mean = torch.var_mean(x, dim=0, unbiased=False, keepdim=False)  # (C,)
+            mean = (1 - self.momentum) * self.source_mean + self.momentum * b_mean
+            var = (1 - self.momentum) * self.source_var + self.momentum * b_var
+            self.source_mean, self.source_var = deepcopy(mean.detach()), deepcopy(var.detach())
+            mean, var = mean.view(1, -1), var.view(1, -1)
+        else:
+            mean, var = self.source_mean.view(1, -1), self.source_var.view(1, -1)
+
+        x = (x - mean) / torch.sqrt(var + self.eps)
+        weight = self.weight.view(1, -1)
+        bias = self.bias.view(1, -1)
+
+        return x * weight + bias
+
+
+class RobustBN2d(MomentumBN):
+    def forward(self, x):
+        if self.training:
+            b_var, b_mean = torch.var_mean(x, dim=[0, 2, 3], unbiased=False, keepdim=False)  # (C,)
+            mean = (1 - self.momentum) * self.source_mean + self.momentum * b_mean
+            var = (1 - self.momentum) * self.source_var + self.momentum * b_var
+            self.source_mean, self.source_var = deepcopy(mean.detach()), deepcopy(var.detach())
+            mean, var = mean.view(1, -1, 1, 1), var.view(1, -1, 1, 1)
+        else:
+            mean, var = self.source_mean.view(1, -1, 1, 1), self.source_var.view(1, -1, 1, 1)
+
+        x = (x - mean) / torch.sqrt(var + self.eps)
+        weight = self.weight.view(1, -1, 1, 1)
+        bias = self.bias.view(1, -1, 1, 1)
+
+        return x * weight + bias
+
+File Path: core/utils/custom_transforms.py
+Content:
+import torch
+import torchvision.transforms.functional as F
+from torchvision.transforms import ColorJitter, Compose, Lambda
+from numpy import random
+import PIL
+import torchvision.transforms as transforms
+
+
+def get_tta_transforms(cfg, gaussian_std: float=0.005, soft=False):
+    img_shape = (*cfg.INPUT.SIZE, 3)
+    n_pixels = img_shape[0]
+
+    clip_min, clip_max = 0.0, 1.0
+
+    p_hflip = 0.5
+
+    tta_transforms = transforms.Compose([
+        Clip(0.0, 1.0),
+        ColorJitterPro(
+            brightness=[0.8, 1.2] if soft else [0.6, 1.4],
+            contrast=[0.85, 1.15] if soft else [0.7, 1.3],
+            saturation=[0.75, 1.25] if soft else [0.5, 1.5],
+            hue=[-0.03, 0.03] if soft else [-0.06, 0.06],
+            gamma=[0.85, 1.15] if soft else [0.7, 1.3]
+        ),
+        transforms.Pad(padding=int(n_pixels / 2), padding_mode='edge'),
+        transforms.RandomAffine(
+            degrees=[-8, 8] if soft else [-15, 15],
+            translate=(1/16, 1/16),
+            scale=(0.95, 1.05) if soft else (0.9, 1.1),
+            shear=None,
+            resample=PIL.Image.BILINEAR,
+            fillcolor=None
+        ),
+        transforms.GaussianBlur(kernel_size=5, sigma=[0.001, 0.25] if soft else [0.001, 0.5]),
+        transforms.CenterCrop(size=n_pixels),
+        transforms.RandomHorizontalFlip(p=p_hflip),
+        GaussianNoise(0, gaussian_std),
+        Clip(clip_min, clip_max)
+    ])
+    return tta_transforms
+
+
+class GaussianNoise(torch.nn.Module):
+    def __init__(self, mean=0., std=1.):
+        super().__init__()
+        self.std = std
+        self.mean = mean
+
+    def forward(self, img):
+        noise = torch.randn(img.size()) * self.std + self.mean
+        noise = noise.to(img.device)
+        return img + noise
+
+    def __repr__(self):
+        return self.__class__.__name__ + '(mean={0}, std={1})'.format(self.mean, self.std)
+
+
+class Clip(torch.nn.Module):
+    def __init__(self, min_val=0., max_val=1.):
+        super().__init__()
+        self.min_val = min_val
+        self.max_val = max_val
+
+    def forward(self, img):
+        return torch.clip(img, self.min_val, self.max_val)
+
+    def __repr__(self):
+        return self.__class__.__name__ + '(min_val={0}, max_val={1})'.format(self.min_val, self.max_val)
+
+
+class ColorJitterPro(ColorJitter):
+    """Randomly change the brightness, contrast, saturation, and gamma correction of an image."""
+
+    def __init__(self, brightness=0, contrast=0, saturation=0, hue=0, gamma=0):
+        super().__init__(brightness, contrast, saturation, hue)
+        self.gamma = self._check_input(gamma, 'gamma')
+
+    @staticmethod
+    @torch.jit.unused
+    def get_params(brightness, contrast, saturation, hue, gamma):
+        """Get a randomized transform to be applied on image.
+
+        Arguments are same as that of __init__.
+
+        Returns:
+            Transform which randomly adjusts brightness, contrast and
+            saturation in a random order.
+        """
+        transforms = []
+
+        if brightness is not None:
+            brightness_factor = random.uniform(brightness[0], brightness[1])
+            transforms.append(Lambda(lambda img: F.adjust_brightness(img, brightness_factor)))
+
+        if contrast is not None:
+            contrast_factor = random.uniform(contrast[0], contrast[1])
+            transforms.append(Lambda(lambda img: F.adjust_contrast(img, contrast_factor)))
+
+        if saturation is not None:
+            saturation_factor = random.uniform(saturation[0], saturation[1])
+            transforms.append(Lambda(lambda img: F.adjust_saturation(img, saturation_factor)))
+
+        if hue is not None:
+            hue_factor = random.uniform(hue[0], hue[1])
+            transforms.append(Lambda(lambda img: F.adjust_hue(img, hue_factor)))
+
+        if gamma is not None:
+            gamma_factor = random.uniform(gamma[0], gamma[1])
+            transforms.append(Lambda(lambda img: F.adjust_gamma(img, gamma_factor)))
+
+        random.shuffle(transforms)
+        transform = Compose(transforms)
+
+        return transform
+
+    def forward(self, img):
+        """
+        Args:
+            img (PIL Image or Tensor): Input image.
+
+        Returns:
+            PIL Image or Tensor: Color jittered image.
+        """
+        fn_idx = torch.randperm(5)
+        for fn_id in fn_idx:
+            if fn_id == 0 and self.brightness is not None:
+                brightness = self.brightness
+                brightness_factor = torch.tensor(1.0).uniform_(brightness[0], brightness[1]).item()
+                img = F.adjust_brightness(img, brightness_factor)
+
+            if fn_id == 1 and self.contrast is not None:
+                contrast = self.contrast
+                contrast_factor = torch.tensor(1.0).uniform_(contrast[0], contrast[1]).item()
+                img = F.adjust_contrast(img, contrast_factor)
+
+            if fn_id == 2 and self.saturation is not None:
+                saturation = self.saturation
+                saturation_factor = torch.tensor(1.0).uniform_(saturation[0], saturation[1]).item()
+                img = F.adjust_saturation(img, saturation_factor)
+
+            if fn_id == 3 and self.hue is not None:
+                hue = self.hue
+                hue_factor = torch.tensor(1.0).uniform_(hue[0], hue[1]).item()
+                img = F.adjust_hue(img, hue_factor)
+
+            if fn_id == 4 and self.gamma is not None:
+                gamma = self.gamma
+                gamma_factor = torch.tensor(1.0).uniform_(gamma[0], gamma[1]).item()
+                img = img.clamp(1e-8, 1.0)  # to fix Nan values in gradients, which happens when applying gamma
+                                            # after contrast
+                img = F.adjust_gamma(img, gamma_factor)
+
+        return img
+
+    def __repr__(self):
+        format_string = self.__class__.__name__ + '('
+        format_string += 'brightness={0}'.format(self.brightness)
+        format_string += ', contrast={0}'.format(self.contrast)
+        format_string += ', saturation={0}'.format(self.saturation)
+        format_string += ', hue={0})'.format(self.hue)
+        format_string += ', gamma={0})'.format(self.gamma)
+        return format_string
+
+File Path: core/utils/logger.py
+Content:
+import logging
+import os
+import sys
+
+
+def setup_logger(name, save_dir, distributed_rank, filename="log.txt"):
+    logger = logging.getLogger(name)
+    logger.setLevel(logging.DEBUG)
+    if distributed_rank > 0:
+        return logger
+    ch = logging.StreamHandler(stream=sys.stdout)
+    ch.setLevel(logging.DEBUG)
+    formatter = logging.Formatter("%(asctime)s %(name)s %(levelname)s: %(message)s")
+    ch.setFormatter(formatter)
+    logger.addHandler(ch)
+
+    if save_dir:
+        fh = logging.FileHandler(os.path.join(save_dir, filename))
+        fh.setLevel(logging.DEBUG)
+        fh.setFormatter(formatter)
+        logger.addHandler(fh)
+
+    return logger
+
+File Path: core/utils/memory.py
+Content:
+import random
+import copy
+import torch
+import torch.nn.functional as F
+import numpy as np
+import math
+
+
+class MemoryItem:
+    def __init__(self, data=None, uncertainty=0, age=0):
+        self.data = data
+        self.uncertainty = uncertainty
+        self.age = age
+
+    def increase_age(self):
+        if not self.empty():
+            self.age += 1
+
+    def get_data(self):
+        return self.data, self.uncertainty, self.age
+
+    def empty(self):
+        return self.data == "empty"
+
+
+class CSTU:
+    def __init__(self, capacity, num_class, lambda_t=1.0, lambda_u=1.0):
+        self.capacity = capacity
+        self.num_class = num_class
+        self.per_class = self.capacity / self.num_class
+        self.lambda_t = lambda_t
+        self.lambda_u = lambda_u
+
+        self.data: list[list[MemoryItem]] = [[] for _ in range(self.num_class)]
+
+    def get_occupancy(self):
+        occupancy = 0
+        for data_per_cls in self.data:
+            occupancy += len(data_per_cls)
+        return occupancy
+
+    def per_class_dist(self):
+        per_class_occupied = [0] * self.num_class
+        for cls, class_list in enumerate(self.data):
+            per_class_occupied[cls] = len(class_list)
+
+        return per_class_occupied
+
+    def add_instance(self, instance):
+        assert (len(instance) == 3)
+        x, prediction, uncertainty = instance
+        new_item = MemoryItem(data=x, uncertainty=uncertainty, age=0)
+        new_score = self.heuristic_score(0, uncertainty)
+        if self.remove_instance(prediction, new_score):
+            self.data[prediction].append(new_item)
+        self.add_age()
+
+    def remove_instance(self, cls, score):
+        class_list = self.data[cls]
+        class_occupied = len(class_list)
+        all_occupancy = self.get_occupancy()
+        if class_occupied < self.per_class:
+            if all_occupancy < self.capacity:
+                return True
+            else:
+                majority_classes = self.get_majority_classes()
+                return self.remove_from_classes(majority_classes, score)
+        else:
+            return self.remove_from_classes([cls], score)
+
+    def remove_from_classes(self, classes: list[int], score_base):
+        max_class = None
+        max_index = None
+        max_score = None
+        for cls in classes:
+            for idx, item in enumerate(self.data[cls]):
+                uncertainty = item.uncertainty
+                age = item.age
+                score = self.heuristic_score(age=age, uncertainty=uncertainty)
+                if max_score is None or score >= max_score:
+                    max_score = score
+                    max_index = idx
+                    max_class = cls
+
+        if max_class is not None:
+            if max_score > score_base:
+                self.data[max_class].pop(max_index)
+                return True
+            else:
+                return False
+        else:
+            return True
+
+    def get_majority_classes(self):
+        per_class_dist = self.per_class_dist()
+        max_occupied = max(per_class_dist)
+        classes = []
+        for i, occupied in enumerate(per_class_dist):
+            if occupied == max_occupied:
+                classes.append(i)
+
+        return classes
+
+    def heuristic_score(self, age, uncertainty):
+        return self.lambda_t * 1 / (1 + math.exp(-age / self.capacity)) + self.lambda_u * uncertainty / math.log(self.num_class)
+
+    def add_age(self):
+        for class_list in self.data:
+            for item in class_list:
+                item.increase_age()
+        return
+
+    def get_memory(self):
+        tmp_data = []
+        tmp_age = []
+
+        for class_list in self.data:
+            for item in class_list:
+                tmp_data.append(item.data)
+                tmp_age.append(item.age)
+
+        tmp_age = [x / self.capacity for x in tmp_age]
+
+        return tmp_data, tmp_age
+
+
+File Path: core/utils/result_precess.py
+Content:
+from collections import defaultdict
+from copy import deepcopy
+from prettytable import PrettyTable
+import torch
+
+
+class AvgResultProcessor:
+    def __init__(self, label2name: dict):
+        self.num_class = len(label2name.keys())
+        self.label2name = deepcopy(label2name)
+        self.acc_per_class = defaultdict(int)
+        self.count_per_class = defaultdict(int)
+        self.result_per_class = defaultdict(float)
+        self.all_accurate = []
+        for i in range(self.num_class):
+            self.acc_per_class[i] = 0
+            self.count_per_class[i] = 0
+
+    def process(self, accurate, label):
+        if isinstance(accurate, torch.Tensor):
+            accurate = accurate.long().cpu()
+            accurate = accurate.numpy()
+        if isinstance(label, torch.Tensor):
+            label = label.cpu()
+            label = label.numpy()
+
+        for acc, l in zip(accurate, label):
+            self.count_per_class[l] += 1
+            self.acc_per_class[l] += acc
+            self.all_accurate.append(acc)
+
+    def calculate(self):
+        for c in range(self.num_class):
+            self.result_per_class[c] = self.acc_per_class[c] / self.count_per_class[c] if self.count_per_class[c] > 0 else 0.0
+
+    def info(self):
+        t = PrettyTable(["Corruption", "Accuracy", "Error Rate"])
+        for c in range(self.num_class):
+            if c not in self.label2name.keys():
+                continue
+            t.add_row([self.label2name[c], f"{self.result_per_class[c] * 100:.2f}", f"{(1 - self.result_per_class[c]) * 100:.2f}"])
+        # avg is the total avg
+        avg = sum(self.all_accurate) / len(self.all_accurate)
+        t.add_row(["Total Avg", f"{avg * 100:.2f}", f"{(1 - avg) * 100:.2f}"])
+
+        per_domain_err = [f"{(1 - self.result_per_class[c]) * 100:.2f}" for c in range(self.num_class)]
+        summary = '\t'.join(per_domain_err)
+        info = f"{t} \n" \
+               + "You should better calculate the per-class average by yourself!\n" \
+               + f"summary: {summary}\n"
+        return info
+
+    def cumulative_acc(self):
+        return sum(self.all_accurate) / len(self.all_accurate)
+
+File Path: core/utils/utils.py
+Content:
+import random
+import numpy as np
+import errno
+import os
+import os.path as osp
+import warnings
+import torch
+
+
+def set_random_seed(seed):
+    if seed > 0 :
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+
+def mkdir(path):
+    try:
+        os.makedirs(path)
+    except OSError as e:
+        if e.errno != errno.EEXIST:
+            raise
+
+
+def check_isfile(fpath):
+    """Check if the given path is a file.
+
+    Args:
+        fpath (str): file path.
+
+    Returns:
+       bool
+    """
+    isfile = osp.isfile(fpath)
+    if not isfile:
+        warnings.warn('No file found at "{}"'.format(fpath))
+    return isfile
+
+
+def get_named_submodule(model, sub_name: str):
+    names = sub_name.split(".")
+    module = model
+    for name in names:
+        module = getattr(module, name)
+
+    return module
+
+
+def set_named_submodule(model, sub_name, value):
+    names = sub_name.split(".")
+    module = model
+    for i in range(len(names)):
+        if i != len(names) - 1:
+            module = getattr(module, names[i])
+
+        else:
+            setattr(module, names[i], value)
+
+
+
+File Path: ptta.py
+Content:
+import logging
+import torch
+import argparse
+
+from core.configs import cfg
+from core.utils import *
+from core.model import build_model
+from core.data import build_loader
+from core.optim import build_optimizer
+from core.adapter import build_adapter
+from tqdm import tqdm
+from setproctitle import setproctitle
+
+
+def testTimeAdaptation(cfg):
+    logger = logging.getLogger("TTA.test_time")
+    # model, optimizer
+    model = build_model(cfg)
+
+    optimizer = build_optimizer(cfg)
+
+    tta_adapter = build_adapter(cfg)
+
+    tta_model = tta_adapter(cfg, model, optimizer)
+    tta_model.cuda()
+
+    loader, processor = build_loader(cfg, cfg.CORRUPTION.DATASET, cfg.CORRUPTION.TYPE, cfg.CORRUPTION.SEVERITY)
+
+    tbar = tqdm(loader)
+    for batch_id, data_package in enumerate(tbar):
+        data, label, domain = data_package["image"], data_package['label'], data_package['domain']
+        if len(label) == 1:
+            continue  # ignore the final single point
+        data, label = data.cuda(), label.cuda()
+        output = tta_model(data)
+        predict = torch.argmax(output, dim=1)
+        accurate = (predict == label)
+        processor.process(accurate, domain)
+        if batch_id % 10 == 0:
+            if hasattr(tta_model, "mem"):
+                tbar.set_postfix(acc=processor.cumulative_acc(), bank=tta_model.mem.get_occupancy())
+            else:
+                tbar.set_postfix(acc=processor.cumulative_acc())
+
+    processor.calculate()
+
+    logger.info(f"All Results\n{processor.info()}")
+
+
+def main():
+    parser = argparse.ArgumentParser("Pytorch Implementation for Test Time Adaptation!")
+    parser.add_argument(
+        '-acfg',
+        '--adapter-config-file',
+        metavar="FILE",
+        default="",
+        help="path to adapter config file",
+        type=str)
+    parser.add_argument(
+        '-dcfg',
+        '--dataset-config-file',
+        metavar="FILE",
+        default="",
+        help="path to dataset config file",
+        type=str)
+    parser.add_argument(
+        '-ocfg',
+        '--order-config-file',
+        metavar="FILE",
+        default="",
+        help="path to order config file",
+        type=str)
+    parser.add_argument(
+        'opts',
+        help='modify the configuration by command line',
+        nargs=argparse.REMAINDER,
+        default=None)
+
+    args = parser.parse_args()
+
+    if len(args.opts) > 0:
+        args.opts[-1] = args.opts[-1].strip('\r\n')
+
+    torch.backends.cudnn.benchmark = True
+
+    cfg.merge_from_file(args.adapter_config_file)
+    cfg.merge_from_file(args.dataset_config_file)
+    if not args.order_config_file == "":
+        cfg.merge_from_file(args.order_config_file)
+    cfg.merge_from_list(args.opts)
+    cfg.freeze()
+
+    ds = cfg.CORRUPTION.DATASET
+    adapter = cfg.ADAPTER.NAME
+    setproctitle(f"TTA:{ds:>8s}:{adapter:<10s}")
+
+    if cfg.OUTPUT_DIR:
+        mkdir(cfg.OUTPUT_DIR)
+
+    logger = setup_logger('TTA', cfg.OUTPUT_DIR, 0, filename=cfg.LOG_DEST)
+    logger.info(args)
+
+    logger.info(f"Loaded configuration file: \n"
+                f"\tadapter: {args.adapter_config_file}\n"
+                f"\tdataset: {args.dataset_config_file}\n"
+                f"\torder: {args.order_config_file}")
+    logger.info("Running with config:\n{}".format(cfg))
+
+    set_random_seed(cfg.SEED)
+
+    testTimeAdaptation(cfg)
+
+
+if __name__ == "__main__":
+    main()
+
+Output:
+{
+    "experimental_code": "import torch\nimport torch.nn as nn\nfrom ..utils import memory\nfrom .base_adapter import BaseAdapter\nfrom copy import deepcopy\nfrom .base_adapter import softmax_entropy\nfrom ..utils.bn_layers import RobustBN1d, RobustBN2d\nfrom ..utils.utils import set_named_submodule, get_named_submodule\nfrom ..utils.custom_transforms import get_tta_transforms\n\n\nclass RoTTA(BaseAdapter):\n    def __init__(self, cfg, model, optimizer):\n        super(RoTTA, self).__init__(cfg, model, optimizer)\n        self.mem = memory.CSTU(capacity=self.cfg.ADAPTER.RoTTA.MEMORY_SIZE, num_class=cfg.CORRUPTION.NUM_CLASS, lambda_t=cfg.ADAPTER.RoTTA.LAMBDA_T, lambda_u=cfg.ADAPTER.RoTTA.LAMBDA_U)\n        self.model_ema = self.build_ema(self.model)\n        self.transform = get_tta_transforms(cfg)\n        self.nu = cfg.ADAPTER.RoTTA.NU\n        self.update_frequency = cfg.ADAPTER.RoTTA.UPDATE_FREQUENCY  # actually the same as the size of memory bank\n        self.current_instance = 0\n\n    @torch.enable_grad()\n    def forward_and_adapt(self, batch_data, model, optimizer):\n        # batch data\n        with torch.no_grad():\n            model.eval()\n            self.model_ema.eval()\n            ema_out = self.model_ema(batch_data)\n            predict = torch.softmax(ema_out, dim=1)\n            pseudo_label = torch.argmax(predict, dim=1)\n            entropy = torch.sum(- predict * torch.log(predict + 1e-6), dim=1)\n\n        # add into memory\n        for i, data in enumerate(batch_data):\n            p_l = pseudo_label[i].item()\n            uncertainty = entropy[i].item()\n            current_instance = (data, p_l, uncertainty)\n            self.mem.add_instance(current_instance)\n            self.current_instance += 1\n\n            if self.current_instance % self.update_frequency == 0:\n                self.update_model(model, optimizer)\n\n        return ema_out\n\n    def update_model(self, model, optimizer):\n        model.train()\n        self.model_ema.train()\n        # get memory data\n        sup_data, ages = self.mem.get_memory()\n        l_sup = None\n        if len(sup_data) > 0:\n            sup_data = torch.stack(sup_data)\n            strong_sup_aug = self.transform(sup_data)\n            ema_sup_out = self.model_ema(sup_data)\n            stu_sup_out = model(strong_sup_aug)\n            instance_weight = timeliness_reweighting(ages)\n            l_sup = (softmax_entropy(stu_sup_out, ema_sup_out) * instance_weight).mean()\n\n        l = l_sup\n        if l is not None:\n            optimizer.zero_grad()\n            l.backward()\n            optimizer.step()\n\n        self.update_ema_variables(self.model_ema, self.model, self.nu)\n\n    @staticmethod\n    def update_ema_variables(ema_model, model, nu):\n        for ema_param, param in zip(ema_model.parameters(), model.parameters()):\n            ema_param.data[:] = (1 - nu) * ema_param[:].data[:] + nu * param[:].data[:]\n        return ema_model\n\n    def configure_model(self, model: nn.Module):\n\n        model.requires_grad_(False)\n        normlayer_names = []\n\n        for name, sub_module in model.named_modules():\n            if isinstance(sub_module, nn.BatchNorm1d) or isinstance(sub_module, nn.BatchNorm2d):\n                normlayer_names.append(name)\n\n        for name in normlayer_names:\n            bn_layer = get_named_submodule(model, name)\n            if isinstance(bn_layer, nn.BatchNorm1d):\n                NewBN = RobustBN1d\n            elif isinstance(bn_layer, nn.BatchNorm2d):\n                NewBN = RobustBN2d\n            else:\n                raise RuntimeError()\n\n            momentum_bn = NewBN(bn_layer,\n                                self.cfg.ADAPTER.RoTTA.ALPHA)\n            momentum_bn.requires_grad_(True)\n            set_named_submodule(model, name, momentum_bn)\n        return model\n\n\ndef timeliness_reweighting(ages):\n    if isinstance(ages, list):\n        ages = torch.tensor(ages).float().cuda()\n    return torch.exp(-ages) / (1 + torch.exp(-ages))\nimport random\nimport copy\nimport torch\nimport torch.nn.functional as F\nimport numpy as np\nimport math\n\n\nclass MemoryItem:\n    def __init__(self, data=None, uncertainty=0, age=0):\n        self.data = data\n        self.uncertainty = uncertainty\n        self.age = age\n\n    def increase_age(self):\n        if not self.empty():\n            self.age += 1\n\n    def get_data(self):\n        return self.data, self.uncertainty, self.age\n\n    def empty(self):\n        return self.data == \"empty\"\n\n\nclass CSTU:\n    def __init__(self, capacity, num_class, lambda_t=1.0, lambda_u=1.0):\n        self.capacity = capacity\n        self.num_class = num_class\n        self.per_class = self.capacity / self.num_class\n        self.lambda_t = lambda_t\n        self.lambda_u = lambda_u\n\n        self.data: list[list[MemoryItem]] = [[] for _ in range(self.num_class)]\n\n    def get_occupancy(self):\n        occupancy = 0\n        for data_per_cls in self.data:\n            occupancy += len(data_per_cls)\n        return occupancy\n\n    def per_class_dist(self):\n        per_class_occupied = [0] * self.num_class\n        for cls, class_list in enumerate(self.data):\n            per_class_occupied[cls] = len(class_list)\n\n        return per_class_occupied\n\n    def add_instance(self, instance):\n        assert (len(instance) == 3)\n        x, prediction, uncertainty = instance\n        new_item = MemoryItem(data=x, uncertainty=uncertainty, age=0)\n        new_score = self.heuristic_score(0, uncertainty)\n        if self.remove_instance(prediction, new_score):\n            self.data[prediction].append(new_item)\n        self.add_age()\n\n    def remove_instance(self, cls, score):\n        class_list = self.data[cls]\n        class_occupied = len(class_list)\n        all_occupancy = self.get_occupancy()\n        if class_occupied < self.per_class:\n            if all_occupancy < self.capacity:\n                return True\n            else:\n                majority_classes = self.get_majority_classes()\n                return self.remove_from_classes(majority_classes, score)\n        else:\n            return self.remove_from_classes([cls], score)\n\n    def remove_from_classes(self, classes: list[int], score_base):\n        max_class = None\n        max_index = None\n        max_score = None\n        for cls in classes:\n            for idx, item in enumerate(self.data[cls]):\n                uncertainty = item.uncertainty\n                age = item.age\n                score = self.heuristic_score(age=age, uncertainty=uncertainty)\n                if max_score is None or score >= max_score:\n                    max_score = score\n                    max_index = idx\n                    max_class = cls\n\n        if max_class is not None:\n            if max_score > score_base:\n                self.data[max_class].pop(max_index)\n                return True\n            else:\n                return False\n        else:\n            return True\n\n    def get_majority_classes(self):\n        per_class_dist = self.per_class_dist()\n        max_occupied = max(per_class_dist)\n        classes = []\n        for i, occupied in enumerate(per_class_dist):\n            if occupied == max_occupied:\n                classes.append(i)\n\n        return classes\n\n    def heuristic_score(self, age, uncertainty):\n        return self.lambda_t * 1 / (1 + math.exp(-age / self.capacity)) + self.lambda_u * uncertainty / math.log(self.num_class)\n\n    def add_age(self):\n        for class_list in self.data:\n            for item in class_list:\n                item.increase_age()\n        return\n\n    def get_memory(self):\n        tmp_data = []\n        tmp_age = []\n\n        for class_list in self.data:\n            for item in class_list:\n                tmp_data.append(item.data)\n                tmp_age.append(item.age)\n\n        tmp_age = [x / self.capacity for x in tmp_age]\n\n        return tmp_data, tmp_age\nimport torch\nimport torch.nn as nn\nfrom copy import deepcopy\n\n\nclass MomentumBN(nn.Module):\n    def __init__(self, bn_layer: nn.BatchNorm2d, momentum):\n        super().__init__()\n        self.num_features = bn_layer.num_features\n        self.momentum = momentum\n        if bn_layer.track_running_stats and bn_layer.running_var is not None and bn_layer.running_mean is not None:\n            self.register_buffer(\"source_mean\", deepcopy(bn_layer.running_mean))\n            self.register_buffer(\"source_var\", deepcopy(bn_layer.running_var))\n            self.source_num = bn_layer.num_batches_tracked\n        self.weight = deepcopy(bn_layer.weight)\n        self.bias = deepcopy(bn_layer.bias)\n\n        self.register_buffer(\"target_mean\", torch.zeros_like(self.source_mean))\n        self.register_buffer(\"target_var\", torch.ones_like(self.source_var))\n        self.eps = bn_layer.eps\n\n        self.current_mu = None\n        self.current_sigma = None\n\n    def forward(self, x):\n        raise NotImplementedError\n\n\nclass RobustBN1d(MomentumBN):\n    def forward(self, x):\n        if self.training:\n            b_var, b_mean = torch.var_mean(x, dim=0, unbiased=False, keepdim=False)  # (C,)\n            mean = (1 - self.momentum) * self.source_mean + self.momentum * b_mean\n            var = (1 - self.momentum) * self.source_var + self.momentum * b_var\n            self.source_mean, self.source_var = deepcopy(mean.detach()), deepcopy(var.detach())\n            mean, var = mean.view(1, -1), var.view(1, -1)\n        else:\n            mean, var = self.source_mean.view(1, -1), self.source_var.view(1, -1)\n\n        x = (x - mean) / torch.sqrt(var + self.eps)\n        weight = self.weight.view(1, -1)\n        bias = self.bias.view(1, -1)\n\n        return x * weight + bias\n\n\nclass RobustBN2d(MomentumBN):\n    def forward(self, x):\n        if self.training:\n            b_var, b_mean = torch.var_mean(x, dim=[0, 2, 3], unbiased=False, keepdim=False)  # (C,)\n            mean = (1 - self.momentum) * self.source_mean + self.momentum * b_mean\n            var = (1 - self.momentum) * self.source_var + self.momentum * b_var\n            self.source_mean, self.source_var = deepcopy(mean.detach()), deepcopy(var.detach())\n            mean, var = mean.view(1, -1, 1, 1), var.view(1, -1, 1, 1)\n        else:\n            mean, var = self.source_mean.view(1, -1, 1, 1), self.source_var.view(1, -1, 1, 1)\n\n        x = (x - mean) / torch.sqrt(var + self.eps)\n        weight = self.weight.view(1, -1, 1, 1)\n        bias = self.bias.view(1, -1, 1, 1)\n\n        return x * weight + bias\n@torch.jit.script\ndef softmax_entropy(x, x_ema):\n    return -(x_ema.softmax(1) * x.log_softmax(1)).sum(1)\nimport torch\nimport torchvision.transforms.functional as F\nfrom torchvision.transforms import ColorJitter, Compose, Lambda\nfrom numpy import random\nimport PIL\nimport torchvision.transforms as transforms\n\n\ndef get_tta_transforms(cfg, gaussian_std: float=0.005, soft=False):\n    img_shape = (*cfg.INPUT.SIZE, 3)\n    n_pixels = img_shape[0]\n\n    clip_min, clip_max = 0.0, 1.0\n\n    p_hflip = 0.5\n\n    tta_transforms = transforms.Compose([\n        Clip(0.0, 1.0),\n        ColorJitterPro(\n            brightness=[0.8, 1.2] if soft else [0.6, 1.4],\n            contrast=[0.85, 1.15] if soft else [0.7, 1.3],\n            saturation=[0.75, 1.25] if soft else [0.5, 1.5],\n            hue=[-0.03, 0.03] if soft else [-0.06, 0.06],\n            gamma=[0.85, 1.15] if soft else [0.7, 1.3]\n        ),\n        transforms.Pad(padding=int(n_pixels / 2), padding_mode='edge'),\n        transforms.RandomAffine(\n            degrees=[-8, 8] if soft else [-15, 15],\n            translate=(1/16, 1/16),\n            scale=(0.95, 1.05) if soft else (0.9, 1.1),\n            shear=None,\n            resample=PIL.Image.BILINEAR,\n            fillcolor=None\n        ),\n        transforms.GaussianBlur(kernel_size=5, sigma=[0.001, 0.25] if soft else [0.001, 0.5]),\n        transforms.CenterCrop(size=n_pixels),\n        transforms.RandomHorizontalFlip(p=p_hflip),\n        GaussianNoise(0, gaussian_std),\n        Clip(clip_min, clip_max)\n    ])\n    return tta_transforms\n\n\nclass GaussianNoise(torch.nn.Module):\n    def __init__(self, mean=0., std=1.):\n        super().__init__()\n        self.std = std\n        self.mean = mean\n\n    def forward(self, img):\n        noise = torch.randn(img.size()) * self.std + self.mean\n        noise = noise.to(img.device)\n        return img + noise\n\n    def __repr__(self):\n        return self.__class__.__name__ + '(mean={0}, std={1})'.format(self.mean, self.std)\n\n\nclass Clip(torch.nn.Module):\n    def __init__(self, min_val=0., max_val=1.):\n        super().__init__()\n        self.min_val = min_val\n        self.max_val = max_val\n\n    def forward(self, img):\n        return torch.clip(img, self.min_val, self.max_val)\n\n    def __repr__(self):\n        return self.__class__.__name__ + '(min_val={0}, max_val={1})'.format(self.min_val, self.max_val)\n\n\nclass ColorJitterPro(ColorJitter):\n    \"\"\"Randomly change the brightness, contrast, saturation, and gamma correction of an image.\"\"\"\n\n    def __init__(self, brightness=0, contrast=0, saturation=0, hue=0, gamma=0):\n        super().__init__(brightness, contrast, saturation, hue)\n        self.gamma = self._check_input(gamma, 'gamma')\n\n    @staticmethod\n    @torch.jit.unused\n    def get_params(brightness, contrast, saturation, hue, gamma):\n        \"\"\"Get a randomized transform to be applied on image.\n\n        Arguments are same as that of __init__.\n\n        Returns:\n            Transform which randomly adjusts brightness, contrast and\n            saturation in a random order.\n        \"\"\"\n        transforms = []\n\n        if brightness is not None:\n            brightness_factor = random.uniform(brightness[0], brightness[1])\n            transforms.append(Lambda(lambda img: F.adjust_brightness(img, brightness_factor)))\n\n        if contrast is not None:\n            contrast_factor = random.uniform(contrast[0], contrast[1])\n            transforms.append(Lambda(lambda img: F.adjust_contrast(img, contrast_factor)))\n\n        if saturation is not None:\n            saturation_factor = random.uniform(saturation[0], saturation[1])\n            transforms.append(Lambda(lambda img: F.adjust_saturation(img, saturation_factor)))\n\n        if hue is not None:\n            hue_factor = random.uniform(hue[0], hue[1])\n            transforms.append(Lambda(lambda img: F.adjust_hue(img, hue_factor)))\n\n        if gamma is not None:\n            gamma_factor = random.uniform(gamma[0], gamma[1])\n            transforms.append(Lambda(lambda img: F.adjust_gamma(img, gamma_factor)))\n\n        random.shuffle(transforms)\n        transform = Compose(transforms)\n\n        return transform\n\n    def forward(self, img):\n        \"\"\"\n        Args:\n            img (PIL Image or Tensor): Input image.\n\n        Returns:\n            PIL Image or Tensor: Color jittered image.\n        \"\"\"\n        fn_idx = torch.randperm(5)\n        for fn_id in fn_idx:\n            if fn_id == 0 and self.brightness is not None:\n                brightness = self.brightness\n                brightness_factor = torch.tensor(1.0).uniform_(brightness[0], brightness[1]).item()\n                img = F.adjust_brightness(img, brightness_factor)\n\n            if fn_id == 1 and self.contrast is not None:\n                contrast = self.contrast\n                contrast_factor = torch.tensor(1.0).uniform_(contrast[0], contrast[1]).item()\n                img = F.adjust_contrast(img, contrast_factor)\n\n            if fn_id == 2 and self.saturation is not None:\n                saturation = self.saturation\n                saturation_factor = torch.tensor(1.0).uniform_(saturation[0], saturation[1]).item()\n                img = F.adjust_saturation(img, saturation_factor)\n\n            if fn_id == 3 and self.hue is not None:\n                hue = self.hue\n                hue_factor = torch.tensor(1.0).uniform_(hue[0], hue[1]).item()\n                img = F.adjust_hue(img, hue_factor)\n\n            if fn_id == 4 and self.gamma is not None:\n                gamma = self.gamma\n                gamma_factor = torch.tensor(1.0).uniform_(gamma[0], gamma[1]).item()\n                img = img.clamp(1e-8, 1.0)  # to fix Nan values in gradients, which happens when applying gamma\n                                            # after contrast\n                img = F.adjust_gamma(img, gamma_factor)\n\n        return img\n\n    def __repr__(self):\n        format_string = self.__class__.__name__ + '('\n        format_string += 'brightness={0}'.format(self.brightness)\n        format_string += ', contrast={0}'.format(self.contrast)\n        format_string += ', saturation={0}'.format(self.saturation)\n        format_string += ', hue={0})'.format(self.hue)\n        format_string += ', gamma={0})'.format(self.gamma)\n        return format_string",
+    "experimental_info": "The RoTTA method involves three main components with the following experimental settings:\n\n1.  **Robust Batch Normalization (RBN):**\n    *   Traditional Batch Normalization layers are replaced with `RobustBN1d` or `RobustBN2d`. These layers use global running mean and variance (initialized from the pre-trained model) and update them via exponential moving average (EMA) with a momentum (`ALPHA`) of 0.05. Only the affine parameters of these RBN layers are trained during adaptation.\n\n2.  **Category-Balanced Sampling with Timeliness and Uncertainty (CSTU) for the Memory Bank:**\n    *   A memory bank (`CSTU`) is maintained with a capacity (`MEMORY_SIZE`) of 64 samples. It aims to distribute this capacity equally among categories based on the number of classes (`NUM_CLASS`) in the dataset (e.g., 10 for CIFAR-10, 100 for CIFAR-100).\n    *   Samples are prioritized for retention/removal based on a heuristic score combining their age (timeliness) and uncertainty (entropy of prediction). The weighting factors for timeliness (`LAMBDA_T`) and uncertainty (`LAMBDA_U`) are both set to 1.0.\n    *   The heuristic score is calculated as `lambda_t * 1 / (1 + math.exp(-age / capacity)) + lambda_u * uncertainty / math.log(num_class)`.\n\n3.  **Time-Aware Robust Training with a Teacher-Student Model:**\n    *   A teacher-student architecture is employed. The student model is updated using samples from the memory bank.\n    *   The teacher model's parameters are updated via EMA of the student's parameters with a decay rate (`NU`) of 0.001.\n    *   The student model minimizes a robust loss (`softmax_entropy`) which measures the difference between the student's prediction on strongly augmented memory samples and the teacher's prediction on original memory samples.\n    *   A timeliness reweighting strategy is applied to this loss, where `instance_weight = torch.exp(-ages) / (1 + torch.exp(-ages))`, giving less weight to older samples from the memory bank. `ages` are normalized by the memory capacity.\n    *   The model (student) is updated using the collected memory bank data every `UPDATE_FREQUENCY` instances, which is set to 64 (equal to `MEMORY_SIZE`).\n\n**General Optimization and Data Settings:**\n*   **Optimization:** The optimizer used is Adam with a learning rate (`LR`) of 1e-3, betas of (0.9, 0.999), and weight decay (`WD`) of 0.0. One optimization step (`STEPS`=1) is performed per batch of incoming data. During each step, an update to the model might occur if the `update_frequency` condition is met.\n*   **Data Augmentation (for memory bank samples):** Strong augmentations are applied to memory bank samples before they are passed to the student model. These transformations include clipping (0.0, 1.0), `ColorJitterPro` (brightness [0.6, 1.4], contrast [0.7, 1.3], saturation [0.5, 1.5], hue [-0.06, 0.06], gamma [0.7, 1.3]), padding (half image size), `RandomAffine` (degrees [-15, 15], translate (1/16, 1/16), scale (0.9, 1.1)), `GaussianBlur` (kernel size 5, sigma [0.001, 0.5]), `CenterCrop` to original size (e.g., 32x32), `RandomHorizontalFlip` (p=0.5), and `GaussianNoise` (std=0.005).\n*   **Input Data:** The method is evaluated on datasets like CIFAR-10/CIFAR-100 under various corruption types and severities. Input images are resized to (32, 32), normalized using standard ImageNet mean ([0.485, 0.456, 0.406]) and std ([0.229, 0.224, 0.225]). The testing batch size (`TEST.BATCH_SIZE`) is 64."
+}
