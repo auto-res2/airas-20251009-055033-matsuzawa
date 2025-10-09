@@ -1,0 +1,17 @@
+
+Input:
+# Task
+You carefully read the contents of the “Paper Outline” and select one GitHub link from the “GitHub URLs List” that you think is most relevant to the contents.
+# Constraints
+- Output the index number corresponding to the selected GitHub URL.
+- Be sure to select only one GitHub URL.
+- If there is no related GitHub link, output None.
+# Paper Outline
+ATTA formally defines dynamic model optimization for streaming test data by actively selecting informative instances for labeling. The theoretical foundation uses learning bounds based on H∆H-distance and VC-dimension to guarantee mitigation of distribution shifts (Theorem 1 and 2). Catastrophic forgetting is addressed through selective entropy minimization, where low-entropy samples (pseudo-labeled by the frozen pre-trained source model) are included alongside actively labeled high-entropy samples to maintain source domain performance (Corollary 3 and 4). The SimATTA algorithm partitions incoming unlabeled test samples into high- and low-entropy sets. Low-entropy samples are pseudo-labeled and stored. High-entropy samples are selected using an incremental clustering technique, which employs weighted K-means to store representative 'anchors' of seen distributions, adapting to new distributions while managing a budget. The model is then fine-tuned on both actively labeled high-entropy samples and pseudo-labeled low-entropy samples, balancing their influence according to theoretical insights.
+
+# GitHub URLs List
+['https://github.com/divelab/ATTA', 'https://github.com/DequanWang/tent', 'https://github.com/mr-eggplant/EATA', 'https://github.com/qinenergy/cotta', 'https://github.com/mr-eggplant/SAR', 'https://github.com/virajprabhu/CLUE']
+Output:
+{
+    "index": 0
+}
