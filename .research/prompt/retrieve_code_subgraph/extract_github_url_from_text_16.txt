@@ -1,0 +1,17 @@
+
+Input:
+# Task
+You carefully read the contents of the “Paper Outline” and select one GitHub link from the “GitHub URLs List” that you think is most relevant to the contents.
+# Constraints
+- Output the index number corresponding to the selected GitHub URL.
+- Be sure to select only one GitHub URL.
+- If there is no related GitHub link, output None.
+# Paper Outline
+The ATTA problem is formally defined, where a pre-trained model continuously selects informative instances from streaming test data within a budget to be labeled by an oracle and subsequently learned. The theoretical analysis establishes learning bounds for mitigating distribution shifts and avoiding catastrophic forgetting (CF). This involves scrutinizing the influence of active learning and using selective entropy minimization to identify 'source-like' low-entropy samples (pseudo-labeled by a frozen source-pretrained model) and informative high-entropy samples. The SimATTA algorithm implements this by partitioning unlabeled test samples into high and low entropy sets. High-entropy samples are actively selected using an incremental clustering technique (based on weighted K-means) to reduce redundancy and increase distribution coverage. The model is then fine-tuned using these labeled test anchors and pseudo-labeled source-like anchors, balancing training weights and sample numbers.
+
+# GitHub URLs List
+['https://github.com/divelab/ATTA', 'https://github.com/DequanWang/tent', 'https://github.com/mr-eggplant/EATA', 'https://github.com/qinenergy/cotta', 'https://github.com/mr-eggplant/SAR', 'https://github.com/virajprabhu/CLUE']
+Output:
+{
+    "index": 0
+}
