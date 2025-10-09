@@ -1,0 +1,81 @@
+experiments:
+  # -----------------------------------------------------------------------
+  # Smoke-test experiments – synthetic data, minimal epochs to keep CI fast.
+  # -----------------------------------------------------------------------
+  - run_id: smoke_source_frozen
+    seed: 123
+    dataset:
+      name: synthetic_classification
+      num_samples: 512
+      num_classes: 10
+      input_shape: [3, 32, 32]
+    model:
+      name: simple_cnn
+    training:
+      epochs: 1
+      batch_size: 64
+      learning_rate: 0.001
+      method: source-frozen
+
+  - run_id: smoke_ngfat
+    seed: 123
+    dataset:
+      name: synthetic_classification
+      num_samples: 512
+      num_classes: 10
+      input_shape: [3, 32, 32]
+    model:
+      name: simple_cnn
+    training:
+      epochs: 1
+      batch_size: 64
+      adapt_lr: 0.001
+      method: ngfat
+
+  - run_id: smoke_rotta
+    seed: 123
+    dataset:
+      name: synthetic_classification
+      num_samples: 512
+      num_classes: 10
+      input_shape: [3, 32, 32]
+    model:
+      name: simple_cnn
+    training:
+      epochs: 1
+      batch_size: 64
+      adapt_lr: 0.001
+      delta: 0.1
+      method: rotta
+
+  - run_id: smoke_zorro_lite
+    seed: 123
+    dataset:
+      name: synthetic_classification
+      num_samples: 512
+      num_classes: 10
+      input_shape: [3, 32, 32]
+    model:
+      name: simple_cnn
+    training:
+      epochs: 1
+      batch_size: 64
+      lambda: 1.0
+      eps: 0.001
+      method: zorro-lite
+
+  - run_id: smoke_zorro_full
+    seed: 123
+    dataset:
+      name: synthetic_classification
+      num_samples: 512
+      num_classes: 10
+      input_shape: [3, 32, 32]
+    model:
+      name: simple_cnn
+    training:
+      epochs: 1
+      batch_size: 64
+      lambda: 1.0
+      eps: 0.001
+      method: zorro-full

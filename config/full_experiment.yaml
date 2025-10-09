@@ -1,0 +1,75 @@
+experiments:
+  # -------------------------------------------------------------------
+  # TinyImageNet-C – ResNet-20-GN – five adaptation variants
+  # -------------------------------------------------------------------
+  - run_id: tinyimagenet_resnet20_gn_source_frozen
+    seed: 7
+    dataset:
+      name: tinyimagenet_c
+      split: test
+      max_samples: 5000        # quick demo – adjust to full set for real experiment
+    model:
+      name: resnet20_gn
+    training:
+      epochs: 1                # no training, just forward passes
+      batch_size: 32
+      method: source-frozen
+
+  - run_id: tinyimagenet_resnet20_gn_ngfat
+    seed: 7
+    dataset:
+      name: tinyimagenet_c
+      split: test
+      max_samples: 5000
+    model:
+      name: resnet20_gn
+    training:
+      epochs: 1
+      batch_size: 32
+      adapt_lr: 5e-4
+      method: ngfat
+
+  - run_id: tinyimagenet_resnet20_gn_rotta
+    seed: 7
+    dataset:
+      name: tinyimagenet_c
+      split: test
+      max_samples: 5000
+    model:
+      name: resnet20_gn
+    training:
+      epochs: 1
+      batch_size: 32
+      adapt_lr: 5e-4
+      delta: 0.1
+      method: rotta
+
+  - run_id: tinyimagenet_resnet20_gn_zorro_lite
+    seed: 7
+    dataset:
+      name: tinyimagenet_c
+      split: test
+      max_samples: 5000
+    model:
+      name: resnet20_gn
+    training:
+      epochs: 1
+      batch_size: 32
+      lambda: 1.0
+      eps: 0.001
+      method: zorro-lite
+
+  - run_id: tinyimagenet_resnet20_gn_zorro_full
+    seed: 7
+    dataset:
+      name: tinyimagenet_c
+      split: test
+      max_samples: 5000
+    model:
+      name: resnet20_gn
+    training:
+      epochs: 1
+      batch_size: 32
+      lambda: 1.0
+      eps: 0.001
+      method: zorro-full
