@@ -1,0 +1,78 @@
+experiments:
+  # ----------------------------------------------------------------- SOURCE
+  - run_id: smoke_source_frozen
+    seed: 1
+    dataset:
+      name: synthetic
+      num_samples: 256
+      num_classes: 10
+      input_shape: [3,32,32]
+    model:
+      name: simple_cnn
+    training:
+      method: source_frozen
+      epochs: 1
+      batch_size: 64
+
+  # ------------------------------------------------------------- BN-ADAPT
+  - run_id: smoke_bn_adapt
+    seed: 1
+    dataset:
+      name: synthetic
+      num_samples: 256
+      num_classes: 10
+      input_shape: [3,32,32]
+    model:
+      name: simple_cnn
+    training:
+      method: bn_adapt
+      epochs: 1
+      batch_size: 64
+
+  # ---------------------------------------------------------------- TENT
+  - run_id: smoke_tent
+    seed: 1
+    dataset:
+      name: synthetic
+      num_samples: 256
+      num_classes: 10
+      input_shape: [3,32,32]
+    model:
+      name: simple_cnn
+    training:
+      method: tent
+      learning_rate: 0.001
+      epochs: 1
+      batch_size: 64
+
+  # --------------------------------------------------------------- NGFAT
+  - run_id: smoke_ngfat
+    seed: 1
+    dataset:
+      name: synthetic
+      num_samples: 256
+      num_classes: 10
+      input_shape: [3,32,32]
+    model:
+      name: simple_cnn
+    training:
+      method: ngfat
+      epochs: 1
+      batch_size: 64
+
+  # ------------------------------------------------------------- ZORRO
+  - run_id: smoke_zorro
+    seed: 1
+    dataset:
+      name: synthetic
+      num_samples: 256
+      num_classes: 10
+      input_shape: [3,32,32]
+    model:
+      name: simple_cnn
+    training:
+      method: zorro_full
+      epochs: 1
+      batch_size: 64
+      lambda: 4
+      eps: 0.01

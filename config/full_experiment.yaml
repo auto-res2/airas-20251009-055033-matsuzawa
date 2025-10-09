@@ -1,0 +1,63 @@
+experiments:
+  # CIFAR-10-C ‑ ResNet20-GN ‑ source frozen
+  - run_id: cifar10c_resnet20_source
+    dataset:
+      name: cifar10_c
+      split: train
+    model:
+      name: resnet20_gn
+    training:
+      method: source_frozen
+      epochs: 1
+      batch_size: 128
+
+  # BN-adaptation
+  - run_id: cifar10c_resnet20_bnadapt
+    dataset:
+      name: cifar10_c
+      split: train
+    model:
+      name: resnet20_gn
+    training:
+      method: bn_adapt
+      epochs: 1
+      batch_size: 128
+
+  # TENT
+  - run_id: cifar10c_resnet20_tent
+    dataset:
+      name: cifar10_c
+      split: train
+    model:
+      name: resnet20_gn
+    training:
+      method: tent
+      learning_rate: 0.001
+      epochs: 1
+      batch_size: 128
+
+  # NGFAT
+  - run_id: cifar10c_resnet20_ngfat
+    dataset:
+      name: cifar10_c
+      split: train
+    model:
+      name: resnet20_gn
+    training:
+      method: ngfat
+      epochs: 1
+      batch_size: 128
+
+  # ZORRO-full
+  - run_id: cifar10c_resnet20_zorro
+    dataset:
+      name: cifar10_c
+      split: train
+    model:
+      name: resnet20_gn
+    training:
+      method: zorro_full
+      lambda: 8
+      eps: 0.01
+      epochs: 1
+      batch_size: 128
