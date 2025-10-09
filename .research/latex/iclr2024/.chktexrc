@@ -1,0 +1,8 @@
+# Suppress overly pedantic warnings
+# Warning 1: Command terminated with space (often a false positive with %)
+# Warning 8: Wrong length of dash (often intentional)
+# Warning 12: Interword spacing (often a false positive)
+# Warning 13: Intersentence spacing (often a false positive)
+# Warning 24: Delete space to maintain page references (often a false positive)
+
+CmdLine { -n1 -n8 -n12 -n13 -n24 }

@@ -1,0 +1,86 @@
+\begin{thebibliography}{13}
+\providecommand{\natexlab}[1]{#1}
+\providecommand{\url}[1]{\texttt{#1}}
+\expandafter\ifx\csname urlstyle\endcsname\relax
+  \providecommand{\doi}[1]{doi: #1}\else
+  \providecommand{\doi}{doi: \begingroup \urlstyle{rm}\Url}\fi
+
+\bibitem[Alfarra et~al.(2023)Alfarra, Itani, Pardo, Alhuwaider, Ramazanova,
+  Pérez, Cai, Müller, and Ghanem]{alfarra-2023-evaluation}
+Motasem Alfarra, Hani Itani, Alejandro Pardo, Shyma Alhuwaider, Merey
+  Ramazanova, Juan~C. Pérez, Zhipeng Cai, Matthias Müller, and Bernard
+  Ghanem.
+\newblock Evaluation of test-time adaptation under computational time
+  constraints.
+\newblock 2023.
+
+\bibitem[Chen et~al.(2023)Chen, Zhang, Song, Shan, and Liu]{chen-2023-improved}
+Liang Chen, Yong Zhang, Yibing Song, Ying Shan, and Lingqiao Liu.
+\newblock Improved test-time adaptation for domain generalization.
+\newblock 2023.
+
+\bibitem[Goyal et~al.(2022)Goyal, Sun, Raghunathan, and
+  Kolter]{goyal-2022-test}
+Sachin Goyal, Mingjie Sun, Aditi Raghunathan, and Zico Kolter.
+\newblock Test time adaptation via conjugate pseudo-labels.
+\newblock 2022.
+
+\bibitem[Gui et~al.(2024)Gui, Li, and Ji]{gui-2024-active}
+Shurui Gui, Xiner Li, and Shuiwang Ji.
+\newblock Active test-time adaptation: Theoretical analyses and an algorithm.
+\newblock 2024.
+
+\bibitem[Hoang et~al.(2023)Hoang, Vo, and Do]{hoang-2023-persistent}
+Trung-Hieu Hoang, Duc~Minh Vo, and Minh~N. Do.
+\newblock Persistent test-time adaptation in recurring testing scenarios.
+\newblock 2023.
+
+\bibitem[Lee et~al.(2024)Lee, Chottananurak, Gong, and Lee]{lee-2024-aetta}
+Taeckyung Lee, Sorn Chottananurak, Taesik Gong, and Sung-Ju Lee.
+\newblock Aetta: Label-free accuracy estimation for test-time adaptation.
+\newblock 2024.
+
+\bibitem[Niu et~al.(2023)Niu, Wu, Zhang, Wen, Chen, Zhao, and
+  Tan]{niu-2023-towards}
+Shuaicheng Niu, Jiaxiang Wu, Yifan Zhang, Zhiquan Wen, Yaofo Chen, Peilin Zhao,
+  and Mingkui Tan.
+\newblock Towards stable test-time adaptation in dynamic wild world.
+\newblock 2023.
+
+\bibitem[Ren \& Goldfarb(2021)Ren and Goldfarb]{ren-2021-tensor}
+Yi~Ren and Donald Goldfarb.
+\newblock Tensor normal training for deep learning models.
+\newblock 2021.
+
+\bibitem[Sun et~al.(2019)Sun, Wang, Liu, Miller, Efros, and
+  Hardt]{sun-2019-test}
+Yu~Sun, Xiaolong Wang, Zhuang Liu, John Miller, Alexei~A. Efros, and Moritz
+  Hardt.
+\newblock Test-time training with self-supervision for generalization under
+  distribution shifts.
+\newblock 2019.
+
+\bibitem[Tanaka et~al.(2025)Tanaka, Matsuzawa, Yoshino, Horiguchi, Takagi,
+  Yamauchi, and Kumagai]{airas2025}
+Toma Tanaka, Takumi Matsuzawa, Yuki Yoshino, Ilya Horiguchi, Shiro Takagi,
+  Ryutaro Yamauchi, and Wataru Kumagai.
+\newblock {AIRAS}, 2025.
+\newblock URL \url{https://github.com/airas-org/airas}.
+
+\bibitem[Wang et~al.(2020)Wang, Shelhamer, Liu, Olshausen, and
+  Darrell]{wang-2020-tent}
+Dequan Wang, Evan Shelhamer, Shaoteng Liu, Bruno Olshausen, and Trevor Darrell.
+\newblock Tent: Fully test-time adaptation by entropy minimization.
+\newblock 2020.
+
+\bibitem[Yuan et~al.(2023)Yuan, Xie, and Li]{yuan-2023-robust}
+Longhui Yuan, Binhui Xie, and Shuang Li.
+\newblock Robust test-time adaptation in dynamic scenarios.
+\newblock 2023.
+
+\bibitem[Zhao et~al.(2023)Zhao, Chen, and Xia]{zhao-2023-delta}
+Bowen Zhao, Chen Chen, and Shu-Tao Xia.
+\newblock Delta: Degradation-free fully test-time adaptation.
+\newblock 2023.
+
+\end{thebibliography}
