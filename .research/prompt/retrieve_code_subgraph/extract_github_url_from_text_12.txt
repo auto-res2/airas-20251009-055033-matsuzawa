@@ -1,0 +1,17 @@
+
+Input:
+# Task
+You carefully read the contents of the “Paper Outline” and select one GitHub link from the “GitHub URLs List” that you think is most relevant to the contents.
+# Constraints
+- Output the index number corresponding to the selected GitHub URL.
+- Be sure to select only one GitHub URL.
+- If there is no related GitHub link, output None.
+# Paper Outline
+ITTA improves TTT by introducing a learnable consistency loss and additional adaptive parameters. First, for the TTT task, a learnable consistency loss (Lwcont) is proposed, calculated as the L2 norm of the output of a weight subnetwork (fw) applied to the difference between original and augmented feature representations (z - z'). The fw subnetwork, composed of stacked ReLU layers with learnable weights and biases, allows flexible consistency measurement. To ensure alignment with the main classification loss (Lmain, a cross-entropy loss), ITTA enforces equality between the normalized gradients of Lmain and Lwcont with respect to the feature extractor parameters, using this as an objective to update fw's parameters. Second, during the test phase, ITTA inserts new adaptive blocks (fΘ), structured similarly to fw, after each block of the pretrained feature extractor. Crucially, only these newly introduced fΘ parameters are updated using the learnable consistency loss for test samples, while the original feature extractor and classifier parameters remain unchanged. This online adaptation process uses the learned consistency loss to tune the adaptive parameters for unseen target domains.
+
+# GitHub URLs List
+['https://github.com/liangchen527/ITTA']
+Output:
+{
+    "index": 0
+}
