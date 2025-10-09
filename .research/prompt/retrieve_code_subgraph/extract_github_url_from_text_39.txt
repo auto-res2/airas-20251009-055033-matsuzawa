@@ -1,0 +1,17 @@
+
+Input:
+# Task
+You carefully read the contents of the “Paper Outline” and select one GitHub link from the “GitHub URLs List” that you think is most relevant to the contents.
+# Constraints
+- Output the index number corresponding to the selected GitHub URL.
+- Be sure to select only one GitHub URL.
+- If there is no related GitHub link, output None.
+# Paper Outline
+MOCA extends Bayesian Online Changepoint Detection (BOCPD) to conditional density estimation, using a base meta-learning algorithm as the underlying predictive model (UPM). It recursively maintains and updates a belief distribution over run lengths (time since the last changepoint) using Bayesian filtering rules. Upon observing new data (xt, yt), MOCA updates the belief based on the input likelihood pθ(xt|ηt−1[rt]) and the conditional predictive likelihood pθ(yt|xt,ηt−1[rt]). The run length belief is then propagated forward in time, assuming a fixed hazard rate for task switches. The entire process is differentiable, allowing backpropagation to optimize the parameters of the base meta-learning algorithm. MOCA was instantiated and evaluated with an LSTM-based meta-learner, ALPaCA (a Bayesian meta-learning approach for regression), and PCOC (Probabilistic Clustering for Online Classification), a novel Bayesian meta-learning algorithm for classification based on Gaussian discriminant analysis in a learned feature space.
+
+# GitHub URLs List
+['https://github.com/StanfordASL/moca']
+Output:
+{
+    "index": 0
+}
