@@ -1,0 +1,3655 @@
+
+Input:
+You are a researcher with expertise in engineering in the field of machine learning.
+
+# Instructions
+- The content described in “Repository Content” corresponds to the GitHub repository of the method described in “Method.”
+- Please extract the following two pieces of information from “Repository Content”:
+    - experimental_code：Extract the implementation sections that are directly related to the method described in “Method.”
+    - experimental_info：Extract and output the experimental settings related to the method described in “Method.”
+
+# Method
+TTOpt discretizes continuous optimization problems by introducing a grid for each parameter, effectively representing the objective function as an implicit d-dimensional tensor. This tensor is then approximated using the Tensor Train (TT) format to overcome the curse of dimensionality. The optimization process is reformulated as finding the maximal elements of this tensor, guided by a generalized maximum volume principle. This involves iteratively searching for maximal volume submatrices in column and row spaces during 'sweeps' (forward and backward) across tensor modes. For stability, QR decomposition is applied before the maxvol algorithm, and `rect_maxvol` is used for adaptive rank selection. A continuous, smooth, and strictly monotone mapping function, `g(x) = pi/2 - atan(J(x) - Jmin)`, transforms objective values to enable finding global minimum/maximum by searching for maximum modulus. Crucially, the method employs quantization of tensor modes (reshaping the original tensor into a 'long' one with smaller mode sizes like P=2) to significantly boost accuracy and reduce complexity for fine grids.
+
+# Repository Content
+File Path: computations_old/check/animate.py
+Content:
+import matplotlib as mpl
+from matplotlib import animation
+from mpl_toolkits.mplot3d import Axes3D
+from matplotlib import cm
+import matplotlib.pyplot as plt
+from matplotlib.ticker import LinearLocator, FormatStrFormatter
+import numpy as np
+import teneva
+
+
+from ttopt import TTOpt
+from ttopt import ttopt_init
+
+
+mpl.rc('animation', html='jshtml')
+mpl.rcParams['animation.embed_limit'] = 2**128
+
+
+def animate(func, tto, frames=None, fpath=None):
+    n = [tto.p**tto.q] * 2 if tto.p is not None else tto.n
+    X1 = np.linspace(func.a[0], func.b[0], n[0])
+    X2 = np.linspace(func.a[1], func.b[1], n[1])
+    X1, X2 = np.meshgrid(X1, X2)
+    X = np.hstack([X1.reshape(-1, 1), X2.reshape(-1, 1)])
+    Y = func.get_f_poi(X)
+    Y = Y.reshape(X1.shape)
+
+    i_min = np.array((func.x_min - tto.a) / (tto.b - tto.a) * (tto.n_func - 1), dtype=int)
+
+    fig = plt.figure(figsize=(16, 7))
+    ax1 = fig.add_subplot(121, projection='3d')
+    ax2 = fig.add_subplot(122)
+
+    title = func.name + ' function'
+    title += f' | y_min={tto.y_min_real}'
+    title += f' | n = {tto.n}' if tto.p is None else f' | n = {tto.p}^{tto.q}'
+    ax1.set_title(title, fontsize=16)
+
+    surf = ax1.plot_surface(X1, X2, Y, cmap=cm.coolwarm,
+        linewidth=0, antialiased=False)
+    ax1.zaxis.set_major_locator(LinearLocator(10))
+    ax1.zaxis.set_major_formatter(FormatStrFormatter('%.02f'))
+    fig.colorbar(surf, ax=ax1, shrink=0.3, aspect=10)
+
+    ax2.imshow(Y, cmap=cm.coolwarm, alpha=0.8)
+    ax2.scatter(i_min[0], i_min[1], s=300, c='#ffbf00', marker='*', alpha=0.8)
+    ax2.set_xlim(0, n[0])
+    ax2.set_ylim(0, n[1])
+
+    img_min = ax2.scatter(0, 0, s=150, c='#EE17DA', marker='D')
+    img_req = ax2.scatter(0, 0, s= 70, c='#8b1d1d')
+    # img_req_old = ax2.scatter(0, 0, s= 50, c='#8b1d1d', alpha=0.2)
+    img_hist, = ax2.plot([], [], '--', c='#485536', linewidth=1, markersize=0)
+
+    def update(k, *args):
+        x = tto.x_min_list[k]
+        i = np.array((x - tto.a) / (tto.b - tto.a) * (tto.n_func - 1), dtype=int)
+        img_min.set_offsets(np.array([i[0], i[1]]))
+
+        I = tto.I_list[k]
+        img_req.set_offsets(I)
+
+        #if k > 0:
+        #    I = tto.I_list[k-1]
+        #    img_req_old.set_offsets(I)
+
+        pois_x, pois_y = [], []
+        for x in tto.x_min_list[:(k+1)]:
+            i = (x - tto.a) / (tto.b - tto.a) * (tto.n_func - 1)
+            pois_x.append(i[0])
+            pois_y.append(i[1])
+        img_hist.set_data(pois_x, pois_y)
+
+        m = sum(tto.evals_min_list[:(k+1)])
+        y = tto.y_min_list[k]
+        e = np.abs(y - tto.y_min_real)
+        ax2.set_title(f'Queries: {m:-7.1e} | Error : {e:-7.1e}', fontsize=20)
+
+        return img_min, img_req, img_hist
+
+    frames = frames or len(tto.x_min_list)
+    anim = animation.FuncAnimation(fig, update, interval=30,
+        frames=frames, blit=True, repeat=False)
+
+    if fpath:
+        anim.save(fpath, writer='pillow', fps=0.7)
+
+    return anim
+
+
+def run(d=2, p=2, q=12, evals=1.E+4, rmax=4, with_cache=False):
+    n = np.ones(d * q, dtype=int) * p
+    Y0 = ttopt_init(n, rmax)
+
+    for func in teneva.func_demo_all(d=d):
+        name = func.name + ' ' * (15 - len(func.name))
+        tto = TTOpt(f=func.get_f_poi, d=func.d, a=func.a, b=func.b,
+            name=name, x_min_real=func.x_min, y_min_real=func.y_min,
+            p=p, q=q, evals=evals, with_cache=with_cache, with_full_info=True)
+        tto.minimize(rmax, Y0, fs_opt=1.)
+        print(tto.info(with_e_x=False))
+
+        fpath = f'./check/animation/{func.name}.gif'
+        animate(func, tto, fpath=fpath)
+
+
+def run_base(d=2, n=256, evals=1.E+4, rmax=4, with_cache=False):
+    n = [n] * d
+    Y0 = ttopt_init(n, rmax)
+
+    for func in teneva.func_demo_all(d=d):
+        name = func.name + ' ' * (15 - len(func.name))
+        tto = TTOpt(f=func.get_f_poi, d=func.d, a=func.a, b=func.b,
+            name=name, x_min_real=func.x_min, y_min_real=func.y_min,
+            n=n, evals=evals, with_cache=with_cache, with_full_info=True)
+        tto.minimize(rmax, Y0, fs_opt=1.)
+        print(tto.info(with_e_x=False))
+
+        fpath = f'./check/animation/{func.name}_base.gif'
+        animate(func, tto, fpath=fpath)
+
+
+if __name__ == '__main__':
+    np.random.seed(16333)
+    run()
+    run_base()
+
+File Path: computations_old/check/check_tt_opts.py
+Content:
+import numpy as np
+import teneva
+
+
+from ttopt import TTOpt
+from ttopt import ttopt_init
+
+
+np.random.seed(16333)
+
+
+def run(d=10, n=1024, evals=1.E+6, rmax=4, reps=10, fs_opt=1., add_opt_inner=True, add_opt_outer=False, add_opt_rect=False, add_rnd_inner=False, add_rnd_outer=False, num=1):
+    errors, times = [], []
+    for func in teneva.func_demo_all(d=d):
+        if func.name == 'Michalewicz':
+            continue
+        e_list = []
+        t_list = []
+        for i in range(reps):
+            name = func.name + ' ' * (15 - len(func.name))
+
+            tto = TTOpt(f=func.get_f_poi, d=func.d, a=func.a, b=func.b,
+                name=name, x_min_real=func.x_min, y_min_real=func.y_min,
+                n=n, evals=evals)
+            tto.minimize(rmax, None, fs_opt, add_opt_inner, add_opt_outer,
+                add_opt_rect, add_rnd_inner, add_rnd_outer)
+            e_list.append(tto.e_y)
+            t_list.append(tto.t_minim)
+
+        errors.append(np.mean(e_list))
+        times.append(np.mean(t_list))
+
+    print(f'#{num:-2d} | e : ', ' | '.join([f'{e:-7.1e}' for e in errors]))
+
+
+if __name__ == '__main__':
+    run(num=1, add_opt_inner=False, add_opt_outer=False, add_opt_rect=False,
+        add_rnd_inner=False, add_rnd_outer=False)
+    run(num=2, add_opt_inner=False, add_opt_outer=False, add_opt_rect=True,
+        add_rnd_inner=False, add_rnd_outer=False)
+    run(num=3, add_opt_inner=True, add_opt_outer=False, add_opt_rect=False,
+        add_rnd_inner=False, add_rnd_outer=False)
+    run(num=4, add_opt_inner=False, add_opt_outer=True, add_opt_rect=False,
+        add_rnd_inner=False, add_rnd_outer=False)
+    run(num=5, add_opt_inner=True, add_opt_outer=True, add_opt_rect=False,
+        add_rnd_inner=False, add_rnd_outer=False)
+    run(num=6, add_opt_inner=False, add_opt_outer=False, add_opt_rect=False,
+        add_rnd_inner=True, add_rnd_outer=True)
+    run(num=7, add_opt_inner=True, add_opt_outer=True, add_opt_rect=True,
+        add_rnd_inner=True, add_rnd_outer=True)
+
+File Path: computations_old/check/compare.py
+Content:
+import numpy as np
+import teneva
+
+
+from ttopt import TTOpt
+from ttopt import ttopt_init
+
+
+np.random.seed(16333)
+
+
+def run(d=10, p=2, q=25, evals=1.E+5, rmax=4, reps=10):
+    text = ''
+    text += '-'*76 + '\n'
+    text += 'Function     | Old        | New        | New + cache | '
+    text += 'Time (old/new/new+c.)' + '\n'
+    text += '-'*76
+    print(text)
+
+    for func in teneva.func_demo_all(d=d):
+        e_list_old, e_list, e_list_cache = [], [], []
+        t_list_old, t_list, t_list_cache = [], [], []
+
+        for i in range(reps):
+            name = func.name + ' ' * (12 - len(func.name))
+            tto = TTOpt(f=func.get_f_poi, d=func.d, a=func.a, b=func.b,
+                name=name, x_min_real=func.x_min, y_min_real=func.y_min,
+                p=p, q=q, evals=evals, use_old=True)
+            tto.minimize(rmax=rmax, fs_opt=None)
+            e_list_old.append(tto.e_y)
+            t_list_old.append(tto.t_minim)
+
+            tto = TTOpt(f=func.get_f_poi, d=func.d, a=func.a, b=func.b,
+                name=name, x_min_real=func.x_min, y_min_real=func.y_min,
+                p=p, q=q, evals=evals)
+            tto.minimize(rmax=rmax)
+            e_list.append(tto.e_y)
+            t_list.append(tto.t_minim)
+
+            tto = TTOpt(f=func.get_f_poi, d=func.d, a=func.a, b=func.b,
+                name=name, x_min_real=func.x_min, y_min_real=func.y_min,
+                p=p, q=q, evals=evals, with_cache=True, with_wrn=False)
+            tto.minimize(rmax=rmax)
+            e_list_cache.append(tto.e_y)
+            t_list_cache.append(tto.t_minim)
+
+        e_old, t_old = np.mean(e_list_old), np.mean(t_list_old)
+        e, t = np.mean(e_list), np.mean(t_list)
+        e_cache, t_cache = np.mean(e_list_cache), np.mean(t_list_cache)
+
+        text = f'{name} | '
+        text += f'{e_old:-7.1e}    | {e:-7.1e}    | {e_cache:-7.1e}     |'
+        text += f'{t_old:-5.1f} / {t:-5.1f} / {t_cache:-5.1f}'
+        print(text)
+
+    print('-'*76)
+
+
+if __name__ == '__main__':
+    run()
+
+File Path: computations_old/check/test.py
+Content:
+import numpy as np
+import teneva
+
+
+from ttopt import TTOpt
+from ttopt import ttopt_init
+
+
+np.random.seed(16333)
+
+
+def run(d=10, p=2, q=25, evals=1.E+5, rmax=4, with_cache=False):
+    n = np.ones(d * q, dtype=int) * p
+    Y0 = ttopt_init(n, rmax)
+
+    for func in teneva.func_demo_all(d=d):
+        name = func.name + ' ' * (15 - len(func.name))
+        tto = TTOpt(f=func.get_f_poi, d=func.d, a=func.a, b=func.b,
+            name=name, x_min_real=func.x_min, y_min_real=func.y_min,
+            p=p, q=q, evals=evals, with_cache=with_cache)
+        tto.minimize(rmax, Y0, fs_opt=1.)
+        print(tto.info(with_e_x=False))
+
+
+def run_many(d=10, p=2, q=25, evals=1.E+5, rmax=4):
+    for func in teneva.func_demo_all(d=d):
+        lim = func.b[0] - func.a[0]
+        for fs_opt in [None, 1000., 100., 10., 1., 0.1, 0.01]:
+            for i in range(5):
+                name = func.name + ' ' * (15 - len(func.name))
+                tto = TTOpt(f=func.get_f_poi, d=func.d, a=func.a, b=func.b,
+                    name=name, x_min_real=func.x_min, y_min_real=func.y_min,
+                    p=p, q=q, evals=evals)
+                tto.minimize(rmax=rmax, fs_opt=fs_opt)
+                print(tto.info(with_e_x=False) + f' | {lim:-6.2f} | opt = {fs_opt}')
+            print('')
+        print('\n')
+
+
+def run_one(d=10, p=2, q=25, evals=1.E+7, rmax=4, with_cache=False):
+    n = np.ones(d * q, dtype=int) * p
+    Y0 = ttopt_init(n, rmax)
+
+    func = teneva.func_demo_all(d=d, names=['Rosenbrock'])[0]
+    tto = TTOpt(f=func.get_f_poi, d=func.d, a=func.a, b=func.b,
+        name=func.name, x_min_real=func.x_min, y_min_real=func.y_min,
+        p=p, q=q, evals=evals, with_log=True, with_cache=with_cache)
+    tto.minimize(rmax, Y0, fs_opt=1.)
+    print(tto.info(with_e_x=False))
+
+
+def run_rep(d=10, p=2, q=25, evals=1.E+5, rmax=4, reps=10):
+    for func in teneva.func_demo_all(d=d):
+        e_list = []
+        t_list = []
+        for i in range(reps):
+            name = func.name + ' ' * (15 - len(func.name))
+            tto = TTOpt(f=func.get_f_poi, d=func.d, a=func.a, b=func.b,
+                name=name, x_min_real=func.x_min, y_min_real=func.y_min,
+                p=p, q=q, evals=evals)
+            tto.minimize(rmax=rmax)
+            e_list.append(tto.e_y)
+            t_list.append(tto.t_minim)
+
+        text = f'{name} | '
+        text += 'err (avg/min/max): '
+        text += f'{np.mean(e_list):-7.1e} / '
+        text += f'{ np.min(e_list):-7.1e} / '
+        text += f'{ np.max(e_list):-7.1e} | '
+        text += f't: {np.mean(t_list):-7.4f}'
+        print(text)
+
+
+if __name__ == '__main__':
+    run()
+
+File Path: computations_old/demo_calc/opt/es.py
+Content:
+"""Implementation of various Evolution Strategies.
+
+This script was downloaded from the repo https://github.com/hardmaru/estool.
+The package "cma" (https://github.com/CMA-ES/pycma) must be installed for it to
+work correctly ("pip install cma").
+
+"""
+import numpy as np
+
+
+def compute_ranks(x):
+  """
+  Returns ranks in [0, len(x))
+  Note: This is different from scipy.stats.rankdata, which returns ranks in [1, len(x)].
+  (https://github.com/openai/evolution-strategies-starter/blob/master/es_distributed/es.py)
+  """
+  assert x.ndim == 1
+  ranks = np.empty(len(x), dtype=int)
+  ranks[x.argsort()] = np.arange(len(x))
+  return ranks
+
+def compute_centered_ranks(x):
+  """
+  https://github.com/openai/evolution-strategies-starter/blob/master/es_distributed/es.py
+  """
+  y = compute_ranks(x.ravel()).reshape(x.shape).astype(np.float32)
+  y /= (x.size - 1)
+  y -= .5
+  return y
+
+def compute_weight_decay(weight_decay, model_param_list):
+  model_param_grid = np.array(model_param_list)
+  return - weight_decay * np.mean(model_param_grid * model_param_grid, axis=1)
+
+# adopted from:
+# https://github.com/openai/evolution-strategies-starter/blob/master/es_distributed/optimizers.py
+
+class Optimizer(object):
+  def __init__(self, pi, epsilon=1e-08):
+    self.pi = pi
+    self.dim = pi.num_params
+    self.epsilon = epsilon
+    self.t = 0
+
+  def update(self, globalg):
+    self.t += 1
+    step = self._compute_step(globalg)
+    theta = self.pi.mu
+    ratio = np.linalg.norm(step) / (np.linalg.norm(theta) + self.epsilon)
+    self.pi.mu = theta + step
+    return ratio
+
+  def _compute_step(self, globalg):
+    raise NotImplementedError
+
+
+class BasicSGD(Optimizer):
+  def __init__(self, pi, stepsize):
+    Optimizer.__init__(self, pi)
+    self.stepsize = stepsize
+
+  def _compute_step(self, globalg):
+    step = -self.stepsize * globalg
+    return step
+
+class SGD(Optimizer):
+  def __init__(self, pi, stepsize, momentum=0.9):
+    Optimizer.__init__(self, pi)
+    self.v = np.zeros(self.dim, dtype=np.float32)
+    self.stepsize, self.momentum = stepsize, momentum
+
+  def _compute_step(self, globalg):
+    self.v = self.momentum * self.v + (1. - self.momentum) * globalg
+    step = -self.stepsize * self.v
+    return step
+
+
+class Adam(Optimizer):
+  def __init__(self, pi, stepsize, beta1=0.99, beta2=0.999):
+    Optimizer.__init__(self, pi)
+    self.stepsize = stepsize
+    self.beta1 = beta1
+    self.beta2 = beta2
+    self.m = np.zeros(self.dim, dtype=np.float32)
+    self.v = np.zeros(self.dim, dtype=np.float32)
+
+  def _compute_step(self, globalg):
+    a = self.stepsize * np.sqrt(1 - self.beta2 ** self.t) / (1 - self.beta1 ** self.t)
+    self.m = self.beta1 * self.m + (1 - self.beta1) * globalg
+    self.v = self.beta2 * self.v + (1 - self.beta2) * (globalg * globalg)
+    step = -a * self.m / (np.sqrt(self.v) + self.epsilon)
+    return step
+
+class CMAES:
+  '''CMA-ES wrapper.'''
+  def __init__(self, num_params,      # number of model parameters
+               sigma_init=0.10,       # initial standard deviation
+               popsize=255,           # population size
+               weight_decay=0.01, # weight decay coefficient
+               seed=0,
+               x0=None):
+
+    self.num_params = num_params
+    self.sigma_init = sigma_init
+    self.popsize = popsize
+    self.weight_decay = weight_decay
+    self.solutions = None
+    self.seed=seed
+
+    import cma
+    if x0 is None:
+        x0 = self.num_params * [0.]
+    self.es = cma.CMAEvolutionStrategy( x0,
+                                        self.sigma_init,
+                                        {'seed':self.seed,'popsize': self.popsize}
+                                      )
+
+  def rms_stdev(self):
+    sigma = self.es.result[6]
+    return np.mean(np.sqrt(sigma*sigma))
+
+  def ask(self):
+    '''returns a list of parameters'''
+    self.solutions = np.array(self.es.ask())
+    return self.solutions
+
+  def tell(self, reward_table_result):
+    reward_table = -np.array(reward_table_result)
+    if self.weight_decay > 0:
+      l2_decay = compute_weight_decay(self.weight_decay, self.solutions)
+      reward_table += l2_decay
+    self.es.tell(self.solutions, (reward_table).tolist()) # convert minimizer to maximizer.
+
+  def current_param(self):
+    return self.es.result[5] # mean solution, presumably better with noise
+
+  def set_mu(self, mu):
+    pass
+
+  def best_param(self):
+    return self.es.result[0] # best evaluated solution
+
+  def result(self): # return best params so far, along with historically best reward, curr reward, sigma
+    r = self.es.result
+    return (r[0], -r[1], -r[1], r[6])
+
+class SimpleGA:
+  '''Simple Genetic Algorithm.'''
+  def __init__(self, num_params,      # number of model parameters
+               sigma_init=0.1,        # initial standard deviation
+               sigma_decay=0.999,     # anneal standard deviation
+               sigma_limit=0.01,      # stop annealing if less than this
+               popsize=256,           # population size
+               elite_ratio=0.1,       # percentage of the elites
+               forget_best=False,     # forget the historical best elites
+               weight_decay=0.01,     # weight decay coefficient
+              ):
+
+    self.num_params = num_params
+    self.sigma_init = sigma_init
+    self.sigma_decay = sigma_decay
+    self.sigma_limit = sigma_limit
+    self.popsize = popsize
+
+    self.elite_ratio = elite_ratio
+    self.elite_popsize = int(self.popsize * self.elite_ratio)
+
+    self.sigma = self.sigma_init
+    self.elite_params = np.zeros((self.elite_popsize, self.num_params))
+    self.elite_rewards = np.zeros(self.elite_popsize)
+    self.best_param = np.zeros(self.num_params)
+    self.best_reward = 0
+    self.first_iteration = True
+    self.forget_best = forget_best
+    self.weight_decay = weight_decay
+
+  def rms_stdev(self):
+    return self.sigma # same sigma for all parameters.
+
+  def ask(self):
+    '''returns a list of parameters'''
+    self.epsilon = np.random.randn(self.popsize, self.num_params) * self.sigma
+    solutions = []
+
+    def mate(a, b):
+      c = np.copy(a)
+      idx = np.where(np.random.rand((c.size)) > 0.5)
+      c[idx] = b[idx]
+      return c
+
+    elite_range = range(self.elite_popsize)
+    for i in range(self.popsize):
+      idx_a = np.random.choice(elite_range)
+      idx_b = np.random.choice(elite_range)
+      child_params = mate(self.elite_params[idx_a], self.elite_params[idx_b])
+      solutions.append(child_params + self.epsilon[i])
+
+    solutions = np.array(solutions)
+    self.solutions = solutions
+
+    return solutions
+
+  def tell(self, reward_table_result):
+    # input must be a numpy float array
+    assert(len(reward_table_result) == self.popsize), "Inconsistent reward_table size reported."
+
+    reward_table = np.array(reward_table_result)
+
+    if self.weight_decay > 0:
+      l2_decay = compute_weight_decay(self.weight_decay, self.solutions)
+      reward_table += l2_decay
+
+    if self.forget_best or self.first_iteration:
+      reward = reward_table
+      solution = self.solutions
+    else:
+      reward = np.concatenate([reward_table, self.elite_rewards])
+      solution = np.concatenate([self.solutions, self.elite_params])
+
+    idx = np.argsort(reward)[::-1][0:self.elite_popsize]
+
+    self.elite_rewards = reward[idx]
+    self.elite_params = solution[idx]
+
+    self.curr_best_reward = self.elite_rewards[0]
+
+    if self.first_iteration or (self.curr_best_reward > self.best_reward):
+      self.first_iteration = False
+      self.best_reward = self.elite_rewards[0]
+      self.best_param = np.copy(self.elite_params[0])
+
+    if (self.sigma > self.sigma_limit):
+      self.sigma *= self.sigma_decay
+
+  def current_param(self):
+    return self.elite_params[0]
+
+  def set_mu(self, mu):
+    pass
+
+  def best_param(self):
+    return self.best_param
+
+  def result(self): # return best params so far, along with historically best reward, curr reward, sigma
+    return (self.best_param, self.best_reward, self.curr_best_reward, self.sigma)
+
+class OpenES:
+  ''' Basic Version of OpenAI Evolution Strategies.'''
+  def __init__(self, num_params,             # number of model parameters
+               sigma_init=0.1,               # initial standard deviation
+               sigma_decay=0.999,            # anneal standard deviation
+               sigma_limit=0.01,             # stop annealing if less than this
+               learning_rate=0.01,           # learning rate for standard deviation
+               learning_rate_decay = 0.9999, # annealing the learning rate
+               learning_rate_limit = 0.001,  # stop annealing learning rate
+               popsize=256,                  # population size
+               antithetic=False,             # whether to use antithetic sampling
+               weight_decay=0.01,            # weight decay coefficient
+               rank_fitness=True,            # use rank rather than fitness numbers
+               forget_best=True):            # forget historical best
+
+    self.num_params = num_params
+    self.sigma_decay = sigma_decay
+    self.sigma = sigma_init
+    self.sigma_init = sigma_init
+    self.sigma_limit = sigma_limit
+    self.learning_rate = learning_rate
+    self.learning_rate_decay = learning_rate_decay
+    self.learning_rate_limit = learning_rate_limit
+    self.popsize = popsize
+    self.antithetic = antithetic
+    if self.antithetic:
+      assert (self.popsize % 2 == 0), "Population size must be even"
+      self.half_popsize = int(self.popsize / 2)
+
+    self.reward = np.zeros(self.popsize)
+    self.mu = np.zeros(self.num_params)
+    self.best_mu = np.zeros(self.num_params)
+    self.best_reward = 0
+    self.first_interation = True
+    self.forget_best = forget_best
+    self.weight_decay = weight_decay
+    self.rank_fitness = rank_fitness
+    if self.rank_fitness:
+      self.forget_best = True # always forget the best one if we rank
+    # choose optimizer
+    self.optimizer = Adam(self, learning_rate)
+
+  def rms_stdev(self):
+    sigma = self.sigma
+    return np.mean(np.sqrt(sigma*sigma))
+
+  def ask(self):
+    '''returns a list of parameters'''
+    # antithetic sampling
+    if self.antithetic:
+      self.epsilon_half = np.random.randn(self.half_popsize, self.num_params)
+      self.epsilon = np.concatenate([self.epsilon_half, - self.epsilon_half])
+    else:
+      self.epsilon = np.random.randn(self.popsize, self.num_params)
+
+    self.solutions = self.mu.reshape(1, self.num_params) + self.epsilon * self.sigma
+
+    return self.solutions
+
+  def tell(self, reward_table_result):
+    # input must be a numpy float array
+    assert(len(reward_table_result) == self.popsize), "Inconsistent reward_table size reported."
+
+    reward = np.array(reward_table_result)
+
+    if self.rank_fitness:
+      reward = compute_centered_ranks(reward)
+
+    if self.weight_decay > 0:
+      l2_decay = compute_weight_decay(self.weight_decay, self.solutions)
+      reward += l2_decay
+
+    idx = np.argsort(reward)[::-1]
+
+    best_reward = reward[idx[0]]
+    best_mu = self.solutions[idx[0]]
+
+    self.curr_best_reward = best_reward
+    self.curr_best_mu = best_mu
+
+    if self.first_interation:
+      self.first_interation = False
+      self.best_reward = self.curr_best_reward
+      self.best_mu = best_mu
+    else:
+      if self.forget_best or (self.curr_best_reward > self.best_reward):
+        self.best_mu = best_mu
+        self.best_reward = self.curr_best_reward
+
+    # main bit:
+    # standardize the rewards to have a gaussian distribution
+    normalized_reward = (reward - np.mean(reward)) / np.std(reward)
+    change_mu = 1./(self.popsize*self.sigma)*np.dot(self.epsilon.T, normalized_reward)
+
+    #self.mu += self.learning_rate * change_mu
+
+    self.optimizer.stepsize = self.learning_rate
+    update_ratio = self.optimizer.update(-change_mu)
+
+    # adjust sigma according to the adaptive sigma calculation
+    if (self.sigma > self.sigma_limit):
+      self.sigma *= self.sigma_decay
+
+    if (self.learning_rate > self.learning_rate_limit):
+      self.learning_rate *= self.learning_rate_decay
+
+  def current_param(self):
+    return self.curr_best_mu
+
+  def set_mu(self, mu):
+    self.mu = np.array(mu)
+
+  def best_param(self):
+    return self.best_mu
+
+  def result(self): # return best params so far, along with historically best reward, curr reward, sigma
+    return (self.best_mu, self.best_reward, self.curr_best_reward, self.sigma)
+
+class PEPG:
+  '''Extension of PEPG with bells and whistles.'''
+  def __init__(self, num_params,             # number of model parameters
+               sigma_init=0.10,              # initial standard deviation
+               sigma_alpha=0.20,             # learning rate for standard deviation
+               sigma_decay=0.999,            # anneal standard deviation
+               sigma_limit=0.01,             # stop annealing if less than this
+               sigma_max_change=0.2,         # clips adaptive sigma to 20%
+               learning_rate=0.01,           # learning rate for standard deviation
+               learning_rate_decay = 0.9999, # annealing the learning rate
+               learning_rate_limit = 0.01,   # stop annealing learning rate
+               elite_ratio = 0,              # if > 0, then ignore learning_rate
+               popsize=256,                  # population size
+               average_baseline=True,        # set baseline to average of batch
+               weight_decay=0.01,            # weight decay coefficient
+               rank_fitness=True,            # use rank rather than fitness numbers
+               forget_best=True):            # don't keep the historical best solution
+
+    self.num_params = num_params
+    self.sigma_init = sigma_init
+    self.sigma_alpha = sigma_alpha
+    self.sigma_decay = sigma_decay
+    self.sigma_limit = sigma_limit
+    self.sigma_max_change = sigma_max_change
+    self.learning_rate = learning_rate
+    self.learning_rate_decay = learning_rate_decay
+    self.learning_rate_limit = learning_rate_limit
+    self.popsize = popsize
+    self.average_baseline = average_baseline
+    if self.average_baseline:
+      assert (self.popsize % 2 == 0), "Population size must be even"
+      self.batch_size = int(self.popsize / 2)
+    else:
+      assert (self.popsize & 1), "Population size must be odd"
+      self.batch_size = int((self.popsize - 1) / 2)
+
+    # option to use greedy es method to select next mu, rather than using drift param
+    self.elite_ratio = elite_ratio
+    self.elite_popsize = int(self.popsize * self.elite_ratio)
+    self.use_elite = False
+    if self.elite_popsize > 0:
+      self.use_elite = True
+
+    self.forget_best = forget_best
+    self.batch_reward = np.zeros(self.batch_size * 2)
+    self.mu = np.zeros(self.num_params)
+    self.sigma = np.ones(self.num_params) * self.sigma_init
+    self.curr_best_mu = np.zeros(self.num_params)
+    self.best_mu = np.zeros(self.num_params)
+    self.best_reward = 0
+    self.first_interation = True
+    self.weight_decay = weight_decay
+    self.rank_fitness = rank_fitness
+    if self.rank_fitness:
+      self.forget_best = True # always forget the best one if we rank
+    # choose optimizer
+    self.optimizer = Adam(self, learning_rate)
+
+  def rms_stdev(self):
+    sigma = self.sigma
+    return np.mean(np.sqrt(sigma*sigma))
+
+  def ask(self):
+    '''returns a list of parameters'''
+    # antithetic sampling
+    self.epsilon = np.random.randn(self.batch_size, self.num_params) * self.sigma.reshape(1, self.num_params)
+    self.epsilon_full = np.concatenate([self.epsilon, - self.epsilon])
+    if self.average_baseline:
+      epsilon = self.epsilon_full
+    else:
+      # first population is mu, then positive epsilon, then negative epsilon
+      epsilon = np.concatenate([np.zeros((1, self.num_params)), self.epsilon_full])
+    solutions = self.mu.reshape(1, self.num_params) + epsilon
+    self.solutions = solutions
+    return solutions
+
+  def tell(self, reward_table_result):
+    # input must be a numpy float array
+    assert(len(reward_table_result) == self.popsize), "Inconsistent reward_table size reported."
+
+    reward_table = np.array(reward_table_result)
+
+    if self.rank_fitness:
+      reward_table = compute_centered_ranks(reward_table)
+
+    if self.weight_decay > 0:
+      l2_decay = compute_weight_decay(self.weight_decay, self.solutions)
+      reward_table += l2_decay
+
+    reward_offset = 1
+    if self.average_baseline:
+      b = np.mean(reward_table)
+      reward_offset = 0
+    else:
+      b = reward_table[0] # baseline
+
+    reward = reward_table[reward_offset:]
+    if self.use_elite:
+      idx = np.argsort(reward)[::-1][0:self.elite_popsize]
+    else:
+      idx = np.argsort(reward)[::-1]
+
+    best_reward = reward[idx[0]]
+    if (best_reward > b or self.average_baseline):
+      best_mu = self.mu + self.epsilon_full[idx[0]]
+      best_reward = reward[idx[0]]
+    else:
+      best_mu = self.mu
+      best_reward = b
+
+    self.curr_best_reward = best_reward
+    self.curr_best_mu = best_mu
+
+    if self.first_interation:
+      self.sigma = np.ones(self.num_params) * self.sigma_init
+      self.first_interation = False
+      self.best_reward = self.curr_best_reward
+      self.best_mu = best_mu
+    else:
+      if self.forget_best or (self.curr_best_reward > self.best_reward):
+        self.best_mu = best_mu
+        self.best_reward = self.curr_best_reward
+
+    # short hand
+    epsilon = self.epsilon
+    sigma = self.sigma
+
+    # update the mean
+
+    # move mean to the average of the best idx means
+    if self.use_elite:
+      self.mu += self.epsilon_full[idx].mean(axis=0)
+    else:
+      rT = (reward[:self.batch_size] - reward[self.batch_size:])
+      change_mu = np.dot(rT, epsilon)
+      self.optimizer.stepsize = self.learning_rate
+      update_ratio = self.optimizer.update(-change_mu) # adam, rmsprop, momentum, etc.
+      #self.mu += (change_mu * self.learning_rate) # normal SGD method
+
+    # adaptive sigma
+    # normalization
+    if (self.sigma_alpha > 0):
+      stdev_reward = 1.0
+      if not self.rank_fitness:
+        stdev_reward = reward.std()
+      S = ((epsilon * epsilon - (sigma * sigma).reshape(1, self.num_params)) / sigma.reshape(1, self.num_params))
+      reward_avg = (reward[:self.batch_size] + reward[self.batch_size:]) / 2.0
+      rS = reward_avg - b
+      delta_sigma = (np.dot(rS, S)) / (2 * self.batch_size * stdev_reward)
+
+      # adjust sigma according to the adaptive sigma calculation
+      # for stability, don't let sigma move more than 10% of orig value
+      change_sigma = self.sigma_alpha * delta_sigma
+      change_sigma = np.minimum(change_sigma, self.sigma_max_change * self.sigma)
+      change_sigma = np.maximum(change_sigma, - self.sigma_max_change * self.sigma)
+      self.sigma += change_sigma
+
+    if (self.sigma_decay < 1):
+      self.sigma[self.sigma > self.sigma_limit] *= self.sigma_decay
+
+    if (self.learning_rate_decay < 1 and self.learning_rate > self.learning_rate_limit):
+      self.learning_rate *= self.learning_rate_decay
+
+  def current_param(self):
+    return self.curr_best_mu
+
+  def set_mu(self, mu):
+    self.mu = np.array(mu)
+
+  def best_param(self):
+    return self.best_mu
+
+  def result(self): # return best params so far, along with historically best reward, curr reward, sigma
+    return (self.best_mu, self.best_reward, self.curr_best_reward, self.sigma)
+
+File Path: computations_old/demo_calc/opt/opt.py
+Content:
+import numpy as np
+
+
+class Opt():
+    """Base class for minimizer.
+
+    Note:
+        Concrete minimizers should extend this class.
+
+    """
+    name = 'Base minimizer'
+
+    def __init__(self, func, d, a, b, x_min=None, y_min=None, verb=True):
+        self._f0 = func          # Scalar function
+        self._f = func           # Vector function
+        self.d = d               # Dimension
+        self.a = a               # Grid lower limit
+        self.b = b               # Grid upper limit
+        self.x_real = x_min      # Real x (arg) for minimum (for error check)
+        self.y_real = y_min      # Real y (f(x)) for minimum (for error check)
+        self.verb = verb         # Verbosity of output (True/False)
+
+        self.prep()
+        self.init()
+
+    @property
+    def e_x(self):
+        if self.x_real is None or self.x is None:
+            return None
+        return np.linalg.norm(self.x_real - self.x)
+
+    @property
+    def e_y(self):
+        if self.y_real is None or self.y is None:
+            return None
+        return abs(self.y_real - self.y)
+
+    def info(self, text_spec=''):
+        text = ''
+        text += f'{self.name}' + ' '*(12 - len(self.name)) + ' | '
+
+        text += f't={self.t:-6.1f}'
+
+        if self.e_y is not None:
+            text += f' | ey={self.e_y:-7.1e}'
+
+        text += f' | evals={self.m:-7.1e}'
+
+        if text_spec:
+            text += f' | {text_spec}'
+
+        return text
+
+    def init(self):
+        self.t = 0.              # Work time (sec)
+        self.m = 0               # Number of function calls
+        self.x = None            # Found x (arg) for minimum
+        self.y = None            # Found y (f(x)) for minimum
+
+        return self
+
+    def f0(self, x):
+        self.m += 1
+        return self._f0(x)
+
+    def f0_max(self, x):
+        return -self.f0(x)
+
+    def f(self, X):
+        self.m += X.shape[0]
+        return self._f(X)
+
+    def f_max(self, X):
+        return -self.f(X)
+
+    def prep(self):
+        return self
+
+    def run_estool(self, solver):
+        for j in range(self.iters):
+            solutions = solver.ask()
+
+            fitness_list = np.zeros(solver.popsize)
+            for i in range(solver.popsize):
+                fitness_list[i] = self.f_max(solutions[i].reshape(1, -1))[0]
+
+            solver.tell(fitness_list)
+            result = solver.result()
+
+            self.x = result[0]
+            self.y = result[1]
+
+            if self.verb and (j+1) % 10 == 0:
+                text = ''
+                text += f'k={self.m:-8.2e} | '
+                text += f'iter={j+1:-6d} | '
+                text += f'e_y={self.e_y:-8.2e} '
+                print(text)
+
+    def solve(self):
+        raise NotImplementedError()
+
+    def to_dict(self):
+        return {
+            'name': self.name,
+            'd': self.d,
+            'a': self.a,
+            'b': self.b,
+            't': self.t,
+            'm': self.m,
+            'y': self.y,
+            'y_real': self.y_real,
+            'e_x': self.e_x,
+            'e_y': self.e_y,
+        }
+
+File Path: computations_old/demo_calc/opt/opt_de.py
+Content:
+from time import perf_counter as tpc
+import nevergrad as ng
+
+
+from opt import Opt
+
+
+class OptDE(Opt):
+    """Minimizer based on the DE method from "nevergrad" package."""
+    name = 'DE'
+
+    def prep(self, evals=1.E+7):
+        self.evals = int(evals)
+
+        return self
+
+    def solve(self):
+        t = tpc()
+
+        par = ng.p.Array(shape=(self.d,), lower=self.a, upper=self.b)
+        opt = ng.optimizers.registry['DE'](budget=self.evals,
+            parametrization=par, num_workers=1)
+        self.x = opt.minimize(self.f0).value
+        self.y = self.f0(self.x)
+
+        self.t = tpc() - t
+
+
+    def to_dict(self):
+        res = super().to_dict()
+        res['evals'] = self.evals
+        return res
+
+File Path: computations_old/demo_calc/opt/opt_es.py
+Content:
+from time import perf_counter as tpc
+
+
+from es import OpenES
+from opt import Opt
+
+
+class OptES(Opt):
+    """Minimizer based on the OpenAI-ES."""
+    name = 'ES-OpenAI'
+
+    def prep(self, popsize=256, iters=40000, sigma=0.1, decay=0.01):
+        self.popsize = int(popsize)
+        self.iters = int(iters)
+        self.sigma = sigma
+        self.decay = decay
+
+        return self
+
+    def solve(self):
+        t = tpc()
+
+        self.run_estool(OpenES(
+            self.d,
+            popsize=self.popsize,
+            rank_fitness=False,
+            sigma_init=self.sigma,
+            weight_decay=self.decay))
+
+        self.t = tpc() - t
+
+    def to_dict(self):
+        res = super().to_dict()
+        res['popsize'] = self.popsize
+        res['iters'] = self.iters
+        res['sigma'] = self.sigma
+        res['decay'] = self.decay
+        return res
+
+File Path: computations_old/demo_calc/opt/opt_es_cma.py
+Content:
+import numpy as np
+from time import perf_counter as tpc
+
+
+from es import CMAES
+from opt import Opt
+
+
+class OptESCMA(Opt):
+    """Minimizer based on the CMA-ES algorithm."""
+    name = 'ES-CMA'
+
+    def prep(self, popsize=255, iters=40000, sigma=0.1, decay=0.01, seed=42):
+        self.popsize = int(popsize)
+        self.iters = int(iters)
+        self.sigma = sigma
+        self.decay = decay
+        self.seed =  int(seed)
+
+        return self
+
+    def solve(self):
+        t = tpc()
+
+        self.run_estool(CMAES(
+            self.d,
+            popsize=self.popsize,
+            sigma_init=self.sigma,
+            weight_decay=self.decay,
+            seed=self.seed,
+            x0=self.a + (self.b - self.a) * np.random.uniform()))
+
+        self.t = tpc() - t
+
+    def to_dict(self):
+        res = super().to_dict()
+        res['popsize'] = self.popsize
+        res['iters'] = self.iters
+        res['sigma'] = self.sigma
+        res['decay'] = self.decay
+        return res
+
+File Path: computations_old/demo_calc/opt/opt_ga.py
+Content:
+from time import perf_counter as tpc
+
+
+from es import SimpleGA
+from opt import Opt
+
+
+class OptGA(Opt):
+    """Minimizer based on the Genetic Algorithm."""
+    name = 'GA'
+
+    def prep(self, popsize=256, iters=40000, sigma=0.1, decay=0.01):
+        self.popsize = int(popsize)
+        self.iters = int(iters)
+        self.sigma = sigma
+        self.decay = decay
+
+        return self
+
+    def solve(self):
+        t = tpc()
+
+        self.run_estool(SimpleGA(
+            self.d,
+            popsize=self.popsize,
+            sigma_init=self.sigma,
+            weight_decay=self.decay))
+
+        self.t = tpc() - t
+
+    def to_dict(self):
+        res = super().to_dict()
+        res['popsize'] = self.popsize
+        res['iters'] = self.iters
+        res['sigma'] = self.sigma
+        res['decay'] = self.decay
+        return res
+
+File Path: computations_old/demo_calc/opt/opt_nb.py
+Content:
+from time import perf_counter as tpc
+import nevergrad as ng
+
+
+from opt import Opt
+
+
+class OptNB(Opt):
+    """Minimizer based on the NoisyBandit method from "nevergrad" package."""
+    name = 'NB'
+
+    def prep(self, evals=1.E+7):
+        self.evals = int(evals)
+
+        return self
+
+    def solve(self):
+        t = tpc()
+
+        par = ng.p.Array(shape=(self.d,), lower=self.a, upper=self.b)
+        opt = ng.optimizers.registry['NoisyBandit'](budget=self.evals,
+            parametrization=par, num_workers=1)
+        self.x = opt.minimize(self.f0).value
+        self.y = self.f0(self.x)
+
+        self.t = tpc() - t
+
+
+    def to_dict(self):
+        res = super().to_dict()
+        res['evals'] = self.evals
+        return res
+
+File Path: computations_old/demo_calc/opt/opt_pso.py
+Content:
+from time import perf_counter as tpc
+import nevergrad as ng
+
+
+from opt import Opt
+
+
+class OptPSO(Opt):
+    """Minimizer based on the PSO method from "nevergrad" package."""
+    name = 'PSO'
+
+    def prep(self, evals=1.E+7):
+        self.evals = int(evals)
+
+        return self
+
+    def solve(self):
+        t = tpc()
+
+        par = ng.p.Array(shape=(self.d,), lower=self.a, upper=self.b)
+        opt = ng.optimizers.registry['PSO'](budget=self.evals,
+            parametrization=par, num_workers=1)
+        self.x = opt.minimize(self.f0).value
+        self.y = self.f0(self.x)
+
+        self.t = tpc() - t
+
+
+    def to_dict(self):
+        res = super().to_dict()
+        res['evals'] = self.evals
+        return res
+
+File Path: computations_old/demo_calc/opt/opt_tt_opt.py
+Content:
+from time import perf_counter as tpc
+from ttopt import TTOpt
+
+
+from opt import Opt
+
+
+class OptTTOpt(Opt):
+    """Minimizer based on the TTOpt."""
+    name = 'TTOpt'
+
+    def info(self):
+        if self.n is not None:
+            text = f'n={self.n:-5d}'
+        else:
+            text = f'p={self.p:-1d}, q={self.q:-2d}'
+        text += f', r={self.r:-3d}'
+        return super().info(text)
+
+    def prep(self, n=None, p=2, q=12, r=6, evals=1.E+7):
+        self.n = n
+        self.p = p
+        self.q = q
+        self.r = r
+        self.evals = int(evals)
+
+        return self
+
+    def solve(self):
+        t = tpc()
+
+        ttopt = TTOpt(
+            self.f,
+            d=self.d,
+            a=self.a,
+            b=self.b,
+            n=self.n,
+            p=self.p,
+            q=self.q,
+            evals=self.evals,
+            x_min_real=self.x_real,
+            y_min_real=self.y_real,
+            with_log=self.verb)
+        ttopt.minimize(self.r)
+
+        self.t = tpc() - t
+
+        self.x = ttopt.x_min
+        self.y = ttopt.y_min
+
+    def to_dict(self):
+        res = super().to_dict()
+        res['n'] = self.n
+        res['p'] = self.p
+        res['q'] = self.q
+        res['r'] = self.r
+        res['evals'] = self.evals
+        return res
+
+File Path: computations_old/demo_calc/run.py
+Content:
+"""Investigating TTOpt performance for analytical benchmark functions."""
+import argparse
+import numpy as np
+import pickle
+import random
+import sys
+
+
+import matplotlib.pyplot as plt
+params = {
+    'text.usetex' : False,
+    'font.size' : 36,
+    'legend.fancybox':True,
+    'legend.loc' : 'best',
+    'legend.framealpha': 0.9,
+    "legend.fontsize" : 27}
+plt.rcParams.update(params)
+
+
+sys.path.append('./demo_calc/opt')
+from opt_tt_opt import OptTTOpt
+from opt_ga import OptGA
+from opt_es import OptES
+from opt_es_cma import OptESCMA
+from opt_de import OptDE
+from opt_nb import OptNB
+from opt_pso import OptPSO
+
+
+from teneva import func_demo_all
+
+
+# Minimizer classes:
+OPTS = [OptTTOpt, OptGA, OptES, OptESCMA, OptDE, OptNB, OptPSO]
+
+
+# Minimizer names:
+OPT_NAMES = {
+    'TTOpt': 'TTOpt',
+    'GA': 'GA',
+    'ES-OpenAI': 'openES',
+    'ES-CMA': 'cmaES',
+    'DE': 'DE',
+    'NB': 'NB',
+    'PSO': 'PSO',
+}
+
+
+# Function names and possible dimensions (set "True" if works for any):
+FUNCS = {
+    'Ackley': True,
+    'Alpine': True,
+    'Brown': True,
+    'Exponential': True,
+    'Grienwank': True,
+    'Michalewicz': [10],
+    'Qing': True,
+    'Rastrigin': True,
+    'Schaffer': True,
+    'Schwefel': True,
+}
+
+
+# List of dimensions to check the TTOpt for multi-dim case:
+D_LIST = [10, 50, 100, 500]
+
+# List of ranks to check dependency of TTOpt on rank:
+R_LIST = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+
+
+# List of grid sizes to check QTT-effect (should be power of 2 and 4):
+N_LIST = [2**8, 2**10, 2**12, 2**14, 2**16, 2**18, 2**20]
+
+
+# List of numbers of function calls to check the dependency:
+EVALS_LIST = [1.E+4, 5.E+4, 1.E+5, 5.E+5, 1.E+6, 5.E+6, 1.E+7]
+
+
+# Population size for genetic-based algorithms:
+GA_POPSIZE = 255
+
+
+def get_funcs(d):
+    names = []
+    for name, dims in FUNCS.items():
+        if isinstance(dims, list):
+            if not d in dims:
+                continue
+        elif not dims:
+            continue
+        names.append(name)
+    return func_demo_all(d, names=names)
+
+
+def get_opt(func, opt_class, n, p, q, r, evals, with_log=False):
+    opt = opt_class(func.get_f_poi, func.d, func.a, func.b,
+        func.x_min, func.y_min, verb=with_log)
+
+    if opt.name == 'TTOpt':
+        opt.prep(n, p, q, r, evals)
+    elif opt.name in ['DE', 'NB', 'PSO']:
+        opt.prep(evals)
+    else:
+        opt.prep(popsize=GA_POPSIZE, iters=evals/GA_POPSIZE)
+
+    return opt
+
+
+def load(d, name, kind):
+    fpath = f'./demo_calc/res_data/{name}_{kind}_{d}dim.pickle'
+    try:
+        with open(fpath, 'rb') as f:
+            res = pickle.load(f)
+    except Exception as e:
+        res = None
+
+    return res
+
+
+def log(text, d, name, kind, is_init=False):
+    print(text)
+
+    fpath = f'./demo_calc/res_logs/{name}_{kind}_{d}dim.txt'
+    with open(fpath, 'w' if is_init else 'a') as f:
+        f.write(text + '\n')
+
+
+def run_comp(d, p, q, r, evals, reps=1, name='calc1', with_log=False):
+    """Compare different methods for benchmark analytic functions."""
+    log(f'', d, name, 'comp', is_init=True)
+    res = {}
+
+    for func in get_funcs(d):
+        log(f'--- Minimize function {func.name}-{d}dim\n', d, name, 'comp')
+        res[func.name] = {}
+
+        for opt_class in OPTS:
+            opt = get_opt(func, opt_class, None, p, q, r, evals, with_log)
+            res[func.name][opt.name] = solve(opt, d, name, 'comp', reps)
+
+            save(res, d, name, 'comp')
+
+        log('\n\n', d, name, 'comp')
+
+
+def run_dims(p, q, r, reps=1, name='calc1', with_log=False, evals_par=1.E+4):
+    """Solve for different dimension numbers."""
+    d0 = D_LIST[-1]
+
+    log(f'', d0, name, 'dims', is_init=True)
+    res = {}
+
+    for d in D_LIST:
+        evals = int(evals_par * d)
+        res[d] = {}
+
+        for func in get_funcs(d):
+            log(f'--- Minimize function {func.name}-{d}dim', d0, name, 'dims')
+
+            opt = get_opt(func, OptTTOpt, None, p, q, r, evals, with_log)
+
+            res[d][func.name] = solve(opt, d, name, 'dims', reps, d0)
+
+            save(res, d0, name, 'dims')
+
+            log('', d0, name, 'dims')
+
+
+def run_iter(d, p, q, r, reps=1, name='calc1', with_log=False):
+    """Check dependency of TTOpt on evals for benchmark analytic functions."""
+    log(f'', d, name, 'iter', is_init=True)
+    res = {}
+
+    for func in get_funcs(d):
+        log(f'--- Minimize function {func.name}-{d}dim\n', d, name, 'iter')
+        res[func.name] = []
+
+        for evals in EVALS_LIST:
+            opt = get_opt(func, OptTTOpt, None, p, q, r, evals, with_log)
+            res[func.name].append(solve(opt, d, name, 'iter', reps))
+
+            save(res, d, name, 'iter')
+
+        log('\n\n', d, name, 'iter')
+
+
+def run_quan(d, r, evals, reps=1, name='calc1', with_log=False):
+    """Check effect of QTT-based approach for benchmark analytic functions."""
+    log(f'', d, name, 'quan', is_init=True)
+    res = {}
+
+    for func in get_funcs(d):
+        log(f'--- Minimize function {func.name}-{d}dim\n', d, name, 'quan')
+
+        res[func.name] = {'q0': [], 'q2': [], 'q4': []}
+
+        for n in N_LIST:
+            n = int(n)
+            q2 = int(np.log2(n))
+            q4 = int(q2 / 2)
+
+            if 2**q2 != n or 4**q4 != n:
+                raise ValueError(f'Invalid grid size "{n}"')
+
+            opt = get_opt(func, OptTTOpt, n, None, None, r, evals, with_log)
+            res[func.name]['q0'].append(solve(opt, d, name, 'quan', reps))
+
+            opt = get_opt(func, OptTTOpt, None, 2, q2, r, evals, with_log)
+            res[func.name]['q2'].append(solve(opt, d, name, 'quan', reps))
+
+            opt = get_opt(func, OptTTOpt, None, 4, q4, r, evals, with_log)
+            res[func.name]['q4'].append(solve(opt, d, name, 'quan', reps))
+
+            save(res, d, name, 'quan')
+
+        log('\n\n', d, name, 'quan')
+
+
+def run_rank(d, p, q, evals, reps=1, name='calc1', with_log=False):
+    """Check dependency of TTOpt on rank for benchmark analytic functions."""
+    log(f'', d, name, 'rank', is_init=True)
+    res = {}
+    for func in get_funcs(d):
+        log(f'--- Minimize function {func.name}-{d}dim\n', d, name, 'rank')
+        res[func.name] = []
+
+        for r in R_LIST:
+            opt = get_opt(func, OptTTOpt, None, p, q, r, evals, with_log)
+            res[func.name].append(solve(opt, d, name, 'rank', reps))
+
+            save(res, d, name, 'rank')
+
+        log('\n\n', d, name, 'rank')
+
+
+def run_show(d, name='calc1'):
+    """Show results of the previous calculations."""
+    log(f'', d, name, 'show', is_init=True)
+    run_show_comp(d, name)
+    run_show_dims(d, D_LIST[-1], name)
+    run_show_iter(d, name)
+    run_show_quan(d, name)
+    run_show_rank(d, name)
+
+
+def run_show_comp(d, name='calc1'):
+    """Show results of the previous calculations for "comp"."""
+    res = load(d, name, 'comp')
+    if res is None:
+        log('>>> Comp-result is not available\n\n', d, name, 'show')
+        return
+
+    text = '>>> Comp-result (part of latex table): \n\n'
+
+    text += '% ------ AUTO CODE START\n\n'
+
+    for name_opt, name_opt_text in OPT_NAMES.items():
+        text += '\\multirow{2}{*}{\\func{' + name_opt_text + '}}'
+
+        text += '\n& $\\epsilon$ '
+        for func in get_funcs(d):
+            v = res[func.name][name_opt]['e']
+            vals = [res[func.name][nm]['e']
+                for nm in OPT_NAMES.keys() if nm != name_opt]
+            if v <= np.min(vals):
+                text += '& \\textbf{' + f'{v:-8.1e}' + '} '
+            else:
+                text += f'& {v:-8.1e} '
+
+        text += '\n\\\\'
+
+        text += '\n& $\\tau$ '
+        for func in get_funcs(d):
+            v = res[func.name][name_opt]['t']
+            text += '& \\textit{' + f'{v:-6.2f}' + '} '
+
+        text += ' \\\\ \\hline \n\n'
+
+    text += '% ------ AUTO CODE END\n\n'
+
+    log(text, d, name, 'show')
+
+
+def run_show_dims(d0, d_max, name='calc1'):
+    res = load(d_max, name, 'dims')
+    if res is None:
+        log('>>> Dims-result is not available', d0, name, 'show')
+        return
+
+    text = '>>> Dims-result: \n\n'
+
+    text += '% ------ AUTO CODE START\n'
+
+    for i, name_func in enumerate(res[d_max].keys(), 1):
+        text += '\\multirow{2}{*}{\\emph{F' + str(i) + '}}\n'
+
+        text += '& $\\epsilon$ \n'
+        for d in D_LIST:
+            item = res[d][name_func]
+            e = item['e']
+            text += '& ' + f'{e:-8.1e}' + '\n'
+
+        text += '\\\\ \n'
+
+        text += '& $\\tau$ \n'
+        for d in D_LIST:
+            item = res[d][name_func]
+            t = item['t']
+            text += '& \\textit{' + f'{t:-.1f}' + '}\n'
+
+        text += '\\\\ \\hline \n\n'
+
+    text += '% ------ AUTO CODE END\n\n'
+
+    log(text, d0, name, 'show')
+
+
+def run_show_iter(d, name='calc1'):
+    """Show results of the previous calculations for "iter"."""
+    res = load(d, name, 'iter')
+    if res is None:
+        log('>>> Iter-result is not available', d, name, 'show')
+        return
+
+    text = '>>> Iter-result (png file with plot): \n\n'
+
+    plt.figure(figsize=(16, 8))
+    plt.xlabel('number of queries')
+    plt.ylabel('absolute error')
+
+    for i, func in enumerate(get_funcs(d), 1):
+        v = [item['e'] for item in res[func.name]]
+        plt.plot(EVALS_LIST, v, label=f'F{i}', marker='o')
+
+    plt.grid()
+    plt.semilogx()
+    plt.semilogy()
+    plt.legend(loc='best', ncol=5, fontsize=20)
+
+    fpath = f'./demo_calc/res_plot/{name}_iter_{d}dim.png'
+    plt.savefig(fpath, bbox_inches='tight')
+    text += f'Figure saved to file "{fpath}"\n\n'
+
+    log(text, d, name, 'show')
+
+
+def run_show_quan(d, name='calc1'):
+    """Show results of the previous calculations for "quan"."""
+    res = load(d, name, 'quan')
+    if res is None:
+        log('>>> Quan-result is not available', d, name, 'show')
+        return
+
+    text = '>>> Quan-result (part of latex table): \n\n'
+
+    text += '% ------ AUTO CODE START\n'
+
+    for i, n in enumerate(N_LIST):
+        text += '\\multirow{2}{*}{' + str(n) + '}'
+
+        text += '\n& TT '
+        for func in get_funcs(d):
+            v = res[func.name]['q0'][i]['e']
+            text += f'& {v:-8.1e} '
+        text += '\\\\'
+
+        text += '\n& QTT '
+        for func in get_funcs(d):
+            v = res[func.name]['q2'][i]['e']
+            text += f'& {v:-8.1e} '
+        text += ' \\\\ \\hline \n'
+
+    text += '% ------ AUTO CODE END\n\n'
+
+    log(text, d, name, 'show')
+
+
+def run_show_rank(d, name='calc1'):
+    """Show results of the previous calculations for "rank"."""
+    res = load(d, name, 'rank')
+    if res is None:
+        log('>>> Rank-result is not available', d, name, 'show')
+        return
+
+    text = '>>> Rank-result (png file with plot): \n\n'
+
+    plt.figure(figsize=(16, 8))
+    plt.xlabel('rank')
+    plt.ylabel('absolute error')
+    plt.xticks(R_LIST)
+
+    for i, func in enumerate(get_funcs(d), 1):
+        v = [item['e'] for item in res[func.name]]
+        plt.plot(R_LIST, v, label=f'F{i}', marker='o')
+
+    plt.grid()
+    plt.semilogy()
+    plt.legend(loc='best', ncol=5, fontsize=20)
+
+    fpath = f'./demo_calc/res_plot/{name}_rank_{d}dim.png'
+    plt.savefig(fpath, bbox_inches='tight')
+    text += f'Figure saved to file "{fpath}"\n\n'
+
+    log(text, d, name, 'show')
+
+
+def save(res, d, name, kind):
+    fpath = f'./demo_calc/res_data/{name}_{kind}_{d}dim.pickle'
+    with open(fpath, 'wb') as f:
+        pickle.dump(res, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+
+def solve(opt, d, name, kind, reps=1, d_log=None):
+    t, y, e, m = [], [], [], []
+    for rep in range(reps):
+        np.random.seed(rep)
+        random.seed(rep)
+
+        opt.init()
+        opt.solve()
+
+        log(opt.info(), d_log or d, name, kind)
+
+        t.append(opt.t)
+        y.append(opt.y)
+        e.append(opt.e_y)
+        m.append(opt.m)
+
+    if reps > 1:
+        print(f'--> Mean error / time : {np.mean(e):-7.1e} / {np.mean(t):.2f}')
+
+    return {
+        't': np.mean(t),
+        'e': np.mean(e),
+        'e_var': np.var(e),
+        'e_min': np.min(e),
+        'e_max': np.max(e),
+        'e_avg': np.mean(e),
+        'e_all': e,
+        'y_all': y,
+        'y_real': opt.y_real,
+        'evals': int(np.mean(m))}
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(
+        description='Investigating TTOpt performance for analytic functions')
+    parser.add_argument('-d', default=10,
+        type=int, help='dimension d')
+    parser.add_argument('-p', default=2,
+        type=int, help='grid param p')
+    parser.add_argument('-q', default=25,
+        type=int, help='grid param q')
+    parser.add_argument('-r', default=4,
+        type=int, help='rank')
+    parser.add_argument('--evals', default=1.E+5,
+        type=float, help='computational budget')
+    parser.add_argument('--reps', default=1,
+        type=int, help='repetitions')
+    parser.add_argument('--name', default='calc1',
+        type=str, help='calculation name (the corresponding prefix will be used for the files with results)')
+    parser.add_argument('--kind', default='comp',
+        type=str, help='kind of calculation ("comp" - compare different solvers; "dims" - check dependency on dimension number; "iter" - check dependency on number of calls for target function; "quan" - check effect of qtt-usage; "rank" - check dependency on rank; "show" - show results of the previous calculations)')
+    parser.add_argument('--verb', default=False,
+        type=bool, help='if True, then intermediate results of the optimization process will be printed to the console')
+
+    args = parser.parse_args()
+
+    if args.kind == 'comp':
+        run_comp(args.d, args.p, args.q, args.r, args.evals, args.reps,
+            args.name, args.verb)
+    elif args.kind == 'dims':
+        run_dims(args.p, args.q, args.r, args.reps,
+            args.name, args.verb)
+    elif args.kind == 'iter':
+        run_iter(args.d, args.p, args.q, args.r, args.reps,
+            args.name, args.verb)
+    elif args.kind == 'quan':
+        run_quan(args.d, args.r, args.evals, args.reps,
+            args.name, args.verb)
+    elif args.kind == 'rank':
+        run_rank(args.d, args.p, args.q, args.evals, args.reps,
+            args.name, args.verb)
+    elif args.kind == 'show':
+        run_show(args.d, args.name)
+    else:
+        raise ValueError(f'Invalid kind of calculation "{args.kind}"')
+
+File Path: computations_old/demo_calc_2/func_demo_brown.py
+Content:
+"""Package teneva, module func.demo.func_demo_brown: function.
+
+This module contains class that implements analytical Brown function
+for demo and tests.
+
+"""
+import numpy as np
+try:
+    import torch
+    with_torch = True
+except Exception as e:
+    with_torch = False
+
+
+from teneva.func import Func
+
+
+class FuncDemoBrown(Func):
+    def __init__(self, d, dy=0.):
+        """Brown function for demo and tests.
+
+        Args:
+            d (int): number of dimensions.
+            dy (float): optional function shift (y -> y + dy).
+
+        Note:
+            See Momin Jamil, Xin-She Yang. "A literature survey of benchmark
+            functions for global optimization problems". Journal of
+            Mathematical Modelling and Numerical Optimisation 2013; 4:150-194
+            for details.
+
+        """
+        super().__init__(d, name='Brown')
+
+        self.dy = dy
+
+        self.set_lim(-1., +4.)
+        self.set_min([0.]*self.d, 0. + dy)
+
+    def _calc(self, x):
+        y = (x[:-1]**2)**(x[1:]**2+1) + (x[1:]**2)**(x[:-1]**2+1)
+        return np.sum(y) + self.dy
+
+    def _calc_pt(self, x):
+        if not with_torch:
+            raise ValueError('Torch is not available')
+
+        dy = torch.tensor(self.dy)
+
+        y = (x[:-1]**2)**(x[1:]**2+1) + (x[1:]**2)**(x[:-1]**2+1)
+
+        return torch.sum(y) + dy
+
+    def _comp(self, X):
+        Y = (X[:, :-1]**2)**(X[:, 1:]**2+1) + (X[:, 1:]**2)**(X[:, :-1]**2+1)
+        return np.sum(Y, axis=1) + self.dy
+
+File Path: computations_old/demo_calc_2/run.py
+Content:
+"""Compare TTOpt with gradient-based methods.
+
+Please, run the following shell scripts:
+cd demo_calc_2
+git clone https://github.com/rfeinman/pytorch-minimize.git
+cd pytorch-minimize
+pip install -e .
+clear && python run.py
+
+"""
+
+import numpy as np
+import teneva
+from time import perf_counter as tpc
+import torch
+from torchmin import minimize
+
+
+from func_demo_brown import FuncDemoBrown
+from ttopt import TTOpt
+
+
+FUNC_NAMES = ['Ackley', 'Alpine', 'Exponential', 'Grienwank', 'Michalewicz', 'Qing', 'Rastrigin', 'Schaffer', 'Schwefel']
+
+
+# Solvers:
+METHODS = [
+    'bfgs',
+    'l-bfgs',
+    'cg',
+    'newton-cg',
+    'newton-exact',
+    'trust-ncg',
+    # 'trust-krylov',  # It leads to error for the most benchmarks!
+    'trust-exact',
+    # 'dogleg',        # It leads to error for the most benchmarks!
+]
+OPT_NAMES = [
+    'TTOpt',
+    'BFGS',
+    'L-BFGS',
+    'CG', # 'Conjugate Gradient (CG)',
+    'NCG', # 'Newton Conjugate Gradient (NCG)',
+    'Newton', # 'Newton Exact'
+    'TR NCG', # 'Trust-Region NCG',
+    # 'Trust-Region GLTR (Krylov)', # It leads to error for the most benchmarks!
+    'TR', # 'Trust-Region Exact',
+    # 'Dogleg',                     # It leads to error for the most benchmarks!
+]
+
+
+def build_latex(result):
+    text = ''
+
+    for i, method in enumerate(OPT_NAMES):
+        t_all = [item['t'][i] for item in result.values()]
+        e_all = [item['e'][i] for item in result.values()]
+
+        text += '\\multirow{2}{*}{\\func{' + method + '}}'
+
+        text += '\n& $\\epsilon$ '
+        for e in [item['e'][i] for item in result.values()]:
+            text += f'& {e:-8.1e} '
+
+        text += '\n\\\\'
+
+        text += '\n& $\\tau$ '
+        for t in [item['t'][i] for item in result.values()]:
+            text += '& \\textit{' + f'{t:-6.2f}' + '} '
+
+        text += ' \\\\ \\hline \n\n'
+
+    print('\n\n Latex:\n\n' + text)
+
+
+def prepare_funcs(d):
+    funcs = teneva.func_demo_all(d=d, names=FUNC_NAMES)
+
+    FUNC_NAMES.insert(2, 'Brown')
+    funcs.insert(2, FuncDemoBrown(d=d))
+
+    return funcs
+
+
+def sample_init(d, a, b):
+    rng = np.random.default_rng(12345)
+    return torch.tensor((b - a) * rng.random(d) + a)
+
+
+def run(d=10, m=int(1.E+5), p=2, q=25, r=4, reps=10):
+    time_total = tpc()
+
+    method_all = ['TTOpt'] + METHODS
+    method_all = [m + ' '*max(0, 12-len(m)) for m in method_all]
+    print('Method          : ' + ' | '.join(method_all))
+
+    result = {}
+    for func in prepare_funcs(d):
+        t_all = []
+        e_all = []
+
+        method = 'TTOpt'
+        t = tpc()
+        f = func._comp
+        tto = TTOpt(f, d=func.d, a=func.a, b=func.b, p=p, q=q, evals=m)
+        tto.minimize(r)
+        y_min = tto.y_min
+        e = abs(func.y_min - y_min)
+        t = tpc() - t
+
+        t_all.append(t)
+        e_all.append(e)
+
+        for method in METHODS:
+            t_cur = []
+            e_cur = []
+
+            if func.name == 'Brown' and method in ['cg']:
+                t_cur = [-1]
+                e_cur = [-1]
+            else:
+                for rep in range(reps):
+                    np.random.seed(rep)
+                    torch.manual_seed(rep)
+
+                    x0 = sample_init(func.d, func.a, func.b)
+
+                    t = tpc()
+                    try:
+                        res = minimize(func._calc_pt, x0, method=method,
+                            max_iter=m)
+                        y_min = res.fun.item()
+                        e = abs(func.y_min - y_min)
+                    except Exception as err:
+                        print(f'Error for {method} : ', err)
+                        y_min = None
+                        e = -1
+                    t = tpc() - t
+
+                    t_cur.append(t)
+                    e_cur.append(e)
+
+            t_all.append(np.mean(t_cur))
+            e_all.append(np.mean(e_cur))
+
+        result[func.name] = {'t': t_all, 'e': e_all}
+
+        name = func.name + ' '*max(0, 12-len(func.name))
+        t_all = ' | '.join([f'{t:-12.4f}' for t in t_all])
+        e_all = ' | '.join([f'{e:-12.1e}' for e in e_all])
+        print()
+        print(name + '(t) : ' + t_all)
+        print(name + '(e) : ' + e_all)
+
+    build_latex(result)
+
+    time_total = tpc() - time_total
+    print(f'\n\nDONE | Time: {time_total:-8.4f}')
+
+
+if __name__ == '__main__':
+    run()
+
+File Path: demo/base.py
+Content:
+"""The demo of using ttopt. Basic example.
+
+We'll find the minimum for the 10-dimensional Alpine function with vectorized
+input. The target function for minimization has the form f(X), where input X is
+the [samples, dimension] numpy array.
+
+Run it from the root of the project as "python demo/base.py".
+
+As a result of the script work we expect the output in console like this:
+"
+...
+Alpine-10d | evals=1.00e+05 | t_cur=2.23e-02 | e_x=5.02e-01 e_y=9.22e-02
+----------------------------------------------------------------------
+Alpine-10d | evals=1.00e+05 | t_all=8.37e-02 | e_x=5.02e-01 e_y=9.22e-02
+"
+
+"""
+import numpy as np
+
+
+from ttopt import TTOpt
+from ttopt import ttopt_init
+
+
+np.random.seed(42)
+
+
+d = 10                      # Number of function dimensions:
+rank = 4                    # Maximum TT-rank while cross-like iterations
+def f(X):                   # Target function
+    return np.sum(np.abs(X * np.sin(X) + 0.1 * X), axis=1)
+
+
+# We initialize the TTOpt class instance with the correct parameters:
+tto = TTOpt(
+    f=f,                    # Function for minimization. X is [samples, dim]
+    d=d,                    # Number of function dimensions
+    a=-10.,                 # Grid lower bound (number or list of len d)
+    b=+10.,                 # Grid upper bound (number or list of len d)
+    n=2**6,                 # Number of grid points (number or list of len d)
+    evals=1.E+5,            # Number of function evaluations
+    name='Alpine',          # Function name for log (this is optional)
+    x_opt_real=np.zeros(d), # Real value of x-minima (x; this is for test)
+    y_opt_real=0.,          # Real value of y-minima (y=f(x); this is for test)
+    with_log=True)
+
+
+# And now we launching the minimizer:
+tto.optimize(rank)
+
+
+# We can extract the results of the computation:
+x = tto.x_opt          # The found value of the minimum of the function (x)
+y = tto.y_opt          # The found value of the minimum of the function (y=f(x))
+k_c = tto.k_cache      # Total number of cache usage (should be 0 in this demo)
+k_e = tto.k_evals      # Total number of requests to func (is always = evals)
+k_t = tto.k_total      # Total number of requests (k_cache + k_evals)
+t_f = tto.t_evals_mean # Average time spent to real function call for 1 point
+                       # ... (see "ttopt.py" and docs for more details)
+
+
+# We log the final state:
+print('-' * 70 + '\n' + tto.info() +'\n\n')
+
+File Path: demo/cache.py
+Content:
+"""The demo of using ttopt. Simple example with cache usage.
+
+We'll find the minimum for the simple analytic function of the form f(X), where
+input X is the [samples, dimension] numpy array using the cache.
+
+Run it from the root of the project as "python demo/cache.py".
+
+As a result of the script work we expect the output in console like this:
+"
+...
+Simple-5d  | evals=9.80e+03+3.01e+03 | t_cur=6.47e-02 | e_x=3.55e-02 e_y=1.03e-04
+----------------------------------------------------------------------
+Simple-5d  | evals=9.80e+03+3.01e+03 | t_all=7.61e-02 | e_x=3.55e-02 e_y=1.03e-04 
+"
+
+"""
+import numpy as np
+from scipy.optimize import rosen
+
+
+from ttopt import TTOpt
+from ttopt import ttopt_init
+
+
+np.random.seed(42)
+
+
+d = 5                       # Number of function dimensions:
+rank = 4                    # Maximum TT-rank while cross-like iterations
+def f(X):                   # Target function
+    return np.sin(0.1 * X[:, 0])**2 + 0.1 * np.sum(X[:, 1:]**2, axis=1)
+
+
+# We initialize the TTOpt class instance with the correct parameters:
+tto = TTOpt(
+    f=f,                    # Function for minimization. X is [samples, dim]
+    d=d,                    # Number of function dimensions
+    a=-1.,                  # Grid lower bound (number or list of len d)
+    b=+1.,                  # Grid upper bound (number or list of len d)
+    n=2**6,                 # Number of grid points (number or list of len d)
+    evals=1.E+4,            # Number of function evaluations
+    name='Simple',          # Function name for log (this is optional)
+    x_opt_real=np.zeros(d), # Real value of x-minima (x; this is for test)
+    y_opt_real=0.,          # Real value of y-minima (y=f(x); this is for test)
+    with_cache=True,        # We save all requests into cache
+    with_log=True)
+
+
+# And now we launching the minimizer:
+tto.optimize(rank)
+
+
+# We can extract the results of the computation:
+x = tto.x_opt          # The found value of the minimum of the function (x)
+y = tto.y_opt          # The found value of the minimum of the function (y=f(x))
+k_c = tto.k_cache      # Total number of cache usage (should be 0 in this demo)
+k_e = tto.k_evals      # Total number of requests to func (is always = evals)
+k_t = tto.k_total      # Total number of requests (k_cache + k_evals)
+t_f = tto.t_evals_mean # Average time spent to real function call for 1 point
+                       # ... (see "ttopt.py" and docs for more details)
+
+
+# We log the final state:
+print('-' * 70 + '\n' + tto.info() +'\n\n')
+
+File Path: demo/qtt.py
+Content:
+"""The demo of using ttopt. Example with QTT.
+
+We'll find the minimum for the 10-dimensional Alpine function with vectorized
+input. The target function for minimization has the form f(X), where input X is
+the [samples, dimension] numpy array.
+
+The target function and all the selected parameters are the same as in the
+"base.py", except that we replace grid size "n" by grid-factors "p" and "q".
+
+Run it from the root of the project as "python demo/qtt.py".
+
+As a result of the script work we expect the output in console like this:
+"
+...
+Alpine-10d | evals=1.00e+05 | t_cur=1.62e-01 | e_x=3.42e+00 e_y=4.23e-06
+----------------------------------------------------------------------
+Alpine-10d | evals=1.00e+05 | t_all=2.28e+00 | e_x=3.42e+00 e_y=4.23e-06
+"
+
+"""
+import numpy as np
+
+
+from ttopt import TTOpt
+from ttopt import ttopt_init
+
+
+np.random.seed(42)
+
+
+d = 10                      # Number of function dimensions:
+rank = 4                    # Maximum TT-rank while cross-like iterations
+def f(X):                   # Target function
+    return np.sum(np.abs(X * np.sin(X) + 0.1 * X), axis=1)
+
+
+# We initialize the TTOpt class instance with the correct parameters:
+tto = TTOpt(
+    f=f,                    # Function for minimization. X is [samples, dim]
+    d=d,                    # Number of function dimensions
+    a=-10.,                 # Grid lower bound (number or list of len d)
+    b=+10.,                 # Grid upper bound (number or list of len d)
+    p=2,                    # The grid size factor (there will n=p^q points)
+    q=20,                   # The grid size factor (there will n=p^q points)
+    evals=1.E+5,            # Number of function evaluations
+    name='Alpine',          # Function name for log (this is optional)
+    x_opt_real=np.ones(d),  # Real value of x-minima (x; this is for test)
+    y_opt_real=0.,          # Real value of y-minima (y=f(x); this is for test)
+    with_log=True)
+
+
+# And now we launching the minimizer:
+tto.optimize(rank)
+
+
+# We can extract the results of the computation:
+x = tto.x_opt          # The found value of the minimum of the function (x)
+y = tto.y_opt          # The found value of the minimum of the function (y=f(x))
+k_c = tto.k_cache      # Total number of cache usage (should be 0 in this demo)
+k_e = tto.k_evals      # Total number of requests to func (is always = evals)
+k_t = tto.k_total      # Total number of requests (k_cache + k_evals)
+t_f = tto.t_evals_mean # Average time spent to real function call for 1 point
+                       # ... (see "ttopt.py" and docs for more details)
+
+
+# We log the final state:
+print('-' * 70 + '\n' + tto.info() +'\n\n')
+
+File Path: demo/qtt_100d.py
+Content:
+"""The demo of using ttopt. Example with QTT for 100-dimensional function.
+
+We'll find the minimum for the 100-dimensional Alpine function with vectorized
+input. The target function for minimization has the form f(X), where input X is
+the [samples, dimension] numpy array.
+
+Run it from the root of the project as "python demo/qtt_100d.py".
+
+As a result of the script work we expect the output in console like this:
+"
+...
+Alpine-100d | evals=1.00e+05 | t_cur=2.87e-01 | e_x=1.16e+01 e_y=2.29e-02
+----------------------------------------------------------------------
+Alpine-100d | evals=1.00e+05 | t_all=6.89e+00 | e_x=1.16e+01 e_y=2.29e-02
+"
+
+"""
+import numpy as np
+
+
+from ttopt import TTOpt
+from ttopt import ttopt_init
+
+
+np.random.seed(42)
+
+
+d = 100                     # Number of function dimensions:
+rank = 4                    # Maximum TT-rank while cross-like iterations
+def f(X):                   # Target function
+    return np.sum(np.abs(X * np.sin(X) + 0.1 * X), axis=1)
+
+
+# We initialize the TTOpt class instance with the correct parameters:
+tto = TTOpt(
+    f=f,                    # Function for minimization. X is [samples, dim]
+    d=d,                    # Number of function dimensions
+    a=-10.,                 # Grid lower bound (number or list of len d)
+    b=+10.,                 # Grid upper bound (number or list of len d)
+    p=2,                    # The grid size factor (there will n=p^q points)
+    q=12,                   # The grid size factor (there will n=p^q points)
+    evals=1.E+5,            # Number of function evaluations
+    name='Alpine',          # Function name for log (this is optional)
+    x_opt_real=np.ones(d),  # Real value of x-minima (x; this is for test)
+    y_opt_real=0.,          # Real value of y-minima (y=f(x); this is for test)
+    with_log=True)
+
+
+# And now we launching the minimizer:
+tto.optimize(rank)
+
+
+# We can extract the results of the computation:
+x = tto.x_opt          # The found value of the minimum of the function (x)
+y = tto.y_opt          # The found value of the minimum of the function (y=f(x))
+k_c = tto.k_cache      # Total number of cache usage (should be 0 in this demo)
+k_e = tto.k_evals      # Total number of requests to func (is always = evals)
+k_t = tto.k_total      # Total number of requests (k_cache + k_evals)
+t_f = tto.t_evals_mean # Average time spent to real function call for 1 point
+                       # ... (see "ttopt.py" and docs for more details)
+
+
+# We log the final state:
+print('-' * 70 + '\n' + tto.info() +'\n\n')
+
+File Path: demo/qtt_max.py
+Content:
+"""The demo of using ttopt for maximization. Example with QTT.
+
+We'll find the maximum for the 10-dimensional Alpine function with vectorized
+input. The target function for maximization has the form f(X), where input X is
+the [samples, dimension] numpy array.
+
+Run it from the root of the project as "python demo/qtt_max.py".
+
+As a result of the script work we expect the output in console like this:
+"
+...
+Alpine-10d | evals=1.00e+05 | t_cur=1.65e-01 | y= 8.715206e+01
+----------------------------------------------------------------------
+Alpine-10d | evals=1.00e+05 | t_all=2.22e+00 | y= 8.715206e+01 
+"
+
+"""
+import numpy as np
+
+
+from ttopt import TTOpt
+from ttopt import ttopt_init
+
+
+np.random.seed(42)
+
+
+d = 10                      # Number of function dimensions:
+rank = 4                    # Maximum TT-rank while cross-like iterations
+def f(X):                   # Target function
+    return np.sum(np.abs(X * np.sin(X) + 0.1 * X), axis=1)
+
+
+# We initialize the TTOpt class instance with the correct parameters:
+tto = TTOpt(
+    f=f,                    # Function for maximization. X is [samples, dim]
+    d=d,                    # Number of function dimensions
+    a=-10.,                 # Grid lower bound (number or list of len d)
+    b=+10.,                 # Grid upper bound (number or list of len d)
+    p=2,                    # The grid size factor (there will n=p^q points)
+    q=20,                   # The grid size factor (there will n=p^q points)
+    evals=1.E+5,            # Number of function evaluations
+    name='Alpine',          # Function name for log (this is optional)
+    with_log=True)
+
+
+# And now we launching the maximizer:
+tto.optimize(rank, is_max=True)
+
+
+# We can extract the results of the computation:
+x = tto.x_opt          # The found value of the maximum of the function (x)
+y = tto.y_opt          # The found value of the maximum of the function (y=f(x))
+k_c = tto.k_cache      # Total number of cache usage (should be 0 in this demo)
+k_e = tto.k_evals      # Total number of requests to func (is always = evals)
+k_t = tto.k_total      # Total number of requests (k_cache + k_evals)
+t_f = tto.t_evals_mean # Average time spent to real function call for 1 point
+                       # ... (see "ttopt.py" and docs for more details)
+
+
+# We log the final state:
+print('-' * 70 + '\n' + tto.info() +'\n\n')
+
+File Path: demo/tensor.py
+Content:
+"""The demo of using ttopt. Example for tensor minimization.
+
+We'll find the minimum for the given simple d-dimensional tensor with elements:
+Y[i_1, i_2, ..., i_d] = (i_1 - 2)^2 + (i_2 - 3)^2 + i_2^4 + i_3^4 + ... + i_d^4.
+
+Run it from the root of the project as "python demo/tensor.py".
+
+As a result of the script work we expect the output in console like this:
+"
+...
+Tensor-10d | evals=1.00e+05 | t_cur=8.64e-03 | e_x=0.00e+00 e_y=0.00e+00
+----------------------------------------------------------------------
+Tensor-10d | evals=1.00e+05 | t_all=2.03e-01 | e_x=0.00e+00 e_y=0.00e+00
+y_opt :  0
+i_opt :  [2 3 0 0 0 0 0 0 0 0]
+"
+
+"""
+import numpy as np
+
+
+from ttopt import TTOpt
+from ttopt import ttopt_init
+
+
+np.random.seed(42)
+
+
+d = 10                      # Number of function dimensions
+p = 2
+q = 10
+n = p**q                    # Mode size for the tensor
+rank = 2                    # Maximum TT-rank while cross-like iterations
+def f(I):                   # Target function (return tensor element)
+    return (I[:, 0] - 2)**2 + (I[:, 1] - 3)**2 + np.sum(I[:, 2:]**4, axis=1)
+
+
+# Real value of x-minima:
+x_min_real = np.zeros(d)
+x_min_real[0] = 2
+x_min_real[1] = 3
+
+
+# We initialize the TTOpt class instance with the correct parameters:
+tto = TTOpt(
+    f=f,                    # Function for minimization. X is [samples, dim]
+    d=d,                    # Number of function dimensions
+    n=n,                    # Number of grid points (number or list of len d)
+    evals=1.E+5,            # Number of function evaluations
+    name='Tensor',          # Function name for log (this is optional)
+    x_opt_real=x_min_real,  # Real value of x-minima (x; this is for test)
+    y_opt_real=0.,          # Real value of y-minima (y=f(x); this is for test)
+    is_func=False,          # We approximate the tensor (not a function)
+    with_log=True)
+
+
+# And now we launching the minimizer:
+tto.optimize(rank)
+
+
+# We can extract the results of the computation:
+i = tto.i_opt          # The found value of the minimum (multi-index)
+y = tto.y_opt          # The found value of the minimum of the function (y=f(x))
+k_c = tto.k_cache      # Total number of cache usage (should be 0 in this demo)
+k_e = tto.k_evals      # Total number of requests to func (is always = evals)
+k_t = tto.k_total      # Total number of requests (k_cache + k_evals)
+t_f = tto.t_evals_mean # Average time spent to real function call for 1 point
+                       # ... (see "ttopt.py" and docs for more details)
+
+
+# We log the final state:
+print('-' * 70 + '\n' + tto.info())
+print('y_opt : ', y)
+print('i_opt : ', i)
+
+File Path: demo/tensor_init.py
+Content:
+"""The demo of using ttopt. Example for tensor minimization (special case).
+
+We'll find the minimum for the given simple d-dimensional tensor with elements:
+Y[i_1, i_2, ..., i_d] = (i_1 - 2)^2 + (i_2 - 3)^2 + i_2^4 + i_3^4 + ... + i_d^4.
+
+We will use special method of initialization. Instead of a random tensor, we
+manually construct a set of starting multi-indices for the search.
+
+Run it from the root of the project as "python demo/tensor_init_spec.py".
+
+As a result of the script work we expect the output in console like this:
+"
+...
+Tensor-10d | evals=1.00e+05 | t_cur=8.92e-03 | e_x=0.00e+00 e_y=0.00e+00
+----------------------------------------------------------------------
+Tensor-10d | evals=1.00e+05 | t_all=1.58e-01 | e_x=0.00e+00 e_y=0.00e+00
+y_opt :  0
+i_opt :  [2 3 0 0 0 0 0 0 0 0]
+"
+
+"""
+import numpy as np
+
+
+from ttopt import TTOpt
+from ttopt import ttopt_init
+
+
+np.random.seed(42)
+
+
+d = 10                      # Number of function dimensions
+p = 2
+q = 10
+n = p**q                    # Mode size for the tensor
+rank = 2                    # Maximum TT-rank while cross-like iterations
+def f(I):                   # Target function (return tensor element)
+    return (I[:, 0] - 2)**2 + (I[:, 1] - 3)**2 + np.sum(I[:, 2:]**4, axis=1)
+
+
+# Real value of x-minima:
+x_min_real = np.zeros(d)
+x_min_real[0] = 2
+x_min_real[1] = 3
+
+
+# We initialize the TTOpt class instance with the correct parameters:
+tto = TTOpt(
+    f=f,                    # Function for minimization. X is [samples, dim]
+    d=d,                    # Number of function dimensions
+    n=n,                    # Number of grid points (number or list of len d)
+    evals=1.E+5,            # Number of function evaluations
+    name='Tensor',          # Function name for log (this is optional)
+    x_opt_real=x_min_real,  # Real value of x-minima (x; this is for test)
+    y_opt_real=0.,          # Real value of y-minima (y=f(x); this is for test)
+    is_func=False,          # We approximate the tensor (not a function)
+    with_log=True)
+
+
+# We manually construct a set of starting multi-indices for the search (note
+# that the list contains (d+1) items, the first and last items should be None):
+J0 = [None for _ in range(d+1)]
+J0[1] = np.zeros((rank, 1), dtype=int)
+for k in range(1, d-1):
+    ir = np.ones((rank, 1), dtype=int)
+    ir *= 1 if k % 2 == 1 else 0
+    J0[k+1] = np.hstack((J0[k], ir))
+
+
+# And now we launching the minimizer:
+tto.optimize(rank, J0=J0)
+
+
+# We can extract the results of the computation:
+i = tto.i_opt          # The found value of the minimum (multi-index)
+y = tto.y_opt          # The found value of the minimum of the function (y=f(x))
+k_c = tto.k_cache      # Total number of cache usage (should be 0 in this demo)
+k_e = tto.k_evals      # Total number of requests to func (is always = evals)
+k_t = tto.k_total      # Total number of requests (k_cache + k_evals)
+t_f = tto.t_evals_mean # Average time spent to real function call for 1 point
+                       # ... (see "ttopt.py" and docs for more details)
+
+
+# We log the final state:
+print('-' * 70 + '\n' + tto.info())
+print('y_opt : ', y)
+print('i_opt : ', i)
+
+File Path: demo/vect.py
+Content:
+"""The demo of using ttopt. Simple example with "scalar" input.
+
+We'll find the minimum for the simple analytic function of the form f(x), where
+input x is the [dimension] numpy array (not vectorized!).
+
+Run it from the root of the project as "python demo/vect.py".
+
+As a result of the script work we expect the output in console like this:
+"
+...
+Simple-5d  | evals=1.00e+04 | t_cur=1.38e-01 | e_x=3.55e-02 e_y=1.03e-04
+----------------------------------------------------------------------
+Simple-5d  | evals=1.00e+04 | t_all=1.53e-01 | e_x=3.55e-02 e_y=1.03e-04 
+"
+
+"""
+import numpy as np
+from scipy.optimize import rosen
+
+
+from ttopt import TTOpt
+from ttopt import ttopt_init
+
+
+np.random.seed(42)
+
+
+d = 5                       # Number of function dimensions:
+rank = 4                    # Maximum TT-rank while cross-like iterations
+def f(x):                   # Target function
+    return np.sin(0.1 * x[0])**2 + 0.1 * np.sum(x[1:]**2)
+
+
+# We initialize the TTOpt class instance with the correct parameters:
+tto = TTOpt(
+    f=f,                    # Function for minimization. X is [samples, dim]
+    d=d,                    # Number of function dimensions
+    a=-1.,                  # Grid lower bound (number or list of len d)
+    b=+1.,                  # Grid upper bound (number or list of len d)
+    n=2**6,                 # Number of grid points (number or list of len d)
+    evals=1.E+4,            # Number of function evaluations
+    name='Simple',          # Function name for log (this is optional)
+    x_opt_real=np.zeros(d), # Real value of x-minima (x; this is for test)
+    y_opt_real=0.,          # Real value of y-minima (y=f(x); this is for test)
+    is_vect=False,          # The function accepts only one spatial point
+    with_log=True)
+
+
+# And now we launching the minimizer:
+tto.optimize(rank)
+
+
+# We can extract the results of the computation:
+x = tto.x_opt          # The found value of the minimum of the function (x)
+y = tto.y_opt          # The found value of the minimum of the function (y=f(x))
+k_c = tto.k_cache      # Total number of cache usage (should be 0 in this demo)
+k_e = tto.k_evals      # Total number of requests to func (is always = evals)
+k_t = tto.k_total      # Total number of requests (k_cache + k_evals)
+t_f = tto.t_evals_mean # Average time spent to real function call for 1 point
+                       # ... (see "ttopt.py" and docs for more details)
+
+
+# We log the final state:
+print('-' * 70 + '\n' + tto.info() +'\n\n')
+
+File Path: setup.py
+Content:
+import os
+import re
+from setuptools import setup
+
+
+def find_packages(package, basepath):
+    packages = [package]
+    for name in os.listdir(basepath):
+        path = os.path.join(basepath, name)
+        if not os.path.isdir(path):
+            continue
+        packages.extend(find_packages('%s.%s'%(package, name), path))
+    return packages
+
+
+here = os.path.abspath(os.path.dirname(__file__))
+desc = 'Multivariate function optimizer based on the tensor train approach.'
+with open(os.path.join(here, 'README.md'), encoding='utf-8') as f:
+    desc_long = f.read()
+
+
+with open(os.path.join(here, 'ttopt/__init__.py'), encoding='utf-8') as f:
+    text = f.read()
+    version = re.search(r"^__version__ = ['\"]([^'\"]*)['\"]", text, re.M)
+    version = version.group(1)
+
+
+with open(os.path.join(here, 'requirements.txt'), encoding='utf-8') as f:
+    requirements = f.read().split('\n')
+    requirements = [r for r in requirements if len(r) >= 3]
+
+
+setup_args = dict(
+    name='ttopt',
+    version=version,
+    description=desc,
+    long_description=desc_long,
+    long_description_content_type='text/markdown',
+    author='Andrei Chertkov',
+    author_email='andre.chertkov@gmail.com',
+    url='https://github.com/AndreiChertkov/ttopt',
+    classifiers=[
+        'Development Status :: 4 - Beta', # 3 - Alpha, 5 - Production/Stable
+        'License :: OSI Approved :: MIT License',
+        'Topic :: Scientific/Engineering',
+        'Topic :: Scientific/Engineering :: Mathematics',
+        'Topic :: Scientific/Engineering :: Information Analysis',
+        'Topic :: Scientific/Engineering :: Artificial Intelligence',
+        'Intended Audience :: Science/Research',
+        'Operating System :: OS Independent',
+        'Programming Language :: Python :: 3',
+        'Programming Language :: Python :: 3 :: Only',
+        'Programming Language :: Python :: 3.7',
+        'Programming Language :: Python :: 3.8',
+        'Programming Language :: Python :: 3.9',
+    ],
+    keywords='function optimization function minimization low-rank representation tensor train format TT-decomposition cross approximation',
+    packages=find_packages('ttopt', './ttopt/'),
+    python_requires='>=3.7',
+    project_urls={
+        'Source': 'https://github.com/AndreiChertkov/ttopt',
+    },
+)
+
+
+if __name__ == '__main__':
+    setup(
+        **setup_args,
+        install_requires=requirements,
+        include_package_data=True)
+
+File Path: ttopt/__init__.py
+Content:
+__version__ = '0.6.2'
+
+
+from .ttopt import TTOpt
+from .ttopt_raw import ttopt
+from .ttopt_raw import ttopt_find
+from .ttopt_raw import ttopt_fs
+from .ttopt_raw import ttopt_init
+
+File Path: ttopt/maxvol.py
+Content:
+"""Code from the package teneva, module maxvol: maxvol-like algorithms.
+
+Please, see the https://github.com/AndreiChertkov/teneva for details.
+
+This module contains the implementation of the maxvol algorithm (function
+"maxvol") and rect_maxvol algorithm (function "maxvol_rect") for matrices.
+The corresponding functions find in a given matrix square and rectangular
+maximal-volume submatrix, respectively (for the case of square submatrix, it
+has approximately the maximum value of the modulus of the determinant).
+
+"""
+import numpy as np
+from scipy.linalg import lu
+from scipy.linalg import solve_triangular
+
+
+def maxvol(A, e=1.05, k=100):
+    """Compute the maximal-volume submatrix for given tall matrix.
+
+    Args:
+        A (np.ndarray): tall matrix of the shape [n, r] (n > r).
+        e (float): accuracy parameter (should be >= 1). If the parameter is
+            equal to 1, then the maximum number of iterations will be performed
+            until true convergence is achieved. If the value is greater than
+            one, the algorithm will complete its work faster, but the accuracy
+            will be slightly lower (in most cases, the optimal value is within
+            the range of 1.01 - 1.1).
+        k (int): maximum number of iterations (should be >= 1).
+
+    Returns:
+        (np.ndarray, np.ndarray): the row numbers I containing the maximal
+        volume submatrix in the form of 1D array of length r and coefficient
+        matrix B in the form of 2D array of shape [n, r], such that
+        A = B A[I, :] and A (A[I, :])^{-1} = B.
+
+    Note:
+        The description of the basic implementation of this algorithm is
+        presented in the work: Goreinov S., Oseledets, I., Savostyanov, D.,
+        Tyrtyshnikov, E., Zamarashkin, N. "How to find a good submatrix".
+        Matrix Methods: Theory, Algorithms And Applications: Dedicated to the Memory of Gene Golub (2010): 247-256.
+
+    """
+    n, r = A.shape
+
+    if n <= r:
+        raise ValueError('Input matrix should be "tall"')
+
+    P, L, U = lu(A, check_finite=False)
+    I = P[:, :r].argmax(axis=0)
+    Q = solve_triangular(U, A.T, trans=1, check_finite=False)
+    B = solve_triangular(L[:r, :], Q, trans=1, check_finite=False,
+        unit_diagonal=True, lower=True).T
+
+    for _ in range(k):
+        i, j = np.divmod(np.abs(B).argmax(), r)
+        if np.abs(B[i, j]) <= e:
+            break
+
+        I[j] = i
+
+        bj = B[:, j]
+        bi = B[i, :].copy()
+        bi[j] -= 1.
+
+        B -= np.outer(bj, bi / B[i, j])
+
+    return I, B
+
+
+def maxvol_rect(A, e=1.1, dr_min=0, dr_max=None, e0=1.05, k0=10):
+    """Compute the maximal-volume rectangular submatrix for given tall matrix.
+
+    Within the framework of this function, the original maxvol algorithm is
+    first called (see function maxvol). Then additional rows of the matrix
+    are greedily added until the maximum allowed number is reached or until
+    convergence.
+
+    Args:
+        A (np.ndarray): tall matrix of the shape [n, r] (n > r).
+        e (float): accuracy parameter.
+        dr_min (int): minimum number of added rows (should be >= 0 and <= n-r).
+        dr_max (int): maximum number of added rows (should be >= 0). If the
+            value is not specified, then the number of added rows will be
+            determined by the precision parameter e, while the resulting
+            submatrix can even has the same size as the original matrix A.
+            If r + dr_max is greater than n, then dr_max will be set such
+            that r + dr_max = n.
+        e0 (float): accuracy parameter for the original maxvol algorithm
+            (should be >= 1). See function "maxvol" for details.
+        k0 (int): maximum number of iterations for the original maxvol algorithm
+            (should be >= 1). See function "maxvol" for details.
+
+    Returns:
+        (np.ndarray, np.ndarray): the row numbers I containing the rectangular
+        maximal-volume submatrix in the form of 1D array of length r + dr,
+        where dr is a number of additional selected rows (dr >= dr_min and
+        dr <= dr_max) and coefficient matrix B in the form of 2D array of shape
+        [n, r+dr], such that A = B A[I, :].
+
+    Note:
+        The description of the basic implementation of this algorithm is
+        presented in the work: Mikhalev A, Oseledets I., "Rectangular
+        maximum-volume submatrices and their applications." Linear Algebra and
+        its Applications 538 (2018): 187-211.
+
+    """
+    n, r = A.shape
+    r_min = r + dr_min
+    r_max = r + dr_max if dr_max is not None else n
+    r_max = min(r_max, n)
+
+    if r_min < r or r_min > r_max or r_max > n:
+        raise ValueError('Invalid minimum/maximum number of added rows')
+
+    I0, B = maxvol(A, e0, k0)
+
+    I = np.hstack([I0, np.zeros(r_max-r, dtype=I0.dtype)])
+    S = np.ones(n, dtype=int)
+    S[I0] = 0
+    F = S * np.linalg.norm(B, axis=1)**2
+
+    for k in range(r, r_max):
+        i = np.argmax(F)
+
+        if k >= r_min and F[i] <= e*e:
+            break
+
+        I[k] = i
+        S[i] = 0
+
+        v = B.dot(B[i])
+        l = 1. / (1 + v[i])
+        B = np.hstack([B - l * np.outer(v, B[i]), l * v.reshape(-1, 1)])
+        F = S * (F - l * v * v)
+
+    I = I[:B.shape[1]]
+    B[I] = np.eye(B.shape[1], dtype=B.dtype)
+
+    return I, B
+
+File Path: ttopt/ttopt.py
+Content:
+import numpy as np
+from time import perf_counter as tpc
+
+
+from .ttopt_raw import ttopt
+from .ttopt_raw import ttopt_find
+
+
+class TTOpt():
+    """Multidimensional optimizer based on the cross-maximum-volume principle.
+
+    Class for computation of the minimum or maximum for the implicitly given
+    d-dimensional array (tensor) or a function of d-dimensional argument. An
+    adaptive method based on the tensor train (TT) approximation and the
+    cross-maximum volume principle is used. Cache of requested values (its
+    usage leads to faster computation if one point is computed for a long time)
+    and QTT-based representation of the grid (its usage in many cases leads to
+    more accurate results) are supported.
+
+    Args:
+        f (function): the function of interest. Its argument X should represent
+            several spatial points for calculation (is 2D numpy array of the
+            shape [samples, d]) if "is_vect" flag is True, and it is one
+            spatial point for calculation (is 1D numpy array of the shape [d])
+            in the case if "is_vect" flag is False. For the case of the tensor
+            approximation (if "is_func" flag is False), the argument X relates
+            to the one or many (depending on the value of the flag "is_vect")
+            multi-indices of the corresponding array/tensor. Function should
+            return the values in the requested points (is 1D numpy array of the
+            shape [samples] of float or only one float value depending on the
+            value of "is_vect" flag). If "with_opt" flag is True, then function
+            should also return the second argument (is 1D numpy array of the
+            shape [samples] of any or just one value depending on the "is_vect"
+            flag) which is the auxiliary quantity corresponding to the
+            requested points (it is used for debugging and in specific parallel
+            calculations; the value of this auxiliary quantity related to the
+            "argmin / argmax" point will be passed to "callback" function).
+        d (int): number of function dimensions.
+        a (float or list of len d of float): grid lower bounds for every
+            dimension. If a number is given, then this value will be used for
+            each dimension.
+        b (float or list of len d of float): grid upper bounds for every
+            dimension. If a number is given, then this value will be used for
+            each dimension.
+        n (int or list of len d of int): number of grid points for every
+            dimension. If a number is given, then this value will be used for
+            each dimension. If this parameter is not specified, then instead of
+            it the values for both "p" and "q" should be set.
+        p (int): the grid size factor (if is given, then there will be n=p^q
+            points for each dimension). This parameter can be specified instead
+            of "n". If this parameter is specified, then the parameter "q" must
+            also be specified, and in this case the QTT-based approach will be
+            used.
+        q (int): the grid size factor (if is given, then there will be n=p^q
+            points for each dimension). This parameter can be specified instead
+            of "n". If this parameter is specified, then the parameter "p" must
+            also be specified, and in this case the QTT-based approach will be
+            used.
+        evals (int or float): the number of requests to the target function
+            that will be made.
+        name (str): optional display name for the function of interest. It is
+            the empty string by default.
+        callback (function): optional function that will be called after each
+            optimization step (in Func.comp_opt) with related info (it is used
+            for debugging and in specific parallel calculations).
+        x_opt_real (list of len d): optional real value of x-minimum or maximum
+            (x). If this value is specified, then it will be used to display the
+            current approximation error within the algorithm iterations (this
+            is convenient for debugging and testing/research).
+        y_opt_real (float): optional real value of y-optima (y=f(x)). If
+            this value is specified, then it will be used to display the
+            current approximation error within the algorithm iterations (this
+            is convenient for debugging and testing/research).
+        is_func (bool): if flag is True, then we optimize the function (the
+            arguments of f correspond to continuous spatial points), otherwise
+            we approximate the tensor (the arguments of f correspond to
+            discrete multidimensional tensor multi-indices). It is True by
+            default.
+        is_vect (bool): if flag is True, then function should accept 2D
+            numpy array of the shape [samples, d] (batch of points or indices)
+            and return 1D numpy array of the shape [samples]. Otherwise, the
+            function should accept 1D numpy array (one multidimensional point)
+            and return the float value. It is True by default.
+        with_cache (bool): if flag is True, then all requested values are
+            stored and retrieved from the storage upon repeated requests.
+            Note that this leads to faster computation if one point is
+            computed for a long time. On the other hand, this can in some
+            cases slow down the process, due to the additional time spent
+            on checking the storage and using unvectorized slow loops in
+            python. It is False by default.
+        with_log (bool): if flag is True, then text messages will be
+            displayed during the optimizer query process. It is False by
+            default.
+        with_opt (bool): if flag is True, then function of interest returns
+            opts related to output y (scalar or vector) as second argument
+            (it will be also saved and passed to "callback" function). It is
+            False by default.
+        with_full_info (bool): if flag is True, then the full information will
+            be saved, including multi-indices of requested points (it is used
+            by animation function) and best found multi-indices and points.
+            Note that the inclusion of this flag can significantly slow down
+            the process of the algorithm. It is False by default.
+        with_wrn (bool): if flag is True, then warning messages will be
+            presented (in the current version, it can only be messages about
+            early convergence when using the cache). It is True by default.
+
+    Note:
+        Call "calc" to evaluate function for one tensor multi-index and call
+        "comp" to evaluate function in the set of multi-indices (both of these
+        functions can be called regardless of the value of the flag "is_vect").
+        Call "minimize" / "maximize" to find the global minimum / maximum of
+        the function of interest by the TTOpt-algorithm.
+
+    """
+
+    def __init__(self, f, d, a=None, b=None, n=None, p=None, q=None,
+                 evals=None, name=None, callback=None, x_opt_real=None,
+                 y_opt_real=None, is_func=True, is_vect=True, with_cache=False,
+                 with_log=False, with_opt=False, with_full_info=False,
+                 with_wrn=True):
+        # Set the target function and its dimension:
+        self.f = f
+        self.d = int(d)
+
+        # Set grid lower bound:
+        if isinstance(a, (int, float)):
+            self.a = np.ones(self.d, dtype=float) * a
+        elif a is not None:
+            self.a = np.asanyarray(a, dtype=float)
+        else:
+            if is_func:
+                raise ValueError('Grid lower bound (a) should be set')
+            self.a = None
+        if self.a is not None and self.a.size != self.d:
+            raise ValueError('Grid lower bound (a) has invalid shape')
+
+        # Set grid upper bound:
+        if isinstance(b, (int, float)):
+            self.b = np.ones(self.d, dtype=float) * b
+        elif b is not None:
+            self.b = np.asanyarray(b, dtype=float)
+        else:
+            if is_func:
+                raise ValueError('Grid upper bound (b) should be set')
+            self.b = None
+        if self.b is not None and self.b.size != self.d:
+            raise ValueError('Grid upper bound (b) has invalid shape')
+
+        # Set number of grid points:
+        if n is None:
+            if p is None or q is None:
+                raise ValueError('If n is not set, then p and q should be set')
+            self.p = int(p)
+            self.q = int(q)
+            self.n = np.ones(self.d * self.q, dtype=int) * self.p
+            self.n_func = np.ones(self.d, dtype=int) * (self.p**self.q)
+        else:
+            if p is not None or q is not None:
+                raise ValueError('If n is set, then p and q should be None')
+            self.p = None
+            self.q = None
+            if isinstance(n, (int, float)):
+                self.n = np.ones(self.d, dtype=int) * int(n)
+            else:
+                self.n = np.asanyarray(n, dtype=int)
+            self.n_func = self.n.copy()
+        if self.n_func.size != self.d:
+            raise ValueError('Grid size (n/p/q) has invalid shape')
+
+        # Set other options according to the input arguments:
+        self.evals = int(evals) if evals else None
+        self.name = name or ''
+        self.callback = callback
+        self.x_opt_real = x_opt_real
+        self.y_opt_real = y_opt_real
+        self.is_func = bool(is_func)
+        self.is_vect = bool(is_vect)
+        self.with_cache = bool(with_cache)
+        self.with_log = bool(with_log)
+        self.with_opt = bool(with_opt)
+        self.with_full_info = bool(with_full_info)
+        self.with_wrn = bool(with_wrn)
+
+        # Inner variables:
+        self.cache = {}     # Cache for the results of requests to function
+        self.cache_opt = {} # Cache for the options while requests to function
+        self.k_cache = 0    # Number of requests, then cache was used
+        self.k_cache_curr = 0
+        self.k_evals = 0    # Number of requests, then function was called
+        self.k_evals_curr = 0
+        self.t_evals = 0.   # Total time of function calls
+        self.t_total = 0.   # Total time of computations (including cache usage)
+        self.t_minim = 0    # Total time of work for minimizator
+        self._opt = None    # Function opts related to its output
+
+        # Current optimum:
+        self.i_opt = None
+        self.x_opt = None
+
+        # Approximations for argopt/opt/opts of the function while iterations:
+        self.I_list = []
+        self.i_opt_list = []
+        self.x_opt_list = []
+        self.y_opt_list = []
+        self.opt_opt_list = []
+        self.evals_opt_list = []
+        self.cache_opt_list = []
+
+    @property
+    def e_x(self):
+        """Current error for approximation of arg-opt of the function."""
+        if self.x_opt_real is not None and self.x_opt is not None:
+            return np.linalg.norm(self.x_opt - self.x_opt_real)
+
+    @property
+    def e_y(self):
+        """Current error for approximation of the optimum of the function."""
+        if self.y_opt_real is not None and self.y_opt is not None:
+            return np.abs(self.y_opt - self.y_opt_real)
+
+    @property
+    def k_total(self):
+        """Total number of requests (both function calls and cache usage)."""
+        return self.k_cache + self.k_evals
+
+    @property
+    def opt_opt(self):
+        """Current value of option of the function related to opt-point."""
+        return self.opt_opt_list[-1] if len(self.opt_opt_list) else None
+
+    @property
+    def t_evals_mean(self):
+        """Average time spent to real function call for 1 point."""
+        return self.t_evals / self.k_evals if self.k_evals else 0.
+
+    @property
+    def t_total_mean(self):
+        """Average time spent to return one function value."""
+        return self.t_total / self.k_total if self.k_total else 0.
+
+    @property
+    def y_opt(self):
+        """Current approximation of optimum of the function of interest."""
+        return self.y_opt_list[-1] if len(self.y_opt_list) else None
+
+    def calc(self, i):
+        """Calculate the function for the given multiindex.
+
+        Args:
+            i (np.ndarray): the input for the function, that is 1D numpy array
+                of the shape [d] of int (indices).
+
+        Returns:
+            float: the output of the function.
+
+        """
+        self.k_cache_curr = 0
+
+        if self.is_vect:
+            return self.comp(i.reshape(1, -1))[0]
+
+        t_total = tpc()
+
+        if not self.with_cache:
+            y = self._eval(i)
+            self.t_total += tpc() - t_total
+            return y
+
+        s = self.i2s(i.astype(int).tolist())
+
+        if not s in self.cache:
+            y = self._eval(i)
+            if y is None:
+                return y
+            self.cache[s] = y
+            self.cache_opt[s] = self._opt
+        else:
+            y = self.cache[s]
+            self._opt = self.cache_opt[s]
+            self.k_cache_curr = 1
+            self.k_cache += self.k_cache_curr
+
+        self.t_total += tpc() - t_total
+
+        return y
+
+    def comp(self, I):
+        """Compute the function for the set of multi-indices (samples).
+
+        Args:
+            I (np.ndarray): the inputs for the function, that are collected in
+                2D numpy array of the shape [samples, d] of int (indices).
+
+        Returns:
+            np.ndarray: the outputs of the function, that are collected in
+            1D numpy array of the shape [samples].
+
+        Note:
+            The set of points (I) should not contain duplicate points. If it
+            contains duplicate points (that are not in the cache), then each of
+            them will be recalculated without using the cache.
+
+        """
+        self.k_cache_curr = 0
+
+        if not self.is_vect:
+            Y, _opt = [], []
+            for i in I:
+                y = self.calc(i)
+                if y is None:
+                    return None
+                Y.append(y)
+                _opt.append(self._opt)
+            self._opt = _opt
+            return np.array(Y)
+
+        t_total = tpc()
+
+        if not self.with_cache:
+            Y = self._eval(I)
+            self.t_total += tpc() - t_total
+            return Y
+
+        # Requested points:
+        I = I.tolist()
+
+        # Points that are not presented in the cache:
+        J = [i for i in I if self.i2s(i) not in self.cache]
+        self.k_cache_curr = len(I) - len(J)
+        self.k_cache += self.k_cache_curr
+
+        # We add new points (J) to the storage:
+        if len(J):
+            Z = self._eval(J)
+            if Z is None:
+                return None
+            for k, j in enumerate(J):
+                s = self.i2s(j)
+                self.cache[s] = Z[k]
+                self.cache_opt[s] = self._opt[k]
+
+        # We obtain the values for requested points from the updated storage:
+        Y = np.array([self.cache[self.i2s(i)] for i in I])
+        self._opt = np.array([self.cache_opt[self.i2s(i)] for i in I])
+
+        self.t_total += tpc() - t_total
+
+        return Y
+
+    def comp_opt(self, I, i_opt=None, y_opt=None, opt_opt=None):
+        """Compute the function for the set of points and save current optimum.
+
+        This helper function (this is wrapper for function "comp") can be
+        passed to the optimizer. When making requests, the optimizer must pass
+        the grid points of interest (I) as arguments, as well as the current
+        approximation of the argmin / argmax (i_opt), the corresponding value
+        (y_opt) and related option value (opt_opt).
+
+        """
+        # We return None if the limit for function requests is exceeded:
+        if self.evals is not None and self.k_evals >= self.evals:
+            return None, None
+
+        # We return None if the number of requests to the cache is 2 times
+        # higher than the number of requests to the function:
+        if self.with_cache:
+            if self.k_cache >= self.evals and self.k_cache >= 2 * self.k_evals:
+                text = '!!! TTOpt warning : '
+                text += 'the number of requests to the cache is 2 times higher '
+                text += 'than the number of requests to the function. '
+                text += 'The work is finished before max func-evals reached.'
+                if self.with_wrn:
+                    print(text)
+                return None, None
+
+        # We truncate the list of requested points if it exceeds the limit:
+        eval_curr = I.shape[0]
+        is_last = self.evals is not None and self.k_evals+eval_curr>=self.evals
+        if is_last:
+            I = I[:(self.evals-self.k_evals), :]
+
+        if self.q:
+            # The QTT is used, hence we should transform the indices:
+            if I is not None:
+                I = self.qtt_parse_many(I)
+            if i_opt is not None:
+                i_opt = self.qtt_parse_many(i_opt.reshape(1, -1))[0, :]
+
+        Y = self.comp(I)
+
+        # If this is last iteration, we should "manually" check for y_opt_new:
+        if is_last:
+            i_opt, y_opt, opt_opt = ttopt_find(
+                I, Y, self._opt, i_opt, y_opt, opt_opt, self.is_max)
+
+        if i_opt is None:
+            return Y, self._opt
+
+        if self.is_func:
+            x_opt = self.i2x(i_opt)
+        else:
+            x_opt = i_opt.copy()
+
+        self.i_opt = i_opt.copy()
+        self.x_opt = x_opt.copy()
+
+        self.y_opt_list.append(y_opt)
+        self.opt_opt_list.append(opt_opt)
+        self.evals_opt_list.append(self.k_evals_curr)
+        self.cache_opt_list.append(self.k_cache_curr)
+
+        if self.with_full_info:
+            self.I_list.append(I)
+            self.i_opt_list.append(self.i_opt.copy())
+            self.x_opt_list.append(self.x_opt.copy())
+
+        if self.is_max:
+            is_better = len(self.y_opt_list)==1 or (y_opt > self.y_opt_list[-2])
+        else:
+            is_better = len(self.y_opt_list)==1 or (y_opt < self.y_opt_list[-2])
+
+        if self.callback and is_better:
+            last = {'last': [x_opt, y_opt, i_opt, opt_opt, self.k_evals]}
+            self.callback(last)
+
+        if self.with_log:
+            print(self.info(is_final=False))
+
+        return Y, self._opt
+
+    def i2s(self, i):
+        """Transform array of int like [1, 2, 3] into string like '1-2-3'."""
+        return '-'.join([str(v) for v in i])
+
+    def i2x(self, i):
+        """Transform multiindex into point of the uniform grid."""
+        t = i * 1. / (self.n_func - 1)
+        x = t * (self.b - self.a) + self.a
+        return x
+
+    def i2x_many(self, I):
+        """Transform multiindices (samples) into grid points."""
+        A = np.repeat(self.a.reshape((1, -1)), I.shape[0], axis=0)
+        B = np.repeat(self.b.reshape((1, -1)), I.shape[0], axis=0)
+        N = np.repeat(self.n_func.reshape((1, -1)), I.shape[0], axis=0)
+        T = I * 1. / (N - 1)
+        X = T * (B - A) + A
+        return X
+
+    def info(self, with_e_x=True, with_e_y=True, is_final=True):
+        """Return text description of the progress of optimizer work."""
+        text = ''
+
+        if self.name:
+            name = self.name + f'-{self.d}d'
+            name += ' ' * max(0, 10 - len(name))
+            text += name + ' | '
+
+        if self.with_cache:
+            text += f'evals={self.k_evals:-8.2e}+{self.k_cache:-8.2e} | '
+        else:
+            text += f'evals={self.k_total:-8.2e} | '
+
+        if is_final:
+            text += f't_all={self.t_minim:-8.2e} | '
+        else:
+            text += f't_cur={self.t_total:-8.2e} | '
+
+        if self.y_opt_real is None and self.y_opt is not None:
+            text += f'y={self.y_opt:-13.6e} '
+        else:
+            if with_e_x and self.e_x is not None:
+                text += f'e_x={self.e_x:-8.2e} '
+            if with_e_y and self.e_y is not None:
+                text += f'e_y={self.e_y:-8.2e} '
+
+        return text
+
+    def optimize(self, rank=4, Y0=None, seed=42, fs_opt=1., is_max=False,
+                 add_opt_inner=True, add_opt_outer=False, add_opt_rect=False,
+                 add_rnd_inner=False, add_rnd_outer=False, J0=None):
+        """Perform the function optimization process by TT-based approach.
+
+        Args:
+            rank (int): maximum TT-rank.
+            Y0 (list of 3D np.ndarrays of float): optional initial tensor in
+                the TT format as a list of the TT-cores.
+            seed (int): random seed for the algorithm initialization. It is
+                used only if Y0 and J0 are not set.
+            fs_opt (float): the parameter of the smoothing function. If it is
+                None, then "arctan" function will be used. Otherwise, the
+                function "exp(-1 * fs_opt * (p - p0))" will be used.
+            is_max (bool): if flag is True, then maximization will be performed.
+
+        """
+        t_minim = tpc()
+        self.is_max = is_max
+
+        i_opt, y_opt = ttopt(self.comp_opt, self.n, rank, None, Y0, seed,
+                fs_opt, add_opt_inner, add_opt_outer, add_opt_rect,
+                add_rnd_inner, add_rnd_outer, J0, is_max)
+
+        self.t_minim = tpc() - t_minim
+
+    def qtt_parse_many(self, I_qtt):
+        """Transform tensor indices from QTT (long) to base (short) format."""
+        samples = I_qtt.shape[0]
+        n_qtt = [self.n[0]]*self.q
+        I = np.zeros((samples, self.d))
+        for i in range(self.d):
+            J_curr = I_qtt[:, self.q*i:self.q*(i+1)].T
+            I[:, i] = np.ravel_multi_index(J_curr, n_qtt, order='F')
+        return I
+
+    def s2i(self, s):
+        """Transforms string like '1-2-3' into array of int like [1, 2, 3]."""
+        return np.array([int(v) for v in s.split('-')], dtype=int)
+
+    def _eval(self, i):
+        """Helper that computes target function in one or many points."""
+        t_evals = tpc()
+
+        i = np.asanyarray(i, dtype=int)
+        is_many = len(i.shape) == 2
+
+        if self.is_func:
+            x = self.i2x_many(i) if is_many else self.i2x(i)
+        else:
+            x = i
+
+        if self.with_opt:
+            y, self._opt = self.f(x)
+            if y is None:
+                return None
+        else:
+            y = self.f(x)
+            if y is None:
+                return None
+            self._opt = [None for _ in range(y.size)] if is_many else None
+
+        self.k_evals_curr = y.size if is_many else 1
+        self.k_evals += self.k_evals_curr
+        self.t_evals += tpc() - t_evals
+
+        return y
+
+File Path: ttopt/ttopt_raw.py
+Content:
+"""Multidimensional opotimizer based on the cross-maximum-volume principle.
+
+This module contains the main function "ttopt" that finds the approximate
+minimum or maximum of the given multidimensional array (tensor), which can
+represent a discretized multivariable function.
+
+Note:
+    For the task of finding the extremum of a function of many variables or
+    multidimensional array, a wrapper class "TTOpt" (from "ttopt.py") could be
+    used. It provides a set of methods for discretizing the function, caching
+    previously requested values and logging intermediate results. In this case,
+    a wrapper "TTOpt.comp_opt" should be passed to the function "ttopt" as its
+    first argument (the methods "TTOpt.minimize" and "TTOpt.maximize" provide
+    the related interface).
+
+"""
+import numpy as np
+
+
+from .maxvol import maxvol
+from .maxvol import maxvol_rect
+
+
+def ttopt(f, n, rank=4, evals=None, Y0=None, seed=42, fs_opt=1.,
+          add_opt_inner=True, add_opt_outer=False, add_opt_rect=False,
+          add_rnd_inner=False, add_rnd_outer=False, J0=None, is_max=False):
+    """Find the optimum element of the implicitly given multidimensional array.
+
+    This function computes the minimum or maximum of the implicitly given
+    d-dimensional (d >= 2) array (tensor). The adaptive method based on the
+    TT-approximation and the cross-maximum-volume principle are used.
+
+    Args:
+        f (function): the function that returns tensor values for the given set
+            of the indices. Its arguments are (I, i_opt, y_opt, opt_opt), where
+            "I" represents several multi-indices (samples) for calculation (it
+            is 2D np.ndarray of the shape [samples, dimensions]), "i_opt"
+            represents the current multi-index of the argmin/argmax
+            approximation (it is 1D np.ndarray of the shape [dimensions]; note
+            that while the first call it will be None), "y_opt" represents the
+            current approximated minimum/maximum of the tensor (it is float;
+            note that while the first call it will be None) and "opt_opt" is
+            the value of the auxiliary quantity corresponding to the multi-
+            index "i_opt" (it is used for debugging and in specific parallel
+            calculations). The output of the function should be the
+            corresponding values in the given indices (1D np.ndarray of the
+            shape [samples]) and related values of the auxiliary quantities at
+            the requested points (1D np.ndarray of the shape [samples] of any).
+            If the function returns None instead of the tensor values, then the
+            algorithm will be interrupted and the current approximation will be
+            returned.
+        n (list of len d of int): number of grid points for every dimension
+            (i.e., the shape of the tensor). Note that the tensor must have a
+            dimension of at least 2.
+        rank (int): maximum used rank for unfolding matrices.
+        evals (int or float): number of available calls to function (i.e.,
+            computational budget). If it is None, then the algorithm will run
+            until the target function returns a None instead of the y-value.
+        Y0 (list of 3D np.ndarrays): optional initial tensor in the TT-format
+            (it should be represented as a list of the TT-cores). If it is not
+            specified, then a random TT-tensor with TT-rank "rank" will be used.
+        seed (int): random seed for the algorithm initialization. It is used
+            only if Y0 and J0 are not set.
+        fs_opt (float): the parameter of the smoothing function. If it is None,
+            then "arctan" function will be used. Otherwise, the function
+            "exp(-1 * fs_opt * (p - p0))" will be used.
+
+    Returns:
+        [np.ndarray, float]: the multi-index that gives the optimum value of the
+        tensor (it is 1D np.ndarray of length "d" of int; i.e., "i_opt") and
+        the optimum value of the tensor (it is float; i.e., "y_opt") that
+        corresponds to the multi-index "i_opt".
+
+    """
+    # Number of dimensions:
+    d = len(n)
+
+    # Number of possible function calls:
+    evals = int(evals) if evals else None
+
+    # Grid:
+    Jg_list = [np.reshape(np.arange(k), (-1, 1)) for k in n]
+
+    # Prepare initial multi-indices for all unfolding matrices:
+    if J0 is None:
+        Y0, r = ttopt_init(n, rank, Y0, seed, with_rank=True)
+        J_list = [None] * (d + 1)
+        for i in range(d - 1):
+            J_list[i+1] = _iter(Y0[i], J_list[i], Jg_list[i], l2r=True)
+    else:
+        J_list = J0
+        r = [1] + [J.shape[0] for J in J_list[1:-1]] + [1]
+        for i in range(1, d):
+            r[i] = min(rank, n[i-1] * r[i-1])
+
+    i_opt = None         # Approximation of argmin /argmax for tensor
+    y_opt = None         # Approximation of optimum for tensor (float('inf'))
+    opt_opt = None       # Additional option related to i_opt
+
+    eval = 0             # Number of performed calls to function
+    iter = 0             # Iteration (sweep) number
+    i = d - 1            # Index of the current core (0, 1, ..., d-1)
+    l2r = False          # Core traversal direction (left <-> right)
+
+    while True:
+        # We select multi-indices [samples, d], which will requested from func:
+        I = _merge(J_list[i], J_list[i+1], Jg_list[i])
+
+        # We check if the maximum number of requests has been exceeded:
+        eval_curr = I.shape[0]
+        if evals is not None and eval + eval_curr > evals:
+            I = I[:(evals-eval), :]
+
+        # We compute the function of interest "f" in the sample points I:
+        y, opt = f(I, i_opt, y_opt, opt_opt)
+
+        # Function "f" can return None to interrupt the algorithm execution:
+        if y is None:
+            return i_opt, y_opt
+
+        # We find and check the optimum value on a set of sampled points:
+        i_opt, y_opt, opt_opt = ttopt_find(I, y, opt, i_opt, y_opt, opt_opt,
+            is_max)
+
+        # If the max number of requests exceeded, we interrupt the algorithm:
+        eval += y.size
+        if evals is not None and eval >= evals:
+            return i_opt, y_opt
+
+        # If computed points less then requested, we interrupt the algorithm:
+        if y.shape[0] < I.shape[0]:
+            return i_opt, y_opt
+
+        # We transform sampled points into "core tensor" and smooth it out:
+        Z = _reshape(y, (r[i], n[i], r[i + 1]))
+        if not is_max:
+            Z = ttopt_fs(Z, y_opt, fs_opt)
+
+        # We perform iteration:
+        if l2r and i < d - 1:
+            J_list[i+1] = _iter(Z, J_list[i], Jg_list[i], l2r,
+                add_opt_inner, add_opt_rect, add_rnd_inner)
+            if add_opt_outer:
+                J_list[i+1] = _add_row(J_list[i+1], i_opt[:(i+1)])
+            if add_rnd_outer:
+                J_list[i+1] = _add_random(J_list[i+1], n[:(i+1)])
+            r[i+1] = J_list[i+1].shape[0]
+        if not l2r and i > 0:
+            J_list[i] = _iter(Z, J_list[i+1], Jg_list[i], l2r,
+                add_opt_inner, add_opt_rect, add_rnd_inner)
+            if add_opt_outer:
+                J_list[i] = _add_row(J_list[i], i_opt[i:])
+            if add_rnd_outer:
+                J_list[i] = _add_random(J_list[i], n[i:])
+            r[i] = J_list[i].shape[0]
+
+        # We update the current core index:
+        i, iter, l2r = _update_iter(d, i, iter, l2r)
+    return i_opt, y_opt
+
+
+def ttopt_find(I, y, opt, i_opt, y_opt, opt_opt, is_max=False):
+    """Find the minimum or maximum value on a set of sampled points."""
+    if is_max:
+        ind = np.argmax(y)
+    else:
+        ind = np.argmin(y)
+    y_opt_curr = y[ind]
+
+    if is_max and y_opt is not None and y_opt_curr <= y_opt:
+        return i_opt, y_opt, opt_opt
+
+    if not is_max and y_opt is not None and y_opt_curr >= y_opt:
+        return i_opt, y_opt, opt_opt
+
+    return I[ind, :], y_opt_curr, opt[ind]
+
+
+def ttopt_fs(y, y0=0., opt=1.):
+    """Smooth function that transforms max to min."""
+    if opt is None or opt == 0:
+        return np.pi/2 - np.arctan(y - y0)
+    else:
+        return np.exp(opt * (y0 - y))
+
+
+def ttopt_init(n, rank, Y0=None, seed=42, with_rank=False):
+    """Build initial approximation for the main algorithm."""
+    d = len(n)
+
+    r = [1]
+    for i in range(1, d):
+        r.append(min(rank, n[i-1] * r[i-1]))
+    r.append(1)
+
+    rng = np.random.default_rng(seed)
+
+    if Y0 is None:
+        Y0 = [rng.normal(size=(r[i], n[i], r[i + 1])) for i in range(d)]
+
+    if with_rank:
+        return Y0, r
+    else:
+        return Y0
+
+
+def _add_random(J, n):
+    i_rnd = [np.random.choice(k) for k in n]
+    i_rnd = np.array(i_rnd, dtype=int)
+    J_new = np.vstack((J, i_rnd.reshape(1, -1)))
+    return J_new
+
+
+def _add_row(J, i_new):
+    J_new = np.vstack((J, i_new.reshape(1, -1)))
+    return J_new
+
+
+def _iter(Z, J, Jg, l2r=True, add_opt_inner=True, add_opt_rect=False,
+          add_rnd_inner=False):
+    r1, n, r2 = Z.shape
+
+    Z = _reshape(Z, (r1 * n, r2)) if l2r else _reshape(Z, (r1, n * r2)).T
+
+    Q, R = np.linalg.qr(Z)
+
+    ind = _maxvol(Q, is_rect=add_opt_rect)
+
+    if add_opt_inner:
+        i_max, j_max = np.divmod(np.abs(Z).argmax(), Z.shape[1])
+        if not i_max in ind:
+            ind[-1] = i_max
+
+    if add_rnd_inner and len(ind) > 1:
+        i_rnd = np.random.choice(Z.shape[0])
+        if not i_rnd in ind:
+            ind[-2] = i_rnd
+
+    J_new = _stack(J, Jg, l2r)
+    J_new = J_new[ind, :]
+
+    return J_new
+
+
+def _maxvol(A, tol=1.001, max_iters=1000, is_rect=False):
+    n, r = A.shape
+    if n <= r:
+        return np.arange(n, dtype=int)
+
+    if is_rect:
+        return maxvol_rect(A, e=1., dr_min=1, dr_max=2)[0]
+    else:
+        return maxvol(A, e=tol, k=max_iters)[0]
+
+
+def _merge(J1, J2, Jg):
+    r1 = J1.shape[0] if J1 is not None else 1
+    r2 = J2.shape[0] if J2 is not None else 1
+    n = Jg.shape[0]
+
+    I = np.kron(np.kron(_ones(r2), Jg), _ones(r1))
+
+    if J1 is not None:
+        J1_ = np.kron(_ones(n * r2), J1)
+        I = np.hstack((J1_, I))
+
+    if J2 is not None:
+        J2_ = np.kron(J2, _ones(r1 * n))
+        I = np.hstack((I, J2_))
+
+    return I
+
+
+def _ones(k, m=1):
+    return np.ones((k, m), dtype=int)
+
+
+def _reshape(A, n):
+    return np.reshape(A, n, order='F')
+
+
+def _stack(J, Jg, l2r=True):
+    r = J.shape[0] if J is not None else 1
+    n = Jg.shape[0]
+
+    J_new = np.kron(Jg, _ones(r)) if l2r else np.kron(_ones(r), Jg)
+
+    if J is not None:
+        J_old = np.kron(_ones(n), J) if l2r else np.kron(J, _ones(n))
+        J_new = np.hstack((J_old, J_new)) if l2r else np.hstack((J_new, J_old))
+
+    return J_new
+
+
+def _update_iter(d, i, iter, l2r):
+    i += 1 if l2r else -1
+
+    if i == -1 or i == d:
+        iter += 1
+        l2r = not l2r
+        i += 1 if l2r else -1
+
+    return i, iter, l2r
+
+Output:
+{
+    "experimental_code": "class TTOpt():    def __init__(self, f, d, a=None, b=None, n=None, p=None, q=None,                 evals=None, name=None, callback=None, x_opt_real=None,                 y_opt_real=None, is_func=True, is_vect=True, with_cache=False,                 with_log=False, with_opt=False, with_full_info=False,                 with_wrn=True):        self.f = f        self.d = int(d)        if isinstance(a, (int, float)):            self.a = np.ones(self.d, dtype=float) * a        elif a is not None:            self.a = np.asanyarray(a, dtype=float)        else:            if is_func:                raise ValueError('Grid lower bound (a) should be set')            self.a = None        if self.a is not None and self.a.size != self.d:            raise ValueError('Grid lower bound (a) has invalid shape')        if isinstance(b, (int, float)):            self.b = np.ones(self.d, dtype=float) * b        elif b is not None:            self.b = np.asanyarray(b, dtype=float)        else:            if is_func:                raise ValueError('Grid upper bound (b) should be set')            self.b = None        if self.b is not None and self.b.size != self.d:            raise ValueError('Grid upper bound (b) has invalid shape')        if n is None:            if p is None or q is None:                raise ValueError('If n is not set, then p and q should be set')            self.p = int(p)            self.q = int(q)            self.n = np.ones(self.d * self.q, dtype=int) * self.p            self.n_func = np.ones(self.d, dtype=int) * (self.p**self.q)        else:            if p is not None or q is not None:                raise ValueError('If n is set, then p and q should be None')            self.p = None            self.q = None            if isinstance(n, (int, float)):                self.n = np.ones(self.d, dtype=int) * int(n)            else:                self.n = np.asanyarray(n, dtype=int)            self.n_func = self.n.copy()        if self.n_func.size != self.d:            raise ValueError('Grid size (n/p/q) has invalid shape')        self.evals = int(evals) if evals else None        self.name = name or ''        self.callback = callback        self.x_opt_real = x_opt_real        self.y_opt_real = y_opt_real        self.is_func = bool(is_func)        self.is_vect = bool(is_vect)        self.with_cache = bool(with_cache)        self.with_log = bool(with_log)        self.with_opt = bool(with_opt)        self.with_full_info = bool(with_full_info)        self.with_wrn = bool(with_wrn)        self.cache = {}        self.cache_opt = {}        self.k_cache = 0        self.k_cache_curr = 0        self.k_evals = 0        self.k_evals_curr = 0        self.t_evals = 0.        self.t_total = 0.        self.t_minim = 0        self._opt = None        self.i_opt = None        self.x_opt = None        self.I_list = []        self.i_opt_list = []        self.x_opt_list = []        self.y_opt_list = []        self.opt_opt_list = []        self.evals_opt_list = []        self.cache_opt_list = []    def qtt_parse_many(self, I_qtt):        samples = I_qtt.shape[0]        n_qtt = [self.n[0]]*self.q        I = np.zeros((samples, self.d))        for i in range(self.d):            J_curr = I_qtt[:, self.q*i:self.q*(i+1)].T            I[:, i] = np.ravel_multi_index(J_curr, n_qtt, order='F')        return I    def i2x(self, i):        t = i * 1. / (self.n_func - 1)        x = t * (self.b - self.a) + self.a        return x    def i2x_many(self, I):        A = np.repeat(self.a.reshape((1, -1)), I.shape[0], axis=0)        B = np.repeat(self.b.reshape((1, -1)), I.shape[0], axis=0)        N = np.repeat(self.n_func.reshape((1, -1)), I.shape[0], axis=0)        T = I * 1. / (N - 1)        X = T * (B - A) + A        return X    def optimize(self, rank=4, Y0=None, seed=42, fs_opt=1., is_max=False,                 add_opt_inner=True, add_opt_outer=False, add_opt_rect=False,                 add_rnd_inner=False, add_rnd_outer=False, J0=None):        t_minim = tpc()        self.is_max = is_max        i_opt, y_opt = ttopt(self.comp_opt, self.n, rank, None, Y0, seed,                fs_opt, add_opt_inner, add_opt_outer, add_opt_rect,                add_rnd_inner, add_rnd_outer, J0, is_max)        self.t_minim = tpc() - t_minim    def comp_opt(self, I, i_opt=None, y_opt=None, opt_opt=None):        if self.evals is not None and self.k_evals >= self.evals:            return None, None        if self.with_cache:            if self.k_cache >= self.evals and self.k_cache >= 2 * self.k_evals:                text = '!!! TTOpt warning : '                text += 'the number of requests to the cache is 2 times higher '                text += 'than the number of requests to the function. '                text += 'The work is finished before max func-evals reached.'                if self.with_wrn:                    print(text)                return None, None        eval_curr = I.shape[0]        is_last = self.evals is not None and self.k_evals+eval_curr>=self.evals        if is_last:            I = I[:(self.evals-self.k_evals), :]        if self.q:            if I is not None:                I = self.qtt_parse_many(I)            if i_opt is not None:                i_opt = self.qtt_parse_many(i_opt.reshape(1, -1))[0, :]        Y = self.comp(I)        if is_last:            i_opt, y_opt, opt_opt = ttopt_find(                I, Y, self._opt, i_opt, y_opt, opt_opt, self.is_max)        if i_opt is None:            return Y, self._opt        if self.is_func:            x_opt = self.i2x(i_opt)        else:            x_opt = i_opt.copy()        self.i_opt = i_opt.copy()        self.x_opt = x_opt.copy()        self.y_opt_list.append(y_opt)        self.opt_opt_list.append(opt_opt)        self.evals_opt_list.append(self.k_evals_curr)        self.cache_opt_list.append(self.k_cache_curr)        if self.with_full_info:            self.I_list.append(I)            self.i_opt_list.append(self.i_opt.copy())            self.x_opt_list.append(self.x_opt.copy())        if self.is_max:            is_better = len(self.y_opt_list)==1 or (y_opt > self.y_opt_list[-2])        else:            is_better = len(self.y_opt_list)==1 or (y_opt < self.y_opt_list[-2])        if self.callback and is_better:            last = {'last': [x_opt, y_opt, i_opt, opt_opt, self.k_evals]}            self.callback(last)        if self.with_log:            print(self.info(is_final=False))        return Y, self._optdef ttopt(f, n, rank=4, evals=None, Y0=None, seed=42, fs_opt=1.,          add_opt_inner=True, add_opt_outer=False, add_opt_rect=False,          add_rnd_inner=False, add_rnd_outer=False, J0=None, is_max=False):    d = len(n)    evals = int(evals) if evals else None    Jg_list = [np.reshape(np.arange(k), (-1, 1)) for k in n]    if J0 is None:        Y0, r = ttopt_init(n, rank, Y0, seed, with_rank=True)        J_list = [None] * (d + 1)        for i in range(d - 1):            J_list[i+1] = _iter(Y0[i], J_list[i], Jg_list[i], l2r=True)    else:        J_list = J0        r = [1] + [J.shape[0] for J in J_list[1:-1]] + [1]        for i in range(1, d):            r[i] = min(rank, n[i-1] * r[i-1])    i_opt = None    y_opt = None    opt_opt = None    eval = 0    iter = 0    i = d - 1    l2r = False    while True:        I = _merge(J_list[i], J_list[i+1], Jg_list[i])        eval_curr = I.shape[0]        if evals is not None and eval + eval_curr > evals:            I = I[:(evals-eval), :]        y, opt = f(I, i_opt, y_opt, opt_opt)        if y is None:            return i_opt, y_opt        i_opt, y_opt, opt_opt = ttopt_find(I, y, opt, i_opt, y_opt, opt_opt,            is_max)        eval += y.size        if evals is not None and eval >= evals:            return i_opt, y_opt        if y.shape[0] < I.shape[0]:            return i_opt, y_opt        Z = _reshape(y, (r[i], n[i], r[i + 1]))        if not is_max:            Z = ttopt_fs(Z, y_opt, fs_opt)        if l2r and i < d - 1:            J_list[i+1] = _iter(Z, J_list[i], Jg_list[i], l2r,                add_opt_inner, add_opt_rect, add_rnd_inner)            if add_opt_outer:                J_list[i+1] = _add_row(J_list[i+1], i_opt[:(i+1)])            if add_rnd_outer:                J_list[i+1] = _add_random(J_list[i+1], n[:(i+1)])            r[i+1] = J_list[i+1].shape[0]        if not l2r and i > 0:            J_list[i] = _iter(Z, J_list[i+1], Jg_list[i], l2r,                add_opt_inner, add_opt_rect, add_rnd_inner)            if add_opt_outer:                J_list[i] = _add_row(J_list[i], i_opt[i:])            if add_rnd_outer:                J_list[i] = _add_random(J_list[i], n[i:])            r[i] = J_list[i].shape[0]        i, iter, l2r = _update_iter(d, i, iter, l2r)    return i_opt, y_optdef ttopt_find(I, y, opt, i_opt, y_opt, opt_opt, is_max=False):    if is_max:        ind = np.argmax(y)    else:        ind = np.argmin(y)    y_opt_curr = y[ind]    if is_max and y_opt is not None and y_opt_curr <= y_opt:        return i_opt, y_opt, opt_opt    if not is_max and y_opt is not None and y_opt_curr >= y_opt:        return i_opt, y_opt, opt_opt    return I[ind, :], y_opt_curr, opt[ind]def ttopt_fs(y, y0=0., opt=1.):    if opt is None or opt == 0:        return np.pi/2 - np.arctan(y - y0)    else:        return np.exp(opt * (y0 - y))def _iter(Z, J, Jg, l2r=True, add_opt_inner=True, add_opt_rect=False,          add_rnd_inner=False):    r1, n, r2 = Z.shape    Z = _reshape(Z, (r1 * n, r2)) if l2r else _reshape(Z, (r1, n * r2)).T    Q, R = np.linalg.qr(Z)    ind = _maxvol(Q, is_rect=add_opt_rect)    if add_opt_inner:        i_max, j_max = np.divmod(np.abs(Z).argmax(), Z.shape[1])        if not i_max in ind:            ind[-1] = i_max    if add_rnd_inner and len(ind) > 1:        i_rnd = np.random.choice(Z.shape[0])        if not i_rnd in ind:            ind[-2] = i_rnd    J_new = _stack(J, Jg, l2r)    J_new = J_new[ind, :]    return J_newdef _maxvol(A, tol=1.001, max_iters=1000, is_rect=False):    n, r = A.shape    if n <= r:        return np.arange(n, dtype=int)    if is_rect:        return maxvol_rect(A, e=1., dr_min=1, dr_max=2)[0]    else:        return maxvol(A, e=tol, k=max_iters)[0]def maxvol(A, e=1.05, k=100):    n, r = A.shape    if n <= r:        raise ValueError('Input matrix should be \"tall\"')    P, L, U = lu(A, check_finite=False)    I = P[:, :r].argmax(axis=0)    Q = solve_triangular(U, A.T, trans=1, check_finite=False)    B = solve_triangular(L[:r, :], Q, trans=1, check_finite=False,        unit_diagonal=True, lower=True).T    for _ in range(k):        i, j = np.divmod(np.abs(B).argmax(), r)        if np.abs(B[i, j]) <= e:            break        I[j] = i        bj = B[:, j]        bi = B[i, :].copy()        bi[j] -= 1.        B -= np.outer(bj, bi / B[i, j])    return I, Bdef maxvol_rect(A, e=1.1, dr_min=0, dr_max=None, e0=1.05, k0=10):    n, r = A.shape    r_min = r + dr_min    r_max = r + dr_max if dr_max is not None else n    r_max = min(r_max, n)    if r_min < r or r_min > r_max or r_max > n:        raise ValueError('Invalid minimum/maximum number of added rows')    I0, B = maxvol(A, e0, k0)    I = np.hstack([I0, np.zeros(r_max-r, dtype=I0.dtype)])    S = np.ones(n, dtype=int)    S[I0] = 0    F = S * np.linalg.norm(B, axis=1)**2    for k in range(r, r_max):        i = np.argmax(F)        if k >= r_min and F[i] <= e*e:            break        I[k] = i        S[i] = 0        v = B.dot(B[i])        l = 1. / (1 + v[i])        B = np.hstack([B - l * np.outer(v, B[i]), l * v.reshape(-1, 1)])        F = S * (F - l * v * v)    I = I[:B.shape[1]]    B[I] = np.eye(B.shape[1], dtype=B.dtype)    return I, B",
+    "experimental_info": "The TTOpt method's performance is investigated across various analytical benchmark functions and settings. The experiments cover the following aspects:  **Benchmark Functions:** - Ackley, Alpine, Brown, Exponential, Grienwank, Michalewicz, Qing, Rastrigin, Schaffer, Schwefel, Rosenbrock.  **Dimensionality (d):** - Evaluated for `d` values: 2, 10, 50, 100, 500.  **Grid Discretization:** - Direct TT-grid sizes (`n`): Tested with `n` ranging from `2^8` to `2^20`. - Quantized Tensor Train (QTT) grid settings: `p=2` (base 2) with `q` from 12 to 25; `p=4` (base 4) for `q` calculated as `np.log4(n)`.  **Maximum TT-Rank (r):** - Investigated ranks `r` from 1 to 10.  **Computational Budget (Function Evaluations):** - Total function calls (`evals` or `m`) ranging from `1.E+4` to `1.E+7`.  **Repetitions:** - Experiments are typically run for 1 to 10 repetitions (`reps`) to account for randomness.  **Optimization Strategies & Maxvol Enhancements:** - Smoothing function parameter (`fs_opt`): Tested with values `None`, `1000.`, `100.`, `10.`, `1.`, `0.1`, `0.01`. `None` uses `arctan`, other values use `exp` based smoothing. - Maxvol algorithm options (flags for adding points):    - `add_opt_inner`: Add optimal inner point.    - `add_opt_outer`: Add optimal outer point.    - `add_opt_rect`: Use `rect_maxvol` for adaptive rank selection.    - `add_rnd_inner`: Add random inner point.    - `add_rnd_outer`: Add random outer point.  **Comparisons with Other Optimizers:** - The method is compared against several non-TT optimizers including: GA (Genetic Algorithm), OpenES (OpenAI Evolution Strategies), CMAES (Covariance Matrix Adaptation Evolution Strategy), DE (Differential Evolution), NB (NoisyBandit), PSO (Particle Swarm Optimization), and gradient-based methods like BFGS, L-BFGS, CG, Newton-CG, Newton-Exact, Trust-Region NCG, Trust-Region Exact.  **Cache Usage:** - Experiments conducted both with and without caching (`with_cache=True/False`) to evaluate its impact.  **Initialization:** - Random TT-tensor initialization (default). - Specific initial multi-indices (`J0`) for tensor problems. - Random uniform `x0` (using `np.random.default_rng(12345)` or `torch.manual_seed(rep)`) for other optimizers.  **Objective:** - Both minimization (default) and maximization (`is_max=True`) tasks are performed.  **Logging and Visualization:** - Animation files (.gif) are generated to visualize the optimization process for 2D functions. - Detailed logs and plots (e.g., error vs. queries, error vs. rank, error vs. grid size) are generated to show results."
+}
