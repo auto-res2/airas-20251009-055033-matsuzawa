@@ -1,0 +1,1618 @@
+
+Input:
+You are a researcher with expertise in engineering in the field of machine learning.
+
+# Instructions
+- The content described in “Repository Content” corresponds to the GitHub repository of the method described in “Method.”
+- Please extract the following two pieces of information from “Repository Content”:
+    - experimental_code：Extract the implementation sections that are directly related to the method described in “Method.”
+    - experimental_info：Extract and output the experimental settings related to the method described in “Method.”
+
+# Method
+MOCA extends Bayesian Online Changepoint Detection (BOCPD) to conditional density estimation, using a base meta-learning algorithm as the underlying predictive model (UPM). It recursively maintains and updates a belief distribution over run lengths (time since the last changepoint) using Bayesian filtering rules. Upon observing new data (xt, yt), MOCA updates the belief based on the input likelihood pθ(xt|ηt−1[rt]) and the conditional predictive likelihood pθ(yt|xt,ηt−1[rt]). The run length belief is then propagated forward in time, assuming a fixed hazard rate for task switches. The entire process is differentiable, allowing backpropagation to optimize the parameters of the base meta-learning algorithm. MOCA was instantiated and evaluated with an LSTM-based meta-learner, ALPaCA (a Bayesian meta-learning approach for regression), and PCOC (Probabilistic Clustering for Online Classification), a novel Bayesian meta-learning algorithm for classification based on Gaussian discriminant analysis in a learned feature space.
+
+# Repository Content
+File Path: experiments/__init__.py
+Content:
+
+File Path: experiments/test.py
+Content:
+import argparse
+import numpy as np
+from metacpd.main.dataset import RainbowMNISTDataset, SwitchingSinusoidDataset, MiniImageNet
+from metacpd.main.utils import get_prgx, mask_nlls, compute_acc
+from metacpd.main import MOCA, ALPaCA, PCOC, ConvNet
+import pickle
+import os
+
+import torch
+from torch.utils.data import Dataset, DataLoader
+import torch.optim as optim
+
+
+parser = argparse.ArgumentParser(description='Test model')
+
+default_model_path = 'best'
+parser.add_argument('--model.model_name', type=str, default=None, metavar='MODELPATH',
+                    help="file of pretrained model to evaluate (default: Error)")
+parser.add_argument('--data.batch_size', type=int, default=1, metavar='BATCHSIZE',
+                    help="meta batch size (default: 1)")
+parser.add_argument('--data.horizon', type=int, default=400, metavar='HORIZON',
+                    help="test horizon (default: 400)")
+parser.add_argument('--data.train_horizon', type=int, default=100, metavar='TRAINHORIZON',
+                    help="train horizon (default: 100)")
+parser.add_argument('--data.test_episodes', type=int, default=100, metavar='TESTEP',
+                    help="number of episode to test on (default: 100)")
+parser.add_argument('--data.cuda', type=int, default=-1, metavar='CUDA_DEVICE',
+                    help='which cuda device to use. if -1, uses cpu')
+parser.add_argument('--data.hazard', type=float, default=0.01, metavar='HAZARD',
+                    help='hazard (default: 0.01)')
+parser.add_argument('--data.train_hazard', type=float, default=0.1, metavar='HAZARD',
+                    help='hazard (default: 0.1)')
+parser.add_argument('--model.model', type=str, default=None, metavar='model',
+                    help="which ablation to use (default: reuse training model)")
+parser.add_argument('--model.train_model', type=str, default='main', metavar='trmodel',
+                    help="training model to test (default: reuse training model)")
+parser.add_argument('--train.task_supervision', type=float, default=None, metavar='LRDECAY',
+                    help='Percentage of task switches labeled')
+parser.add_argument('--train.train_task_supervision', type=float, default=None, metavar='LRDECAY',
+                    help='Percentage of task switches labeled')
+parser.add_argument('--train.seed', type=int, default=1000, metavar='SEED',
+                    help='numpy seed')
+parser.add_argument('--train.experiment_id', type=int, default=0, metavar='SEED',
+                    help='unique experiment identifier seed')
+parser.add_argument('--data.dataset', type=str, default='Sinusoid', metavar='DS',
+                    help="data set name (default: Error)")
+parser.add_argument('--data.window_length', type=int, default=20, metavar='WINDOW',
+                    help="sliding window length for train model (default: 20)")
+parser.add_argument('--data.test_window_length', type=int, default=20, metavar='WINDOW',
+                    help="sliding window length for test model (default: 20)")
+parser.add_argument('--train.train_experiment_name', type=str, default=None, metavar='SEED',
+                    help='name of experiment')
+parser.add_argument('--train.experiment_name', type=str, default=None, metavar='SEED',
+                    help='name of experiment')
+parser.add_argument('--train.oracle_hazard', type=float, default=None, metavar='LR',
+                    help='Hazard rate for oracle (curriculum) (default: None)')
+
+def main(updated_config):
+    
+    load_path = str(updated_config['train.experiment_id']) + '/' + updated_config['train.train_experiment_name'] + '/' + updated_config['data.dataset'] + '/'
+    save_path = str(updated_config['train.experiment_id']) + '/' + updated_config['train.experiment_name'] + '/' + updated_config['data.dataset'] + '/'
+    if updated_config['model.train_model'] == 'sliding_window':
+        if updated_config['data.window_length'] == 0:
+            load_path += 'toe/'
+        else:
+            load_path += updated_config['model.train_model'] + str(updated_config['data.window_length']) + '/'
+
+    else:
+        load_path += updated_config['model.train_model'] + '/'
+    
+    if updated_config['model.model'] is None:
+        updated_config['model.model'] = updated_config['model.train_model']
+    
+    if updated_config['model.model'] == 'sliding_window':
+        if updated_config['data.test_window_length'] == 0:
+            save_path += 'toe/'
+        else:
+            save_path += updated_config['model.model'] + str(updated_config['data.test_window_length']) + '/'
+    elif updated_config['model.train_model'] == 'conv_net':
+        save_path += 'toe/'
+    else:
+        save_path += updated_config['model.model'] + '/'
+    
+    if updated_config['train.oracle_hazard'] is None:
+        path = 'h' + str(updated_config['data.train_hazard']) + '/'
+    else:
+        path = 'h' + str(updated_config['train.oracle_hazard']) + '/'
+            
+    def to_cuda(x):
+        if config['data.cuda'] >= 0:
+            return x.float().cuda(config['data.cuda'])
+        else:
+            return x.float()
+        
+    seed = updated_config['train.seed']
+
+    print('saved_models/' + load_path + path)
+    dir_list = next(os.walk('saved_models/' + load_path + path))[1]
+    
+    for direc in dir_list:
+        with torch.no_grad():
+            if direc not in ['10']:
+                np.random.seed(seed)
+                torch.manual_seed(seed)
+
+                torch.backends.cudnn.deterministic = True
+                torch.backends.cudnn.benchmark = False
+
+                # join the experiment seed with the path
+                dir_path = path + direc
+                print('Test model path: ', save_path + dir_path)
+
+                if updated_config['model.model_name'] is None:
+                    raise ValueError('must specify model name')
+
+                checkpoint = torch.load('saved_models/' + load_path + dir_path  + '/' + updated_config['model.model_name'])
+                config = checkpoint['config']
+
+                for k,v in updated_config.items():
+                    if v is not None:
+                        config[k] = v
+
+                config['train.oracle_hazard'] = None #should take this out
+
+                batch_size = config['data.batch_size']
+                horizon = config['data.horizon']
+
+                if config['data.dataset'] == 'MiniImageNet':
+                    dataset = MiniImageNet(config,'test')
+                    problem_setting = 'class'
+                    if config['model.model'] == 'conv_net':
+                        model = ConvNet(config)
+                        model.load_state_dict(checkpoint['conv_net'])
+                    else:
+                        meta_learning_model = PCOC(config)
+                        meta_learning_model.load_state_dict(checkpoint['meta_learning_model'])
+                        model = MOCA(meta_learning_model, config)
+                        model.load_state_dict(checkpoint['moca'])
+
+                elif config['data.dataset'] == 'RainbowMNIST':
+                    dataset = RainbowMNISTDataset(config,train='test')
+                    problem_setting = 'class'
+                    config['model.classification'] = True
+                    if config['model.model'] == 'conv_net':
+                        model = ConvNet(config)
+                        model.load_state_dict(checkpoint['conv_net'])
+                    else:
+                        meta_learning_model = PCOC(config)
+                        meta_learning_model.load_state_dict(checkpoint['meta_learning_model'])
+                        model = MOCA(meta_learning_model, config)
+                        model.load_state_dict(checkpoint['moca'])
+
+                elif config['data.dataset'] == 'Sinusoid':
+                    config['model.sigma_eps'] = '[.05]' # todo move to config
+                    dataset = SwitchingSinusoidDataset(config)
+                    problem_setting = 'reg'
+
+                    meta_learning_model = ALPaCA(config)
+                    meta_learning_model.load_state_dict(checkpoint['meta_learning_model'])
+                    model = MOCA(meta_learning_model, config)
+                    model.load_state_dict(checkpoint['moca'])
+
+                elif config['data.dataset'] == 'NoiseSinusoid':
+                    dataset = SwitchingNoiseSinusoidDataset(config)
+                    problem_setting = 'reg'
+
+                    meta_learning_model = t_ALPaCA(config)
+                    meta_learning_model.load_state_dict(checkpoint['meta_learning_model'])
+                    model = MOCA(meta_learning_model, config)
+                    model.load_state_dict(checkpoint['moca'])
+
+                else:
+                    raise NotImplementedError    
+
+                model = to_cuda(model)
+                model = model.eval()
+
+                dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=4)
+
+                running_nll = []
+                running_acc = []
+                timings_mode = False
+                running_times = np.zeros((config['data.horizon'], config['data.test_episodes']))
+
+                for i, data in enumerate(dataloader):
+                    if data['x'].shape[0] == config['data.batch_size']:
+                        if i >= config['data.test_episodes']:
+                            break
+                        
+                        inputs = to_cuda(data['x'])
+                        labels = to_cuda(data['y'])
+                        switch_times = to_cuda(data['switch_times'])
+
+                        prgx, task_sup = get_prgx(config,horizon,batch_size,switch_times=switch_times)
+
+                        # moca
+                        if timings_mode:
+                            _,_,nlls, timing_array = model(inputs,labels,prgx=prgx, task_supervision=task_sup, return_timing=timings_mode)
+                        else:
+                            _,_,nlls = model(inputs,labels,prgx=prgx, task_supervision=task_sup, return_timing=timings_mode)
+                            
+                        if not timings_mode:
+                            if problem_setting == 'class':
+                                # nlls are shape batchsize x t x n_classes, so we need to mask
+                                # for loss and also eval accuracy
+                                accs = compute_acc(labels, nlls) # batchsize x t
+                                nlls = mask_nlls(labels, nlls) # now batchsize x t
+
+                            mean_nll = torch.mean(nlls)
+
+                            running_nll.append(mean_nll.item())
+                            if problem_setting == 'class':
+                                mean_acc = torch.mean(accs)
+                                running_acc.append(mean_acc.item())
+
+                        else:
+                            running_times[:,i] = timing_array
+
+                # compute stats on NLL and accuracy
+
+                if not timings_mode:
+                    mean_nll = np.mean(running_nll)
+                    nll_stderr = np.std(running_nll)/np.sqrt(len(running_nll))
+
+                    print('Mean NLL: ', mean_nll)
+                    print('NLL 95% confidence: +/-', nll_stderr*1.96)
+
+                    results = {
+                        'running_nll': running_nll,
+                        'mean_nll': mean_nll,
+                        'nll_conf': nll_stderr*1.96
+                    }
+                else:
+                    results = {
+                        'timings': running_times
+                    }
+
+                if problem_setting == 'class' and not timings_mode:
+                    mean_acc = np.mean(running_acc)
+                    acc_stderr = np.std(running_acc)/np.sqrt(len(running_acc))
+
+                    print('Mean accuracy: ', 100.*mean_acc)
+                    print('Accuracy 95% confidence: +/-', acc_stderr*196.)
+
+                    results['running_acc'] = running_acc
+                    results['mean_acc'] = 100.*mean_acc
+                    results['acc_conf'] = 196.*acc_stderr
+
+                print('---------------\n')
+
+                # saving results
+                filename = 'results/' + save_path + dir_path + '/' + updated_config['model.model_name'][:-3] + '.pickle'
+                os.makedirs(os.path.dirname(filename), exist_ok=True)
+                with open(filename, 'wb') as f:
+                    pickle.dump(results, f)
+
+args = vars(parser.parse_args())
+main(args)
+
+File Path: experiments/train.py
+Content:
+import argparse
+import numpy as np
+
+from metacpd.main import MOCA, ALPaCA, PCOC, ConvNet
+from metacpd.main.encoders import get_encoder
+
+from metacpd.main.dataset import RainbowMNISTDataset, SwitchingSinusoidDataset, MiniImageNet
+from metacpd.main.utils import get_prgx, mask_nlls, compute_acc
+
+import torch
+from torch import autograd
+from torch.utils.data import Dataset, DataLoader
+from torch.utils.tensorboard import SummaryWriter
+import datetime
+import torch.optim as optim
+import os
+
+
+parser = argparse.ArgumentParser(description='Train model')
+
+# ---------- data args
+default_dataset = 'Sinusoid'
+parser.add_argument('--data.dataset', type=str, default=default_dataset, metavar='DS',
+                    help="data set name (default: {:s})".format(default_dataset))
+parser.add_argument('--data.batch_size', type=int, default=50, metavar='BATCHSIZE',
+                    help="meta batch size (default: 50)")
+parser.add_argument('--data.horizon', type=int, default=100, metavar='HORIZON',
+                    help="train horizon (default: 100)")
+parser.add_argument('--data.hazard', type=float, default=0.1, metavar='HAZARD',
+                    help='hazard (default: 0.1)')
+parser.add_argument('--data.window_length', type=int, default=10, metavar='WINDOW',
+                    help="sliding window length for ablation model (default: 10)")
+parser.add_argument('--data.cuda', type=int, default=-1, metavar='CUDA_DEVICE',
+                    help='which cuda device to use. if -1, uses cpu')
+
+# ---------- model args
+parser.add_argument('--model.model', type=str, default='main', metavar='model',
+                    help="which ablation to use (default: main moca model)")
+parser.add_argument('--model.x_dim', type=int, default=1, metavar='XDIM',
+                    help="dimensionality of input images (default: '1,28,28')")
+parser.add_argument('--model.hid_dim', type=int, default=128, metavar='HIDDIM',
+                    help="dimensionality of hidden layers (default: 64)")
+parser.add_argument('--model.y_dim', type=int, default=1, metavar='YDIM',
+                    help="number of classes/dimension of regression label")
+parser.add_argument('--model.phi_dim', type=int, default=32, metavar='PDIM',
+                    help="dimensionality of embedding space (default: 64)")
+parser.add_argument('--model.sigma_eps', type=str, default='[0.05]', metavar='SigEps',
+                    help="noise covariance (regression models; Default: 0.05)")
+parser.add_argument('--model.Linv_init', type=float, default=0., metavar='Linv',
+                    help="initialization of logLinv in PCOC (Default: 0.0)")
+parser.add_argument('--model.dirichlet_scale', type=float, default=10., metavar='Linv',
+                    help="value of log Dirichlet concentration params (init if learnable; Default: 0.0)")
+
+# ---------- train args
+parser.add_argument('--train.train_iterations', type=int, default=7500, metavar='NEPOCHS',
+                    help='number of episodes to train (default: 7500)')
+parser.add_argument('--train.val_iterations', type=int, default=5, metavar='NEPOCHS',
+                    help='number of episodes to validate on (default: 10)')
+parser.add_argument('--train.learning_rate', type=float, default=0.02, metavar='LR',
+                    help='learning rate (default: 0.02)')
+parser.add_argument('--train.decay_every', type=int, default=1500, metavar='LRDECAY',
+                    help='number of iterations after which to decay the learning rate')
+parser.add_argument('--train.learnable_hazard', type=int, default=0, metavar='learn_hazard',
+                    help='enable hazard being learnable')
+parser.add_argument('--train.learnable_noise', type=int, default=0, metavar='learn_noise',
+                    help='enable noise being learnable (default: false/0)')
+parser.add_argument('--train.learnable_dirichlet', type=int, default=0, metavar='learn_dir',
+                    help='enable dirichlet concentration being learnable')
+parser.add_argument('--train.verbose', type=bool, default=True, metavar='verbose',
+                    help='print during training (default: True)')
+# parser.add_argument('--train.save_directory', type=str, default='saved_models/most_recent', metavar='save_directory',
+#                     help='where model is saved after training (default: False)')
+parser.add_argument('--train.grad_accumulation_steps', type=int, default=1, metavar='grad_acc',
+                    help='Number of gradient accumulation steps (default: 1)')
+parser.add_argument('--train.task_supervision', type=float, default=None, metavar='TASK_SUP',
+                    help='Percentage of task switches labeled')
+parser.add_argument('--train.seed', type=int, default=1, metavar='SEED',
+                    help='numpy seed')
+parser.add_argument('--train.experiment_id', type=int, default=0, metavar='SEED',
+                    help='unique experiment identifier seed')
+parser.add_argument('--train.experiment_name', type=str, default=0, metavar='SEED',
+                    help='name of experiment')
+parser.add_argument('--train.oracle_hazard', type=float, default=None, metavar='LR',
+                    help='Hazard rate for oracle (curriculum) (default: None)')
+
+def main(config):
+
+    path = str(config['train.experiment_id']) + '/' + config['train.experiment_name'] +'/'
+    path += config['data.dataset'] + '/'
+    if config['model.model'] == 'sliding_window':
+        if config['data.window_length'] == 0:
+            path += 'toe/'
+        else:
+            path += config['model.model'] + str(config['data.window_length']) + '/'
+    else:
+        path += config['model.model'] + '/'
+        
+    if config['train.oracle_hazard'] is None:
+        path += 'h' + str(config['data.hazard']) + '/'
+    else:
+        path += 'h' + str(config['train.oracle_hazard']) + '/'
+
+    path += str(config['train.seed']) + '/'
+    
+    def to_cuda(x):
+        if config['data.cuda'] >= 0:
+            return x.float().cuda(config['data.cuda'])
+        else:
+            return x.float()
+
+    def save_model(save_name):
+        save_path = 'saved_models/' + path + save_name + '.pt' 
+
+        if config['model.model'] == 'conv_net':
+            torch.save({'conv_net': model.state_dict(),
+                        'config': config
+                       }, save_path)
+        else:
+            torch.save({'meta_learning_model': meta_learning_model.state_dict(),
+                        'moca': model.state_dict(),
+                        'config': config
+                        }, save_path)
+
+    for bool_arg in ['train.learnable_hazard', 'train.learnable_noise', 'train.learnable_dirichlet']:
+        config[bool_arg] = bool(config[bool_arg])
+
+    seed = config['train.seed']
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+    batch_size = config['data.batch_size']
+    horizon = config['data.horizon']
+    
+    
+    if not os.path.exists('saved_models/' + path[:-1]):
+        os.makedirs('saved_models/' + path[:-1] , exist_ok=True)
+    
+    writer = SummaryWriter('./runs/' + path + datetime.datetime.now().strftime('y%y_m%m_d%d_s%s'))
+
+
+    if config['data.dataset'] == 'MiniImageNet':
+        dataset = MiniImageNet(config,'train')
+        validate_dataset = MiniImageNet(config,'val')
+        config['model.classification'] = True
+        problem_setting = 'class'
+        
+        if config['model.model'] == 'conv_net':
+            model = ConvNet(config)
+        else:
+            meta_learning_model = PCOC(config)
+            model = MOCA(meta_learning_model, config)
+
+    elif config['data.dataset'] == 'RainbowMNIST':
+        dataset = RainbowMNISTDataset(config,train='train')
+        validate_dataset = RainbowMNISTDataset(config,train='validate')
+        config['model.classification'] = True
+        problem_setting = 'class'
+        
+        if config['model.model'] == 'conv_net':
+            model = ConvNet(config)
+        else:
+            meta_learning_model = PCOC(config)
+            model = MOCA(meta_learning_model, config)
+
+    elif config['data.dataset'] == 'Sinusoid':
+        dataset = SwitchingSinusoidDataset(config)
+        validate_dataset = SwitchingSinusoidDataset(config)
+        config['model.classification'] = False
+        problem_setting = 'reg'
+        
+        meta_learning_model = ALPaCA(config)
+        model = MOCA(meta_learning_model, config)
+        
+    elif config['data.dataset'] == 'NoiseSinusoid':
+        dataset = SwitchingNoiseSinusoidDataset(config)
+        validate_dataset = SwitchingNoiseSinusoidDataset(config)
+        config['model.classification'] = False
+        problem_setting = 'reg'
+        
+        meta_learning_model = t_ALPaCA(config)
+        model = MOCA(meta_learning_model, config)
+        
+    else:
+        raise notImplementedError
+
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=4)
+    val_dataloader = DataLoader(validate_dataset, batch_size=batch_size, shuffle=True, num_workers=4)
+
+    model = to_cuda(model)
+
+    optimizer = optim.Adam(model.parameters(), lr=config['train.learning_rate'])
+    optimizer.zero_grad()
+
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer,step_size=1,gamma=0.5)
+
+    running_nll = []
+    last_mean_val_nll = 10000
+    running_acc = []
+
+    if problem_setting == 'reg':
+        best_val = 10000.
+    else:
+        best_val = 0.
+
+    for i, data in enumerate(dataloader):
+        if data['x'].shape[0] == config['data.batch_size']:
+
+            if (i+1) % config['train.decay_every'] == 0:
+                scheduler.step()
+                if config['train.verbose']:
+                    print('decreasing learning rate\n')
+                                
+            if i > config['train.train_iterations']:
+                break
+
+            inputs = to_cuda(data['x'])
+            labels = to_cuda(data['y'])
+            switch_times = to_cuda(data['switch_times'])
+
+
+            prgx, task_supervision = get_prgx(config,horizon,batch_size,switch_times=switch_times)
+
+            _,_,nlls= model(inputs,labels,prgx=prgx, task_supervision=task_supervision)
+            if problem_setting == 'class':
+                # nlls are shape batchsize x t x n_classes, so we need to mask
+                # for loss and also eval accuracy
+                accs = compute_acc(labels, nlls) # batchsize x t
+                nlls = mask_nlls(labels, nlls) # now batchsize x t
+
+            mean_nll = torch.mean(nlls)
+            mean_nll.backward()
+
+
+
+
+            if i % config['train.grad_accumulation_steps'] == 0:
+                optimizer.step()
+
+                running_nll.append(mean_nll.item())
+                writer.add_scalar('NLL/Train', mean_nll.item(), i)
+
+                if problem_setting == 'class':
+                    ep_acc = torch.mean(accs).item()
+                    writer.add_scalar('Accuracy/Train', ep_acc, i)
+                    running_acc.append(ep_acc)
+                    if config['model.model'] != 'conv_net':
+                        writer.add_scalar('max_Linv_eigenval', np.mean(np.exp(model.meta_learning_alg.logLinv.data.cpu().numpy()).max(0)),i)
+                        writer.add_scalar('min_Linv_eigenval', np.mean(np.exp(model.meta_learning_alg.logLinv.data.cpu().numpy()).min(0)),i)
+
+                        writer.add_scalar('max_q_val', np.mean(model.meta_learning_alg.Q.data.cpu().numpy().max(0)),i)
+                        writer.add_scalar('min_q_val', np.mean(model.meta_learning_alg.Q.data.cpu().numpy().min(0)),i)
+
+                        if config['train.learnable_noise']:
+                            writer.add_scalar('max_sigeps_eigenval', np.mean(np.exp(model.meta_learning_alg.logSigEps.data.cpu().numpy()).max(0)),i)
+                            writer.add_scalar('min_sigeps_eigenval', np.mean(np.exp(model.meta_learning_alg.logSigEps.data.cpu().numpy()).min(0)),i)
+
+                if config['train.learnable_hazard']:
+                    writer.add_scalar('hazard: ', model.hazard.item(), i)
+
+
+            if i % 100 == 0:
+
+                print('Iteration ' + str(i) + '/' + str(config['train.train_iterations']))
+                print('Train NLL: ', np.mean(running_nll))
+                running_nll = []
+
+
+                if problem_setting == 'class':
+                    train_acc = np.mean(running_acc)
+                    print('Train Accuracy: ', train_acc)
+                    running_acc = []
+
+                if config['train.val_iterations'] != 0:
+                    with torch.no_grad():
+                        running_val_nll = []
+                        running_val_acc = []
+                        for j, val_data in enumerate(val_dataloader):
+
+
+                            val_inputs = to_cuda(val_data['x'])
+                            val_labels = to_cuda(val_data['y'])
+                            val_switch_times = to_cuda(val_data['switch_times'])
+
+                            prgx, task_supervision = get_prgx(config,horizon,batch_size,switch_times=val_switch_times)
+
+                            _,_,val_nlls = model(val_inputs, val_labels, prgx=prgx, task_supervision=task_supervision)
+                            if problem_setting == 'class':
+                                # nlls are shape batchsize x t x n_classes, so we need to mask
+                                # for loss and also eval accuracy
+                                val_accs = compute_acc(val_labels, val_nlls) # batchsize x t
+                                val_nlls = mask_nlls(val_labels, val_nlls) # now batchsize x t
+
+                            val_mean_nll = torch.mean(val_nlls)
+                            running_val_nll.append(val_mean_nll.item())
+
+                            if problem_setting == 'class':
+                                running_val_acc.append(torch.mean(val_accs).item())
+
+                            if j == config['train.val_iterations']:
+                                val_nll = np.mean(running_val_nll)
+
+                                writer.add_scalar('NLL/Validation', val_nll, i)
+                                if problem_setting == 'class':
+                                    val_acc = torch.mean(val_accs)
+                                    writer.add_scalar('Accuracy/Validation', val_acc.item(), i)
+
+
+                                break
+
+                        if config['train.verbose']:
+                            print('Validation NLL: ', np.mean(running_val_nll))
+
+                            # only print for classification
+                            if problem_setting == 'class':
+                                print('Validation Accuracy: ', val_acc.item())
+
+                        if problem_setting == 'class':
+                            # save best model by val accuracy
+                            if best_val < val_acc:
+                                best_val = val_acc
+                                save_model('best')
+
+                        elif problem_setting == 'reg':
+                            # save best model by val NLL
+                            if best_val < val_nll:
+                                best_val = val_nll
+                                save_model('best')
+
+                save_model(str(i))
+
+                print('--------------------')
+
+            optimizer.zero_grad()
+
+args = vars(parser.parse_args())
+main(args)
+
+File Path: metacpd/main/__init__.py
+Content:
+from .moca import MOCA
+from .alpaca import ALPaCA
+from .pcoc import PCOC
+from .baselines import ConvNet
+
+File Path: metacpd/main/alpaca.py
+Content:
+import torch
+import torch.nn as nn
+import numpy as np
+
+from copy import deepcopy
+from metacpd.main.encoders import get_encoder
+
+class ALPaCA(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+
+        self.config = deepcopy(config)
+        self.x_dim = config['model.x_dim']
+        self.phi_dim = config['model.phi_dim']
+        self.y_dim = config['model.y_dim']
+
+        self.sigma_eps = eval(self.config['model.sigma_eps'])
+        self.logSigEps = nn.Parameter(torch.from_numpy(np.log(self.sigma_eps)), requires_grad=self.config['train.learnable_noise'])
+
+        self.Q = nn.Parameter(torch.randn(self.phi_dim, self.y_dim))
+        self.L_asym = nn.Parameter(torch.randn(self.phi_dim, self.phi_dim))
+
+        self.normal_nll_const = self.y_dim*np.log(2*np.pi)
+
+        hid_dim = config['model.hid_dim']
+        self.encoder = get_encoder(config)
+
+    @property
+    def logdetSigEps(self):
+        return torch.sum(self.logSigEps)
+
+    @property
+    def invSigEps(self):
+        return torch.diag(torch.exp(-self.logSigEps))
+
+    def prior_params(self):
+        Q0 = self.Q
+        Linv0 = self.L_asym @ self.L_asym.T
+
+        return (Q0, Linv0)
+
+    def recursive_update(self, phi, y, params):
+        """
+            inputs: phi: shape (..., phi_dim )
+                    y:   shape (..., y_dim )
+                    params: tuple of Q, Linv
+                        Q: shape (..., phi_dim, y_dim)
+                        Linv: shape (..., phi_dim, phi_dim)
+        """
+        Q, Linv = params
+
+        Lphi = Linv @ phi.unsqueeze(-1)
+
+        Linv = Linv - 1./(1 + phi.unsqueeze(-2) @ Lphi) * (Lphi @ Lphi.transpose(-1,-2))
+        Q = phi.unsqueeze(-1) @ y.unsqueeze(-2) + Q
+
+        return (Q, Linv)
+
+    def log_predictive_prob(self, x, y, posterior_params, update_params=False):
+        """
+            input:  x: shape (..., x_dim)
+                    y: shape (..., y_dim)
+                    posterior_params: tuple of Q, Linv:
+                        Q: shape (..., phi_dim, y_dim)
+                        Linv: shape (..., phi_dim, phi_dim)
+                    update_params: bool, whether to perform recursive update on
+                                   posterior params and return updated params
+            output: logp: log p(y | x, posterior_parms)
+                    updated_params: updated posterior params after factoring in (x,y) pair
+        """
+
+        phi = self.encoder(x)
+
+        Q, Linv = posterior_params
+
+        K = Linv @ Q
+
+        sigfactor = 1 + (phi.unsqueeze(-2) @ Linv @ phi.unsqueeze(-1))
+        err = y.unsqueeze(-1) - K.transpose(-1,-2) @ phi.unsqueeze(-1)
+
+        invsig = self.invSigEps / sigfactor # shape (..., y_dim y_dim)
+
+        nll_quadform = err.transpose(-1,-2) @ invsig @ err
+        nll_logdet = self.y_dim * torch.log(sigfactor) + self.logdetSigEps
+
+        logp = -0.5*(self.normal_nll_const + nll_quadform + nll_logdet).squeeze(-1).squeeze(-1)
+
+        if update_params:
+            updated_params = self.recursive_update(phi,y,posterior_params)
+            return logp, updated_params
+
+        return logp
+
+
+    def forward(self, x, posterior_params):
+        """
+            input: x, posterior params
+            output: y
+        """
+        phi = self.encoder(x)
+
+        Q, Linv = posterior_params
+
+        K = Linv @ Q
+
+        sigfactor = 1 + (phi.unsqueeze(-2) @ Linv @ phi.unsqueeze(-1))
+        mu = ( K.transpose(-1,-2) @ phi.unsqueeze(-1) ).squeeze(-1)
+        invsig = self.invSigEps / sigfactor
+
+        return mu, invsig
+
+File Path: metacpd/main/baselines.py
+Content:
+import torch
+import torch.nn as nn
+from metacpd.main.encoders import get_encoder
+from metacpd.main.utils import Flatten, conv_block, final_conv_block
+
+class ConvNet(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        hid_dim = config['model.hid_dim']
+        self.use_cuda = config['data.cuda']
+        self.y_dim = config['model.y_dim']
+        self.phi_dim = config['model.phi_dim']
+
+        self.config = config
+        encoder = get_encoder(config)
+        self.encoder = nn.Sequential(
+            encoder,
+            nn.Linear(self.phi_dim, self.y_dim),
+            nn.LogSoftmax()
+        )
+
+    def forward(self,x,y,prgx=None, task_supervision=None):
+        """
+        x: (batch_size, horizon, C, H, W)
+        y: (batch_size, horizon, n_classes)
+
+        output: nlls (batch_size, horizon)
+        """
+        #reshape x_mat
+        x_shape = x.shape
+
+        nlls = -self.encoder(x.reshape(-1,x_shape[-3],x_shape[-2],x_shape[-1]))
+        nlls = nlls.reshape(x_shape[0], x_shape[1], self.y_dim)
+        
+        return None, None, nlls
+
+File Path: metacpd/main/dataset.py
+Content:
+import numpy as np
+import torch
+from torch.utils.data import Dataset, DataLoader
+import os
+from skimage import io
+from metacpd.main.utils import listdir_nohidden
+import torchvision
+
+import os.path as osp
+from PIL import Image
+
+from torchvision import transforms
+
+imagenet_train_superclasses = {
+    0: [ 1, 2, 3, 4, 5, 6, 7, 8,19,20,21,48],
+    1: [ 9,10,11,12,13,14,15,16,17,18],
+    2: [22,26,27,38,39,46,50,53,54,57,62.63],
+    3: [23,24,25,28,29,30,32,34,35,36,37,55,59,60,61,64],
+    4: [31,33,40,41,42,43,44,45,47,49,51,52,56,58]
+}
+
+imagenet_val_superclasses = {
+    0: [ 1, 4, 5],
+    1: [ 2, 3],
+    2: [ 6, 8,10,12,14,16],
+    3: [13,15],
+    4: [ 7, 9,11]
+}
+
+imagenet_test_superclasses = {
+    0: [ 1, 2, 7, 8, 9],
+    1: [ 3, 4, 5, 6],
+    2: [13,16],
+    3: [12,15,19,20],
+    4: [10,11,14,17,18]
+}
+
+def uniform_sample(x):
+    x_lower, x_upper = x
+    return x_lower + np.random.rand()*(x_upper-x_lower)
+
+
+class MiniImageNet(Dataset):
+    def __init__(self, config, setname, path_prefix=None, data_length=1000000):
+        
+        ROOT_PATH = 'data/miniImageNet/'
+        if path_prefix is not None:
+            ROOT_PATH = path_prefix + ROOT_PATH
+            
+
+        self.horizon = config['data.horizon']
+        self.switch_prob = config['data.hazard']
+        self.data_length = data_length
+
+        if setname == 'train':
+            self.superclass_dict = imagenet_train_superclasses
+        elif setname == 'val':
+            self.superclass_dict = imagenet_val_superclasses
+        elif setname == 'test':
+            self.superclass_dict = imagenet_test_superclasses
+        else:
+            raise ValueError
+
+        csv_path = osp.join(ROOT_PATH, setname + '.csv')
+        lines = [x.strip() for x in open(csv_path, 'r').readlines()][1:]
+
+        data = []
+        label = []
+        lb = -1
+
+        self.wnids = []
+
+        self.class_probs = [0.2, 0.2, 0.2, 0.2, 0.2]
+
+        for l in lines:
+            name, wnid = l.split(',')
+            path = osp.join(ROOT_PATH, 'images', name)
+            if wnid not in self.wnids:
+                self.wnids.append(wnid)
+                lb += 1
+            data.append(path)
+            label.append(lb)
+
+        self.data = data
+        self.label = label
+
+        if setname == 'train' or setname == 'val':
+            self.transform = transforms.Compose([
+                transforms.Resize(84),
+                transforms.CenterCrop(84),
+                transforms.RandomHorizontalFlip(),
+                transforms.RandomVerticalFlip(),
+                transforms.ColorJitter(brightness=0.4,contrast=0.4,saturation=0.4,hue=0.4),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                     std=[0.229, 0.224, 0.225])
+            ])
+        elif setname == 'test':
+            self.transform = transforms.Compose([
+            transforms.Resize(84),
+            transforms.CenterCrop(84),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                 std=[0.229, 0.224, 0.225])
+        ])
+
+    def __len__(self):
+        return self.data_length
+
+    def sample_subclasses(self):
+        subclasses = []
+        for i in range(5):
+            subclasses.append(np.random.choice(self.superclass_dict[i])-1)
+
+        return subclasses
+
+    def get_sample_from_subclass(self,subclass_idx):
+        imgs_per_class = 600
+        return int(subclass_idx*imgs_per_class + np.random.randint(imgs_per_class))
+
+    def sample(self, return_lists=True):
+        x = np.zeros((self.horizon,3,84,84))
+        y = np.zeros((self.horizon,5))
+
+        subclasses_list = []
+        switch_times = []
+        for i in range(self.horizon):
+
+            sampled_class = np.random.choice([0,1,2,3,4],p=self.class_probs)
+
+            if np.random.rand() < self.switch_prob or i==0:
+                subclasses = self.sample_subclasses()
+                switch_times.append(i)
+
+            subclasses_list.append(subclasses)
+
+            img_idx = self.get_sample_from_subclass(subclasses[sampled_class])
+            path = self.data[img_idx]
+
+            x[i,:,:,:] = self.transform(Image.open(path).convert('RGB'))
+            y[i,sampled_class] = 1
+
+        if return_lists:
+            return x,y,subclasses_list,switch_times
+
+        return x,y
+
+    def __getitem__(self,idx,train=True):
+        # batching happens automatically
+
+        data, labels, self.subclasses_list, self.switch_times = self.sample()
+
+        switch_indicators = np.zeros(self.horizon)
+        for i in range(self.horizon):
+            if i in self.switch_times:
+                switch_indicators[i] = 1.
+
+        sample = {
+            'x': data.astype(float),
+            'y': labels.astype(float),
+            'switch_times':switch_indicators.astype(float)
+        }
+
+        return sample
+
+class SwitchingSinusoidDataset:
+    def __init__(self, config, data_length=100000000):
+        self.amp_range = [0.1, 5.0]
+        self.phase_range = [0, 3.14]
+        self.freq_range = [0.999, 1.0]
+        self.x_range = [-5., 5.]
+        self.horizon = config['data.horizon']
+        self.switch_prob = config['data.hazard']
+        
+        self.data_length = data_length
+        self.sigma_eps = eval(config['model.sigma_eps'])[0]
+        
+        self.noise_std = np.sqrt(self.sigma_eps)
+        
+    def __len__(self):
+        return self.data_length-self.horizon
+            
+    def sample(self, return_lists=True):
+        x_dim = 1 
+        y_dim = 1
+        
+        x = np.zeros((self.horizon,x_dim))
+        y = np.zeros((self.horizon,y_dim))
+
+        amp_list = []
+        phase_list = []
+        freq_list = []
+        switch_times = []
+        for i in range(self.horizon):
+            if np.random.rand() < self.switch_prob or i==0:
+                amp = uniform_sample(self.amp_range)
+                phase = uniform_sample(self.phase_range)
+                freq = uniform_sample(self.freq_range)
+                switch_times.append(i)
+            
+            amp_list.append(amp)
+            phase_list.append(phase)
+            freq_list.append(freq) 
+            
+            x_samp = uniform_sample(self.x_range)
+            
+            y_samp = amp*np.sin(freq*x_samp + phase) + self.noise_std*np.random.randn()
+
+            x[i,0] = x_samp
+            y[i,0] = y_samp
+
+        if return_lists:
+            return x,y,freq_list,amp_list,phase_list,switch_times
+
+        return x,y
+    
+    def __getitem__(self,idx,train=True):
+        # batching happens automatically
+        
+        data, labels, self.freq_list, self.amp_list, self.phase_list, self.switch_times = self.sample()
+        switch_indicators = np.zeros(self.horizon)
+        for i in range(self.horizon):
+            if i in self.switch_times:
+                switch_indicators[i] = 1.
+
+        sample = {
+            'x': data.astype(float),
+            'y': labels.astype(float),
+            'switch_times':switch_indicators.astype(float)
+        }
+
+        return sample
+
+class RainbowMNISTDataset(Dataset):
+    def __init__(self,config,path_prefix=None, train=True,data_length=1000000,path=None):
+
+        self.data_length = data_length
+
+        if path is None:
+            if train == 'train':
+                self.path = 'data/rainbow_mnist/train'
+                print('Loading train set.')
+
+            elif train == 'validate':
+                self.path = 'data/rainbow_mnist/validate'
+                print('Loading validation set.')
+
+            elif train == 'test':
+                self.path = 'data/rainbow_mnist/test'
+                print('Loading test set.')
+
+            else:
+                raise ValueError
+        else:
+            raise NotImplementedError
+        
+        if path_prefix is not None:
+            self.path = path_prefix + self.path
+
+        self.horizon = config['data.horizon']
+        self.switch_prob = config['data.hazard']
+
+    def load_data(self,timeseries_length,path):
+        labels = np.zeros((timeseries_length,10))
+        data = np.zeros((timeseries_length,3,28,28)) 
+        switch_times = []
+
+        num_dirs = len(os.listdir(path))
+
+        for i in range(timeseries_length):
+            if np.random.rand() < self.switch_prob or i==0:
+                # resample task (corresponding to resampling dir)
+
+                task_dir = listdir_nohidden(path)
+                task = np.random.choice(task_dir)
+                task_path = path + '/' + task
+                switch_times.append(i)
+
+            # given task, sample digit
+            full_path = task_path + '/' + np.random.choice(listdir_nohidden(task_path))
+
+            digit = np.random.choice(listdir_nohidden(full_path))
+
+            digit_path = full_path + '/' + digit
+
+            # digit path is the label
+            labels[i,int(digit)] = 1
+
+            # load digit, add to time series
+            final_path = np.random.choice(listdir_nohidden(digit_path))
+            img = np.array(io.imread(digit_path + '/' + final_path)).transpose(2,0,1)
+            data[i,:,:,:] = img
+        return labels, data, switch_times
+
+    def __len__(self):
+        return self.data_length-self.horizon
+
+    def __getitem__(self,idx,train=True):
+        # batching happens automatically
+
+        labels, data, self.switch_times = self.load_data(self.horizon,self.path)
+        
+        switch_indicators = np.zeros(self.horizon)
+        for i in range(self.horizon):
+            if i in self.switch_times:
+                switch_indicators[i] = 1.
+
+        sample = {
+            'x': data.astype(float),
+            'y': labels.astype(float),
+            'switch_times':switch_indicators.astype(float)
+        }
+            
+        return sample
+    
+File Path: metacpd/main/encoders.py
+Content:
+import torch
+import torch.nn as nn
+from metacpd.main.utils import Flatten, conv_block, final_conv_block
+
+def get_encoder(config):
+    hid_dim = config['model.hid_dim']
+    x_dim = config['model.x_dim']
+    phi_dim = config['model.phi_dim']
+    # REGRESSION
+
+    if config['data.dataset'] == 'Sinusoid':
+        activation = nn.Tanh()
+        encoder = nn.Sequential(
+            nn.Linear(x_dim, hid_dim),
+            nn.ReLU(),
+            nn.Linear(hid_dim, hid_dim),
+            nn.ReLU(),
+            nn.Linear(hid_dim, phi_dim),
+            activation
+        )
+    elif config['data.dataset'] == 'NoiseSinusoid':
+        activation = nn.Tanh()
+        encoder = nn.Sequential(
+            nn.Linear(x_dim, hid_dim),
+            nn.ReLU(),
+            nn.Linear(hid_dim, hid_dim),
+            nn.ReLU(),
+            nn.Linear(hid_dim, phi_dim),
+            activation
+        )
+        
+    # CLASSIFICATION
+
+    elif config['data.dataset'] in ['RainbowMNIST']:
+        encoder = nn.Sequential(
+            conv_block(3, hid_dim),
+            conv_block(hid_dim, hid_dim),
+            conv_block(hid_dim, hid_dim),
+            final_conv_block(hid_dim, hid_dim),
+            Flatten()
+        )
+    elif config['data.dataset'] == 'MiniImageNet':
+        encoder = nn.Sequential(
+            conv_block(3, hid_dim),
+            conv_block(hid_dim, hid_dim),
+            conv_block(hid_dim, hid_dim),
+            conv_block(hid_dim, hid_dim),
+            conv_block(hid_dim, hid_dim),
+            final_conv_block(hid_dim, hid_dim),
+            Flatten()
+        )
+
+    elif config['data.dataset'] == 'PermutedMNIST':
+        encoder = nn.Sequential(
+            conv_block(1, hid_dim),
+            conv_block(hid_dim, hid_dim),
+            conv_block(hid_dim, hid_dim),
+            final_conv_block(hid_dim, hid_dim),
+            Flatten()
+        )
+
+    else:
+        raise ValueError("data.dataset not understood")
+
+    return encoder
+
+File Path: metacpd/main/moca.py
+Content:
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+import numpy as np
+import time
+import math
+from copy import deepcopy
+
+from metacpd.main.utils import mask_nlls
+
+
+class MOCA(nn.Module):
+    """
+    Wraps an underlying MetaLearning algorithm to allow training on timeseries of
+    sequential examples with discrete task switches that are unlabeled.
+    """
+
+    def __init__(self, meta_learning_alg, config):
+        super().__init__()
+
+        self.config = deepcopy(config)
+        self.x_dim = config['model.x_dim']
+        self.y_dim = config['model.y_dim']
+
+        self.classification = config['model.classification']
+
+        self.meta_learning_alg = meta_learning_alg
+
+        # hazard rate:
+        hazard_logit = np.log( config['data.hazard'] / (1 - config['data.hazard'] ) )
+        self.hazard_logit = nn.Parameter(torch.from_numpy(np.array([hazard_logit])), requires_grad=config['train.learnable_hazard'])
+
+        # initial log_prx:
+        self.init_log_prgx = nn.Parameter(torch.zeros([1,1]), requires_grad=False)
+
+
+    def nll(self, log_pi, log_prgx):
+        """
+            log_pi: shape(batch_size x t x ...)       log p(new data | x, r=i, data so far) for all i = 0, ..., t
+            log_prgx: shape (batch_size x t x ...)    log p(r=i | data so far) for all i = 0, ..., t
+        """
+
+        if len(log_pi.shape) == 3:
+            return -torch.logsumexp(log_pi + log_prgx.unsqueeze(-1), dim=1)
+
+        return -torch.logsumexp(log_pi + log_prgx, dim=1)
+
+    def log_p_r_given_x(self,log_prx):
+        """
+            computes log p(r|x)
+
+            inputs: log_prx: (batch_size, t+1), log p(r, x) for each r in 0, ..., t
+                    log_prx: (batch_size, t+1), log p(r | x) for each r in 0, ..., t
+        """
+        return nn.functional.log_softmax(log_prx,dim=1)
+
+    @property
+    def log_hazard(self):
+        """
+        log p( task_switch )
+        """
+        return torch.log(torch.sigmoid(self.hazard_logit))
+
+    @property
+    def log_1m_hazard(self):
+        """
+        log (1 - p(task_switch))
+        """
+        return torch.log(1-torch.sigmoid(self.hazard_logit))
+
+    @property
+    def hazard(self):
+        return torch.sigmoid(self.hazard_logit)
+
+    def forward(self,x_mat,y_mat,prgx=None, task_supervision=None, return_timing=False):
+        """
+        Takes in x,y batches; loops over horizon to recursively compute posteriors
+        Inputs:
+        - x_mat; shape = batch size x horizon x x_dim
+        - y_mat; shape = batch size x horizon x y_dim
+        """
+        batch_size = x_mat.shape[0]
+        test_horizon = x_mat.shape[1]
+
+
+        posterior_params_list = []
+        log_prgx_list = []
+        nll_list = []
+
+        # define initial params and append to list
+        # we add a batch dimension and a time dimension
+        prior_params = tuple( p[None,None,...] for p in self.meta_learning_alg.prior_params() )
+
+
+        posterior_params = prior_params
+        log_prgx = self.init_log_prgx # p(r, all data so far)
+
+        posterior_params_list.append(posterior_params)
+
+
+        # start at time t+1
+        
+        time_array = []
+        
+        for i in range(test_horizon):
+            # grab y, phi:
+            
+            if return_timing:
+                torch.cuda.synchronize()
+                start_time = time.perf_counter()
+            
+            x = x_mat[:,i,:]
+            y = y_mat[:,i,:]
+
+
+            # compute log p(y|x,hist) for all possible run lengths (shape: (batch_size, t+1))
+            # and return updated params incorporating new point
+            # log_pi_t = log p(y|x,r,hist) for all r = [0,...,i]
+
+            # if classification, log_pi_t == p(y,x|eta) for all y (batchsize, i+1, y_dim)
+            # if regression, log_pi_t == p(y|x,eta)
+            log_pi_t, updated_posterior_params = self.meta_learning_alg.log_predictive_prob(x[:,None,:], y[:,None,:], posterior_params, update_params=True)
+            if self.classification:
+                log_pygx =  nn.functional.log_softmax(log_pi_t, dim=-1) # normalize to get p(y | x) # (batchsize, i+1, y_dim)
+
+                # update p(r_t) given just the x value
+                log_p_newx_gr = torch.logsumexp(log_pi_t, dim=-1) # sum over all y values, shape (batch_size, i+1)
+                log_prgx = log_prgx + log_p_newx_gr # (batch_size, i+1) # log p ( r_{i} \mid x_{0,i}, y_{0,i-1} )
+                log_prgx = torch.log_softmax(log_prgx, dim=1) # normalizing over runlengths
+
+            else:
+                log_pygx = log_pi_t
+
+            if prgx is not None:
+                if task_supervision is not None:
+                    override_log_prgx = torch.log(prgx[i]) + torch.log(task_supervision[i].unsqueeze(-1))
+                    masked_log_prgx = log_prgx + torch.log(1-task_supervision[i].unsqueeze(-1))
+                    cat_log_prgx = torch.cat((override_log_prgx.unsqueeze(-1), masked_log_prgx.unsqueeze(-1)),dim=-1)
+                    log_prgx = torch.logsumexp(cat_log_prgx,dim=-1)
+                else:
+                    log_prgx = torch.log(prgx[i])
+                    
+            if not return_timing: log_prgx_list.append(log_prgx)
+
+            # use these posterior predictives and log p(r | hist) to evaluate y under the full posterior predictive
+            nll = self.nll(log_pygx, log_prgx)
+            if not return_timing: nll_list.append(nll)
+
+            # update belief over run lengths:
+
+            # if classification, then log_pi_t is (batch_size, i+1. y_dim), need to mask before updating belief
+            if self.classification:
+                log_pygx = mask_nlls(y.unsqueeze(-2), log_pygx) # (batch_size, i+1)
+
+            # calculate joint densities p(r_t,data_so_far) for both r_t = r_{t-1} + 1 and r_t = 0
+            log_prx_grow = self.log_1m_hazard + log_pygx + log_prgx                      # p( r_t = r_{t-1} + 1 )
+            log_prx_chpt = self.log_hazard + torch.logsumexp(log_pygx + log_prgx, dim=1) # p (r_t = 0 )
+
+            log_prx = torch.cat((log_prx_grow,log_prx_chpt[:,None]), 1) # shape (batch_size, i + 2)
+            log_prgx = torch.log_softmax(log_prx, dim=1) # log p(r_{i+1} | x_{0:i}, y_{0:i})
+
+            # update posteriors update
+            posterior_params = tuple( torch.cat((u, p.expand(*([batch_size] + list(p.shape)[1:]))), axis=1) for u,p in zip(updated_posterior_params, prior_params) )
+
+            # append to list
+            if not return_timing: posterior_params_list.append(posterior_params)
+
+            if return_timing:
+                torch.cuda.synchronize()
+                end_time = time.perf_counter()
+                time_array.append(end_time-start_time)
+            
+        if not return_timing: nlls = torch.stack(nll_list, dim=1) # shape (batch_size, t, y_dim)
+        
+        if return_timing:
+            return [], [], [], time_array
+        
+        return posterior_params_list, log_prgx_list, nlls
+
+File Path: metacpd/main/pcoc.py
+Content:
+import torch
+import torch.nn as nn
+import numpy as np
+
+from copy import deepcopy
+from metacpd.main.encoders import get_encoder
+
+class PCOC(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+
+        self.config = deepcopy(config)
+        self.x_dim = config['model.x_dim']
+        self.phi_dim = config['model.phi_dim']
+        self.y_dim = config['model.y_dim']
+
+        self.sigma_eps = np.zeros([self.y_dim,1]) + np.asarray(eval(config['model.sigma_eps']))
+        self.cov_dim =  self.sigma_eps.shape[-1]
+        print("Using %d parameters in covariance:" % self.cov_dim)
+        if self.phi_dim % self.cov_dim != 0:
+            raise ValueError("cov_dim must evenly divide phi_dim")
+
+        self.logSigEps = nn.Parameter(torch.from_numpy(np.log(self.sigma_eps)), requires_grad=self.config['train.learnable_noise'])
+        
+        Linv_offset = config['model.Linv_init']
+        dir_scale = config['model.dirichlet_scale']
+        self.Q = nn.Parameter(torch.randn(self.y_dim, self.cov_dim, self.phi_dim//self.cov_dim))
+        self.logLinv = nn.Parameter(torch.randn(self.y_dim, self.cov_dim)+Linv_offset)
+        self.log_dirichlet_priors = nn.Parameter(dir_scale*torch.ones(self.y_dim), requires_grad=config['train.learnable_dirichlet'])
+
+        self.normal_nll_const = self.phi_dim*np.log(2*np.pi)
+
+        self.encoder = get_encoder(config)
+
+    @property
+    def invSigEps(self):
+        return torch.exp(-self.logSigEps) #.repeat(self.y_dim,1)
+
+    @property
+    def SigEps(self):
+        return torch.exp(self.logSigEps) #.repeat(self.y_dim,1)
+
+    def prior_params(self):
+        Q0 = self.Q
+        Linv0 = torch.exp(self.logLinv)
+        dir_weights = torch.exp(self.log_dirichlet_priors)
+
+        return (Q0, Linv0, dir_weights)
+
+    def recursive_update(self, phi, y, params):
+        """
+            inputs: phi: shape (..., cov_dim, k )
+                    y:   shape (..., y_dim )
+                    params: tuple of Q, Linv
+                        Q: shape (..., y_dim, cov_dim, k)
+                        Linv: shape (..., y_dim, cov_dim)
+                        dir_weights: shape (..., y_dim)
+        """
+        Q, Linv, dir_weights = params
+
+        # zeros out entries all except class y
+        invSigEps_masked = self.invSigEps * y.unsqueeze(-1) # (..., y_dim, cov_dim)
+
+        Q = Q + invSigEps_masked.unsqueeze(-1)*phi.unsqueeze(-3)
+        Linv = Linv + invSigEps_masked
+        dir_weights = dir_weights + y
+
+        return (Q, Linv, dir_weights)
+
+    def log_predictive_prob(self, x, y, posterior_params, update_params=False):
+        """
+            input:  x: shape (..., x_dim)
+                    y: shape (..., y_dim)
+                    posterior_params: tuple of Q, Linv:
+                        Q: shape (..., y_dim, cov_dim, k)
+                        Linv: shape (..., y_dim, cov_dim)
+                        dir_weights: shape (..., y_dim)
+                    update_params: bool, whether to perform recursive update on
+                                   posterior params and return updated params
+            output: logp: log p(y, x | posterior_params) (..., y_dim)
+                    updated_params: updated posterior params after factoring in (x,y) pair
+        """
+
+        x_shape = list(x.shape)
+
+        if len(x_shape) > 4: # more than one batch dim
+            x = x.reshape([-1]+x_shape[-3:])
+
+        phi = self.encoder(x) # (..., phi_dim)
+        if len(x_shape) > 4:
+            phi = phi.reshape(x_shape[:-3]+[self.phi_dim])
+
+        Q, Linv, dir_weights = posterior_params
+        mu = Q / Linv.unsqueeze(-1) # (..., y_dim, cov_dim, k)
+        pred_cov = 1./Linv + self.SigEps() # (..., y_dim, cov_dim)
+
+        phi_shape = phi.shape
+        phi_reshaped = phi.reshape(*(list(phi_shape)[:-1]+[self.cov_dim, -1])) # (..., cov_dim, k)
+
+        err = phi_reshaped.unsqueeze(-3) - mu # (..., y_dim, cov_dim, k)
+
+        nll_quadform = (err**2 / pred_cov.unsqueeze(-1) ).sum(-1).sum(-1)
+        nll_logdet = (self.phi_dim/self.cov_dim) * torch.log(pred_cov).sum(-1) # sum of log of diagonal entries
+
+        logp = -0.5*(nll_quadform + nll_logdet + self.normal_nll_const) # log p(x | y)
+
+        logp += torch.log(dir_weights / dir_weights.sum(-1,keepdim=True)) # multiply by p(y) posterior to get p(x, y)
+
+        if update_params:
+            updated_params = self.recursive_update(phi_reshaped, y, posterior_params)
+            return logp, updated_params
+
+        return logp
+
+
+    def forward(self, x, posterior_params):
+        """
+            input: x, posterior params
+            output: log p(x | y) for all y
+        """
+        x_shape = list(x.shape)
+
+        if len(x_shape) > 4: # more than one batch dim
+            x = x.reshape([-1]+x_shape[-3:])
+
+        phi = self.encoder(x) # (..., phi_dim)
+        if len(x_shape) > 4:
+            phi = phi.reshape(x_shape[:-3]+[self.phi_dim])
+
+        Q, Linv, dir_weights = posterior_params
+        mu = Q / Linv.unsqueeze(-1) # (..., y_dim, cov_dim, k)
+        pred_cov = 1./Linv + self.SigEps() # (..., y_dim, cov_dim)
+
+        phi_shape = phi.shape
+        phi_reshaped = phi.reshape(*(list(phi_shape)[:-1]+[self.cov_dim, -1])) # (..., cov_dim, k)
+
+        err = phi_reshaped.unsqueeze(-3) - mu # (..., y_dim, cov_dim, k)
+
+        nll_quadform = (err**2 / pred_cov.unsqueeze(-1) ).sum(-1).sum(-1)
+        nll_logdet = (self.phi_dim/self.cov_dim) * torch.log(pred_cov).sum(-1) # sum of log of diagonal entries
+
+        logp = -0.5*(nll_quadform + nll_logdet + self.normal_nll_const) # log p(x | y)
+
+        logp += torch.log(dir_weights / dir_weights.sum(-1,keepdim=True)) # multiply by p(y) posterior to get p(x, y)
+
+        return logp
+
+File Path: metacpd/main/utils.py
+Content:
+import numpy as np
+import torch
+import os
+import torch.nn as nn
+
+class Flatten(nn.Module):
+    def __init__(self):
+        super(Flatten, self).__init__()
+
+    def forward(self, x):
+        return x.view(x.size(0), -1)
+    
+def conv_block(in_channels,out_channels):
+    return nn.Sequential(nn.Conv2d(in_channels,out_channels,3,padding=1),
+                        nn.BatchNorm2d(out_channels),
+                        nn.ReLU(),
+                        nn.MaxPool2d(2)
+                        )
+
+def final_conv_block(in_channels,out_channels):
+    return nn.Sequential(nn.Conv2d(in_channels,out_channels,3,padding=1),
+#                         nn.BatchNorm2d(out_channels),
+                        nn.MaxPool2d(2)
+                        )
+
+def listdir_nohidden(path):
+    dir_list = []
+    for f in os.listdir(path):
+        if not f.startswith('.'):
+             dir_list.append(f)
+    return dir_list
+
+
+def mask_nlls(y,likelihoods):
+    """
+    y: onehot labels: shape (..., n_classes)
+    likelihood: per class: shape (..., n_classes)
+    """
+    # mask with y
+    return torch.sum(y * likelihoods,dim=-1)
+
+def compute_acc(y,nlls):
+    # compute accuracy using nlls
+    pred_class = torch.argmin(nlls,-1,keepdim=True)
+    
+    acc = y.gather(-1, pred_class).squeeze(-1)
+    return acc
+
+
+def get_prgx(config,horizon,batch_size,switch_times=None):
+
+    model = config['model.model']
+    sliding_window_len = config['data.window_length']
+
+    if model == 'main' or model == 'conv_net':
+        return None, None
+
+    prgx = []
+    task_sup = []
+    last_switch = np.zeros(batch_size,dtype=int)
+
+    for t in range(horizon):
+        prgx_t = np.zeros((batch_size,t+1))
+        task_supervision = np.zeros(batch_size)
+        for i in range(batch_size):
+            if model == 'sliding_window':
+                prgx_t[i,max(t-sliding_window_len,0)] = 1
+            elif model == 'no_task_change':
+                prgx_t[i,t] = 1
+            elif model == 'oracle':
+                if switch_times[i,t] > 0.5:
+                    last_switch[i] = t
+                    if config['train.task_supervision'] is not None:
+                        if np.random.rand() < config['train.task_supervision']:
+                            task_supervision[i] = 1.
+                            epsilon = 1e-5
+                            prgx_t[i,:] = np.ones(t+1)*epsilon
+                            prgx_t[i,last_switch[i]] = 1. - epsilon*t
+                            
+                            if config['train.oracle_hazard'] is not None:
+                                raise NotImplementedError
+                                
+                if config['train.task_supervision'] is None:
+                    if config['train.oracle_hazard'] is not None:
+                        if last_switch[i] != 0:
+                            prgx_t[i,0] = config['train.oracle_hazard']
+                            prgx_t[i,last_switch[i]] = 1. - config['train.oracle_hazard']
+                        else:
+                            prgx_t[i,last_switch[i]] = 1.
+                    else:
+                        prgx_t[i,last_switch[i]] = 1.
+                
+            else:
+                raise ValueError('make sure specified model is implemented')
+
+
+        prgx_t = torch.tensor(prgx_t).float()
+        task_supervision = torch.tensor(task_supervision).float()
+
+
+        if config['data.cuda'] >= 0:
+            prgx_t = prgx_t.cuda(config['data.cuda'])
+            task_supervision = task_supervision.cuda(config['data.cuda'])
+
+        
+        prgx.append(prgx_t)
+        task_sup.append(task_supervision)
+
+    if config['train.task_supervision'] is None:
+        return prgx, None
+    else:
+        return prgx, task_sup
+    
+File Path: setup.py
+Content:
+from setuptools import setup, find_packages
+
+setup(name='metacpd', 
+      version='0.1', 
+      packages=find_packages())
+Output:
+{
+    "experimental_code": "import torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nimport numpy as np\nimport time\nimport math\nfrom copy import deepcopy\n\n# From metacpd/main/utils.py\nclass Flatten(nn.Module):\n    def __init__(self):\n        super(Flatten, self).__init__()\n\n    def forward(self, x):\n        return x.view(x.size(0), -1)\n    \ndef conv_block(in_channels,out_channels):\n    return nn.Sequential(nn.Conv2d(in_channels,out_channels,3,padding=1),\n                        nn.BatchNorm2d(out_channels),\n                        nn.ReLU(),\n                        nn.MaxPool2d(2)\n                        )\n\ndef final_conv_block(in_channels,out_channels):\n    return nn.Sequential(nn.Conv2d(in_channels,out_channels,3,padding=1),\n#                         nn.BatchNorm2d(out_channels),\n                        nn.MaxPool2d(2)\n                        )\n\ndef mask_nlls(y,likelihoods):\n    \"\"\"\n    y: onehot labels: shape (..., n_classes)\n    likelihood: per class: shape (..., n_classes)\n    \"\"\"\n    # mask with y\n    return torch.sum(y * likelihoods,dim=-1)\n\ndef compute_acc(y,nlls):\n    # compute accuracy using nlls\n    pred_class = torch.argmin(nlls,-1,keepdim=True)\n    \n    acc = y.gather(-1, pred_class).squeeze(-1)\n    return acc\n\ndef get_prgx(config,horizon,batch_size,switch_times=None):\n\n    model = config['model.model']\n    sliding_window_len = config['data.window_length']\n\n    if model == 'main' or model == 'conv_net':\n        return None, None\n\n    prgx = []\n    task_sup = []\n    last_switch = np.zeros(batch_size,dtype=int)\n\n    for t in range(horizon):\n        prgx_t = np.zeros((batch_size,t+1))\n        task_supervision = np.zeros(batch_size)\n        for i in range(batch_size):\n            if model == 'sliding_window':\n                prgx_t[i,max(t-sliding_window_len,0)] = 1\n            elif model == 'no_task_change':\n                prgx_t[i,t] = 1\n            elif model == 'oracle':\n                if switch_times[i,t] > 0.5:\n                    last_switch[i] = t\n                    if config['train.task_supervision'] is not None:\n                        if np.random.rand() < config['train.task_supervision']:\n                            task_supervision[i] = 1.\n                            epsilon = 1e-5\n                            prgx_t[i,:] = np.ones(t+1)*epsilon\n                            prgx_t[i,last_switch[i]] = 1. - epsilon*t\n                            \n                            if config['train.oracle_hazard'] is not None:\n                                raise NotImplementedError\n                                \n                if config['train.task_supervision'] is None:\n                    if config['train.oracle_hazard'] is not None:\n                        if last_switch[i] != 0:\n                            prgx_t[i,0] = config['train.oracle_hazard']\n                            prgx_t[i,last_switch[i]] = 1. - config['train.oracle_hazard']\n                        else:\n                            prgx_t[i,last_switch[i]] = 1.\n                    else:\n                        prgx_t[i,last_switch[i]] = 1.\n                \n            else:\n                raise ValueError('make sure specified model is implemented')\n\n\n        prgx_t = torch.tensor(prgx_t).float()\n        task_supervision = torch.tensor(task_supervision).float()\n\n\n        if config['data.cuda'] >= 0:\n            prgx_t = prgx_t.cuda(config['data.cuda'])\n            task_supervision = task_supervision.cuda(config['data.cuda'])\n\n        \n        prgx.append(prgx_t)\n        task_sup.append(task_supervision)\n\n    if config['train.task_supervision'] is None:\n        return prgx, None\n    else:\n        return prgx, task_sup\n\n# From metacpd/main/encoders.py\ndef get_encoder(config):\n    hid_dim = config['model.hid_dim']\n    x_dim = config['model.x_dim']\n    phi_dim = config['model.phi_dim']\n    # REGRESSION\n\n    if config['data.dataset'] == 'Sinusoid':\n        activation = nn.Tanh()\n        encoder = nn.Sequential(\n            nn.Linear(x_dim, hid_dim),\n            nn.ReLU(),\n            nn.Linear(hid_dim, hid_dim),\n            nn.ReLU(),\n            nn.Linear(hid_dim, phi_dim),\n            activation\n        )\n    elif config['data.dataset'] == 'NoiseSinusoid':\n        activation = nn.Tanh()\n        encoder = nn.Sequential(\n            nn.Linear(x_dim, hid_dim),\n            nn.ReLU(),\n            nn.Linear(hid_dim, hid_dim),\n            nn.ReLU(),\n            nn.Linear(hid_dim, phi_dim),\n            activation\n        )\n        \n    # CLASSIFICATION\n\n    elif config['data.dataset'] in ['RainbowMNIST']:\n        encoder = nn.Sequential(\n            conv_block(3, hid_dim),\n            conv_block(hid_dim, hid_dim),\n            conv_block(hid_dim, hid_dim),\n            final_conv_block(hid_dim, hid_dim),\n            Flatten()\n        )\n    elif config['data.dataset'] == 'MiniImageNet':\n        encoder = nn.Sequential(\n            conv_block(3, hid_dim),\n            conv_block(hid_dim, hid_dim),\n            conv_block(hid_dim, hid_dim),\n            conv_block(hid_dim, hid_dim),\n            conv_block(hid_dim, hid_dim),\n            final_conv_block(hid_dim, hid_dim),\n            Flatten()\n        )\n\n    elif config['data.dataset'] == 'PermutedMNIST':\n        encoder = nn.Sequential(\n            conv_block(1, hid_dim),\n            conv_block(hid_dim, hid_dim),\n            conv_block(hid_dim, hid_dim),\n            final_conv_block(hid_dim, hid_dim),\n            Flatten()\n        )\n\n    else:\n        raise ValueError(\"data.dataset not understood\")\n\n    return encoder\n\n# From metacpd/main/moca.py\nclass MOCA(nn.Module):\n    \"\"\"\n    Wraps an underlying MetaLearning algorithm to allow training on timeseries of\n    sequential examples with discrete task switches that are unlabeled.\n    \"\"\"\n\n    def __init__(self, meta_learning_alg, config):\n        super().__init__()\n\n        self.config = deepcopy(config)\n        self.x_dim = config['model.x_dim']\n        self.y_dim = config['model.y_dim']\n\n        self.classification = config['model.classification']\n\n        self.meta_learning_alg = meta_learning_alg\n\n        # hazard rate:\n        hazard_logit = np.log( config['data.hazard'] / (1 - config['data.hazard'] ) )\n        self.hazard_logit = nn.Parameter(torch.from_numpy(np.array([hazard_logit])), requires_grad=config['train.learnable_hazard'])\n\n        # initial log_prx:\n        self.init_log_prgx = nn.Parameter(torch.zeros([1,1]), requires_grad=False)\n\n\n    def nll(self, log_pi, log_prgx):\n        \"\"\"\n            log_pi: shape(batch_size x t x ...)       log p(new data | x, r=i, data so far) for all i = 0, ..., t\n            log_prgx: shape (batch_size x t x ...)    log p(r=i | data so far) for all i = 0, ..., t\n        \"\"\"\n\n        if len(log_pi.shape) == 3:\n            return -torch.logsumexp(log_pi + log_prgx.unsqueeze(-1), dim=1)\n\n        return -torch.logsumexp(log_pi + log_prgx, dim=1)\n\n    def log_p_r_given_x(self,log_prx):\n        \"\"\"\n            computes log p(r|x)\n\n            inputs: log_prx: (batch_size, t+1), log p(r, x) for each r in 0, ..., t\n                    log_prx: (batch_size, t+1), log p(r | x) for each r in 0, ..., t\n        \"\"\"\n        return nn.functional.log_softmax(log_prx,dim=1)\n\n    @property\n    def log_hazard(self):\n        \"\"\"\n        log p( task_switch )\n        \"\"\"\n        return torch.log(torch.sigmoid(self.hazard_logit))\n\n    @property\n    def log_1m_hazard(self):\n        \"\"\"\n        log (1 - p(task_switch))\n        \"\"\"\n        return torch.log(1-torch.sigmoid(self.hazard_logit))\n\n    @property\n    def hazard(self):\n        return torch.sigmoid(self.hazard_logit)\n\n    def forward(self,x_mat,y_mat,prgx=None, task_supervision=None, return_timing=False):\n        \"\"\"\n        Takes in x,y batches; loops over horizon to recursively compute posteriors\n        Inputs:\n        - x_mat; shape = batch size x horizon x x_dim\n        - y_mat; shape = batch size x horizon x y_dim\n        \"\"\"\n        batch_size = x_mat.shape[0]\n        test_horizon = x_mat.shape[1]\n\n\n        posterior_params_list = []\n        log_prgx_list = []\n        nll_list = []\n\n        # define initial params and append to list\n        # we add a batch dimension and a time dimension\n        prior_params = tuple( p[None,None,...] for p in self.meta_learning_alg.prior_params() )\n\n\n        posterior_params = prior_params\n        log_prgx = self.init_log_prgx # p(r, all data so far)\n\n        posterior_params_list.append(posterior_params)\n\n\n        # start at time t+1\n        \n        time_array = []\n        \n        for i in range(test_horizon):\n            # grab y, phi:\n            \n            if return_timing:\n                torch.cuda.synchronize()\n                start_time = time.perf_counter()\n            \n            x = x_mat[:,i,:]\n            y = y_mat[:,i,:]\n\n\n            # compute log p(y|x,hist) for all possible run lengths (shape: (batch_size, t+1))\n            # and return updated params incorporating new point\n            # log_pi_t = log p(y|x,r,hist) for all r = [0,...,i]\n\n            # if classification, log_pi_t == p(y,x|eta) for all y (batchsize, i+1, y_dim)\n            # if regression, log_pi_t == p(y|x,eta)\n            log_pi_t, updated_posterior_params = self.meta_learning_alg.log_predictive_prob(x[:,None,:], y[:,None,:], posterior_params, update_params=True)\n            if self.classification:\n                log_pygx =  nn.functional.log_softmax(log_pi_t, dim=-1) # normalize to get p(y | x) # (batchsize, i+1, y_dim)\n\n                # update p(r_t) given just the x value\n                log_p_newx_gr = torch.logsumexp(log_pi_t, dim=-1) # sum over all y values, shape (batch_size, i+1)\n                log_prgx = log_prgx + log_p_newx_gr # (batch_size, i+1) # log p ( r_{i} \\mid x_{0,i}, y_{0,i-1} )\n                log_prgx = torch.log_softmax(log_prgx, dim=1) # normalizing over runlengths\n\n            else:\n                log_pygx = log_pi_t\n\n            if prgx is not None:\n                if task_supervision is not None:\n                    override_log_prgx = torch.log(prgx[i]) + torch.log(task_supervision[i].unsqueeze(-1))\n                    masked_log_prgx = log_prgx + torch.log(1-task_supervision[i].unsqueeze(-1))\n                    cat_log_prgx = torch.cat((override_log_prgx.unsqueeze(-1), masked_log_prgx.unsqueeze(-1)),dim=-1)\n                    log_prgx = torch.logsumexp(cat_log_prgx,dim=-1)\n                else:\n                    log_prgx = torch.log(prgx[i])\n                    \n            if not return_timing: log_prgx_list.append(log_prgx)\n\n            # use these posterior predictives and log p(r | hist) to evaluate y under the full posterior predictive\n            nll = self.nll(log_pygx, log_prgx)\n            if not return_timing: nll_list.append(nll)\n\n            # update belief over run lengths:\n\n            # if classification, then log_pi_t is (batch_size, i+1. y_dim), need to mask before updating belief\n            if self.classification:\n                log_pygx = mask_nlls(y.unsqueeze(-2), log_pygx) # (batch_size, i+1)\n\n            # calculate joint densities p(r_t,data_so_far) for both r_t = r_{t-1} + 1 and r_t = 0\n            log_prx_grow = self.log_1m_hazard + log_pygx + log_prgx                      # p( r_t = r_{t-1} + 1 )\n            log_prx_chpt = self.log_hazard + torch.logsumexp(log_pygx + log_prgx, dim=1) # p (r_t = 0 )\n\n            log_prx = torch.cat((log_prx_grow,log_prx_chpt[:,None]), 1) # shape (batch_size, i + 2)\n            log_prgx = torch.log_softmax(log_prx, dim=1) # log p(r_{i+1} | x_{0:i}, y_{0:i})\n\n            # update posteriors update\n            posterior_params = tuple( torch.cat((u, p.expand(*([batch_size] + list(p.shape)[1:]))), axis=1) for u,p in zip(updated_posterior_params, prior_params) )\n\n            # append to list\n            if not return_timing: posterior_params_list.append(posterior_params)\n\n            if return_timing:\n                torch.cuda.synchronize()\n                end_time = time.perf_counter()\n                time_array.append(end_time-start_time)\n            \n        if not return_timing: nlls = torch.stack(nll_list, dim=1) # shape (batch_size, t, y_dim)\n        \n        if return_timing:\n            return [], [], [], time_array\n        \n        return posterior_params_list, log_prgx_list, nlls\n\n# From metacpd/main/alpaca.py\nclass ALPaCA(nn.Module):\n    def __init__(self, config):\n        super().__init__()\n\n        self.config = deepcopy(config)\n        self.x_dim = config['model.x_dim']\n        self.phi_dim = config['model.phi_dim']\n        self.y_dim = config['model.y_dim']\n\n        self.sigma_eps = eval(self.config['model.sigma_eps'])\n        self.logSigEps = nn.Parameter(torch.from_numpy(np.log(self.sigma_eps)), requires_grad=self.config['train.learnable_noise'])\n\n        self.Q = nn.Parameter(torch.randn(self.phi_dim, self.y_dim))\n        self.L_asym = nn.Parameter(torch.randn(self.phi_dim, self.phi_dim))\n\n        self.normal_nll_const = self.y_dim*np.log(2*np.pi)\n\n        hid_dim = config['model.hid_dim']\n        self.encoder = get_encoder(config)\n\n    @property\n    def logdetSigEps(self):\n        return torch.sum(self.logSigEps)\n\n    @property\n    def invSigEps(self):\n        return torch.diag(torch.exp(-self.logSigEps))\n\n    def prior_params(self):\n        Q0 = self.Q\n        Linv0 = self.L_asym @ self.L_asym.T\n\n        return (Q0, Linv0)\n\n    def recursive_update(self, phi, y, params):\n        \"\"\"\n            inputs: phi: shape (..., phi_dim )\n                    y:   shape (..., y_dim )\n                    params: tuple of Q, Linv\n                        Q: shape (..., phi_dim, y_dim)\n                        Linv: shape (..., phi_dim, phi_dim)\n        \"\"\"\n        Q, Linv = params\n\n        Lphi = Linv @ phi.unsqueeze(-1)\n\n        Linv = Linv - 1./(1 + phi.unsqueeze(-2) @ Lphi) * (Lphi @ Lphi.transpose(-1,-2))\n        Q = phi.unsqueeze(-1) @ y.unsqueeze(-2) + Q\n\n        return (Q, Linv)\n\n    def log_predictive_prob(self, x, y, posterior_params, update_params=False):\n        \"\"\"\n            input:  x: shape (..., x_dim)\n                    y: shape (..., y_dim)\n                    posterior_params: tuple of Q, Linv:\n                        Q: shape (..., phi_dim, y_dim)\n                        Linv: shape (..., phi_dim, phi_dim)\n                    update_params: bool, whether to perform recursive update on\n                                   posterior params and return updated params\n            output: logp: log p(y | x, posterior_parms)\n                    updated_params: updated posterior params after factoring in (x,y) pair\n        \"\"\"\n\n        phi = self.encoder(x)\n\n        Q, Linv = posterior_params\n\n        K = Linv @ Q\n\n        sigfactor = 1 + (phi.unsqueeze(-2) @ Linv @ phi.unsqueeze(-1))\n        err = y.unsqueeze(-1) - K.transpose(-1,-2) @ phi.unsqueeze(-1)\n\n        invsig = self.invSigEps / sigfactor # shape (..., y_dim y_dim)\n\n        nll_quadform = err.transpose(-1,-2) @ invsig @ err\n        nll_logdet = self.y_dim * torch.log(sigfactor) + self.logdetSigEps\n\n        logp = -0.5*(self.normal_nll_const + nll_quadform + nll_logdet).squeeze(-1).squeeze(-1)\n\n        if update_params:\n            updated_params = self.recursive_update(phi,y,posterior_params)\n            return logp, updated_params\n\n        return logp\n\n\n    def forward(self, x, posterior_params):\n        \"\"\"\n            input: x, posterior params\n            output: y\n        \"\"\"\n        phi = self.encoder(x)\n\n        Q, Linv = posterior_params\n\n        K = Linv @ Q\n\n        sigfactor = 1 + (phi.unsqueeze(-2) @ Linv @ phi.unsqueeze(-1))\n        mu = ( K.transpose(-1,-2) @ phi.unsqueeze(-1) ).squeeze(-1)\n        invsig = self.invSigEps / sigfactor\n\n        return mu, invsig\n\n# From metacpd/main/pcoc.py\nclass PCOC(nn.Module):\n    def __init__(self, config):\n        super().__init__()\n\n        self.config = deepcopy(config)\n        self.x_dim = config['model.x_dim']\n        self.phi_dim = config['model.phi_dim']\n        self.y_dim = config['model.y_dim']\n\n        self.sigma_eps = np.zeros([self.y_dim,1]) + np.asarray(eval(config['model.sigma_eps']))\n        self.cov_dim =  self.sigma_eps.shape[-1]\n        print(\"Using %d parameters in covariance:\" % self.cov_dim)\n        if self.phi_dim % self.cov_dim != 0:\n            raise ValueError(\"cov_dim must evenly divide phi_dim\")\n\n        self.logSigEps = nn.Parameter(torch.from_numpy(np.log(self.sigma_eps)), requires_grad=self.config['train.learnable_noise'])\n        \n        Linv_offset = config['model.Linv_init']\n        dir_scale = config['model.dirichlet_scale']\n        self.Q = nn.Parameter(torch.randn(self.y_dim, self.cov_dim, self.phi_dim//self.cov_dim))\n        self.logLinv = nn.Parameter(torch.randn(self.y_dim, self.cov_dim)+Linv_offset)\n        self.log_dirichlet_priors = nn.Parameter(dir_scale*torch.ones(self.y_dim), requires_grad=config['train.learnable_dirichlet'])\n\n        self.normal_nll_const = self.phi_dim*np.log(2*np.pi)\n\n        self.encoder = get_encoder(config)\n\n    @property\n    def invSigEps(self):\n        return torch.exp(-self.logSigEps) #.repeat(self.y_dim,1)\n\n    @property\n    def SigEps(self):\n        return torch.exp(self.logSigEps) #.repeat(self.y_dim,1)\n\n    def prior_params(self):\n        Q0 = self.Q\n        Linv0 = torch.exp(self.logLinv)\n        dir_weights = torch.exp(self.log_dirichlet_priors)\n\n        return (Q0, Linv0, dir_weights)\n\n    def recursive_update(self, phi, y, params):\n        \"\"\"\n            inputs: phi: shape (..., cov_dim, k )\n                    y:   shape (..., y_dim )\n                    params: tuple of Q, Linv\n                        Q: shape (..., y_dim, cov_dim, k)\n                        Linv: shape (..., y_dim, cov_dim)\n                        dir_weights: shape (..., y_dim)\n        \"\"\"\n        Q, Linv, dir_weights = params\n\n        # zeros out entries all except class y\n        invSigEps_masked = self.invSigEps * y.unsqueeze(-1) # (..., y_dim, cov_dim)\n\n        Q = Q + invSigEps_masked.unsqueeze(-1)*phi.unsqueeze(-3)\n        Linv = Linv + invSigEps_masked\n        dir_weights = dir_weights + y\n\n        return (Q, Linv, dir_weights)\n\n    def log_predictive_prob(self, x, y, posterior_params, update_params=False):\n        \"\"\"\n            input:  x: shape (..., x_dim)\n                    y: shape (..., y_dim)\n                    posterior_params: tuple of Q, Linv:\n                        Q: shape (..., y_dim, cov_dim, k)\n                        Linv: shape (..., y_dim, cov_dim)\n                        dir_weights: shape (..., y_dim)\n                    update_params: bool, whether to perform recursive update on\n                                   posterior params and return updated params\n            output: logp: log p(y, x | posterior_params) (..., y_dim)\n                    updated_params: updated posterior params after factoring in (x,y) pair\n        \"\"\"\n\n        x_shape = list(x.shape)\n\n        if len(x_shape) > 4: # more than one batch dim\n            x = x.reshape([-1]+x_shape[-3:])\n\n        phi = self.encoder(x) # (..., phi_dim)\n        if len(x_shape) > 4:\n            phi = phi.reshape(x_shape[:-3]+[self.phi_dim])\n\n        Q, Linv, dir_weights = posterior_params\n        mu = Q / Linv.unsqueeze(-1) # (..., y_dim, cov_dim, k)\n        pred_cov = 1./Linv + self.SigEps() # (..., y_dim, cov_dim)\n\n        phi_shape = phi.shape\n        phi_reshaped = phi.reshape(*(list(phi_shape)[:-1]+[self.cov_dim, -1])) # (..., cov_dim, k)\n\n        err = phi_reshaped.unsqueeze(-3) - mu # (..., y_dim, cov_dim, k)\n\n        nll_quadform = (err**2 / pred_cov.unsqueeze(-1) ).sum(-1).sum(-1)\n        nll_logdet = (self.phi_dim/self.cov_dim) * torch.log(pred_cov).sum(-1) # sum of log of diagonal entries\n\n        logp = -0.5*(nll_quadform + nll_logdet + self.normal_nll_const) # log p(x | y)\n\n        logp += torch.log(dir_weights / dir_weights.sum(-1,keepdim=True)) # multiply by p(y) posterior to get p(x, y)\n\n        if update_params:\n            updated_params = self.recursive_update(phi_reshaped, y, posterior_params)\n            return logp, updated_params\n\n        return logp\n\n\n    def forward(self, x, posterior_params):\n        \"\"\"\n            input: x, posterior params\n            output: log p(x | y) for all y\n        \"\"\"\n        x_shape = list(x.shape)\n\n        if len(x_shape) > 4: # more than one batch dim\n            x = x.reshape([-1]+x_shape[-3:])\n\n        phi = self.encoder(x) # (..., phi_dim)\n        if len(x_shape) > 4:\n            phi = phi.reshape(x_shape[:-3]+[self.phi_dim])\n\n        Q, Linv, dir_weights = posterior_params\n        mu = Q / Linv.unsqueeze(-1) # (..., y_dim, cov_dim, k)\n        pred_cov = 1./Linv + self.SigEps() # (..., y_dim, cov_dim)\n\n        phi_shape = phi.shape\n        phi_reshaped = phi.reshape(*(list(phi_shape)[:-1]+[self.cov_dim, -1])) # (..., cov_dim, k)\n\n        err = phi_reshaped.unsqueeze(-3) - mu # (..., y_dim, cov_dim, k)\n\n        nll_quadform = (err**2 / pred_cov.unsqueeze(-1) ).sum(-1).sum(-1)\n        nll_logdet = (self.phi_dim/self.cov_dim) * torch.log(pred_cov).sum(-1) # sum of log of diagonal entries\n\n        logp = -0.5*(nll_quadform + nll_logdet + self.normal_nll_const) # log p(x | y)\n\n        logp += torch.log(dir_weights / dir_weights.sum(-1,keepdim=True)) # multiply by p(y) posterior to get p(x, y)\n\n        return logp",
+    "experimental_info": "MOCA (Meta-learning for Online Changepoint Analysis) is evaluated by instantiating it with specific underlying predictive models (UPMs) and tested on various datasets with defined experimental settings.\n\n**Underlying Predictive Models (UPMs):**\n- For regression tasks, MOCA uses ALPaCA (A Bayesian meta-learning approach for regression).\n- For classification tasks, MOCA uses PCOC (Probabilistic Clustering for Online Classification).\n\n**Datasets:**\n- **Regression:** `SwitchingSinusoidDataset` (referred to as 'Sinusoid' in configurations) and `SwitchingNoiseSinusoidDataset` (referred to as 'NoiseSinusoid').\n- **Classification:** `MiniImageNet` and `RainbowMNISTDataset` (referred to as 'RainbowMNIST').\n\n**Experimental Parameters and Settings (Defaults unless otherwise specified):**\n- **General:**\n    - `--data.batch_size`: 50 for training, 1 for testing.\n    - `--data.horizon`: 100 for training, 400 for testing.\n    - `--data.cuda`: CUDA device ID, -1 for CPU.\n    - `--train.seed`: Numpy seed, default 1 or 1000.\n    - `--train.experiment_id`: Unique experiment identifier, default 0.\n- **MOCA Specific:**\n    - `--data.hazard`: Hazard rate for task switches, default 0.1 for training, 0.01 for testing.\n    - `--train.learnable_hazard`: Flag to enable learning the hazard rate (0=False, 1=True), default 0 (False).\n    - `--train.task_supervision`: Percentage of task switches labeled (float), default None.\n    - `--train.oracle_hazard`: Hazard rate for oracle (curriculum), default None.\n- **Model Architecture (UPMs and Encoders):**\n    - `--model.x_dim`: Input dimensionality, 1 for Sinusoid datasets (regression), 3 for image datasets (classification).\n    - `--model.y_dim`: Output dimensionality, 1 for regression, 5 or 10 for classification (depending on dataset).\n    - `--model.hid_dim`: Dimensionality of hidden layers, default 128.\n    - `--model.phi_dim`: Dimensionality of the embedding space, default 32.\n- **ALPaCA Specific (Regression UPM):**\n    - `--model.sigma_eps`: Noise covariance, e.g., `[0.05]` for Sinusoid datasets. Can be learned.\n    - `--train.learnable_noise`: Flag to enable learning noise covariance (0=False, 1=True), default 0 (False).\n- **PCOC Specific (Classification UPM):**\n    - `--model.Linv_init`: Initialization of logLinv, default 0.0.\n    - `--model.dirichlet_scale`: Value for log Dirichlet concentration parameters initialization, default 10.0.\n    - `--train.learnable_dirichlet`: Flag to enable learning Dirichlet concentration (0=False, 1=True), default 0 (False).\n- **Training Process:**\n    - `--train.train_iterations`: Number of episodes to train, default 7500.\n    - `--train.val_iterations`: Number of episodes to validate on, default 5.\n    - `--train.learning_rate`: Learning rate for optimizer (Adam), default 0.02.\n    - `--train.decay_every`: Learning rate decay every 1500 iterations (gamma=0.5).\n    - `--train.grad_accumulation_steps`: Number of gradient accumulation steps, default 1.\n- **Evaluation Metrics:**\n    - Negative Log-Likelihood (NLL) is reported for both regression and classification tasks.\n    - Accuracy is reported for classification tasks."
+}
