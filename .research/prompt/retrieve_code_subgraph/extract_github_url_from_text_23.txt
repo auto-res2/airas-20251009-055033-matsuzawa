@@ -1,0 +1,17 @@
+
+Input:
+# Task
+You carefully read the contents of the “Paper Outline” and select one GitHub link from the “GitHub URLs List” that you think is most relevant to the contents.
+# Constraints
+- Output the index number corresponding to the selected GitHub URL.
+- Be sure to select only one GitHub URL.
+- If there is no related GitHub link, output None.
+# Paper Outline
+AETTA's methodology is grounded in comparing a model's prediction with predictions from its dropout inferences, termed Prediction Disagreement with Dropouts (PDD). It assumes 'dropout independence' (dropout inferences simulate i.i.d. models) and 'confidence-prediction calibration' to theoretically approximate test error with PDD. To address adaptation failures, which often lead to over-confident incorrect predictions and violate standard calibration, AETTA proposes 'robust confidence-prediction calibration'. This is achieved by introducing a weighting constant 'b' that dynamically scales predicted probabilities. The constant 'b' is determined by the skewness of predicted outputs, specifically using the entropy of batch-aggregated softmax values from dropout inferences (Eavg), modeled as b = (Eavg / Emax)^(-α). The final accuracy estimation (Err) is approximated as ErrDT(h) ≈ b PDDDT(h), with C omitted due to lack of information. The process involves performing N dropout inferences, calculating PDD and Eavg, and then applying the scaling factor 'b' to estimate the error. Exponential moving average is applied for stable error estimation.
+
+# GitHub URLs List
+['https://github.com/taeckyung/AETTA', 'https://github.com/DequanWang/tent', 'https://github.com/mr-eggplant/EATA', 'https://github.com/mr-eggplant/SAR', 'https://github.com/qinenergy/cotta', 'https://github.com/BIT-DA/RoTTA', 'https://github.com/taeckyung/sotta']
+Output:
+{
+    "index": 0
+}
