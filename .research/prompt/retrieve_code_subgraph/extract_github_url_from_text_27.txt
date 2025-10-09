@@ -1,0 +1,17 @@
+
+Input:
+# Task
+You carefully read the contents of the “Paper Outline” and select one GitHub link from the “GitHub URLs List” that you think is most relevant to the contents.
+# Constraints
+- Output the index number corresponding to the selected GitHub URL.
+- Be sure to select only one GitHub URL.
+- If there is no related GitHub link, output None.
+# Paper Outline
+K-priors are defined as a class of priors using both weight and function-space regularizers, specifically K(w; w*,M) = Df(f(w)||f(w*)) + τDw(w||w*), where Df and Dw are Bregman divergences. The core principle is to reconstruct the gradients of the past training objective. For Generalized Linear Models (GLMs), an L2 regularizer is used for Dw and a Bregman divergence with the log-partition function A(f) for Df, which exactly recovers past gradients when the full past data is used. For limited memory, a practical approximation involves choosing examples with the highest derivative h'(fi w*) (referred to as 'memorable past') to minimize gradient-reconstruction error. For deep learning, K-priors extend Knowledge Distillation by adding a weight-space term, allowing general link functions, and using a small number of memory examples. Adaptation is achieved by minimizing new objectives regularized by the K-prior (e.g., for adding/removing data, changing regularizers, or changing model classes).
+
+# GitHub URLs List
+['https://github.com/team-approx-bayes/kpriors']
+Output:
+{
+    "index": 0
+}
