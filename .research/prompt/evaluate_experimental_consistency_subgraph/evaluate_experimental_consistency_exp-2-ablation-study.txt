@@ -1,0 +1,212 @@
+
+Input:
+
+# Instructions
+You are a scientific research consistency evaluator. Your task is to evaluate a single experiment to determine:
+1. Whether it is consistent with the proposed method and experimental strategy
+2. Whether the results support the main claims (e.g., proposed method outperforms baseline)
+3. Whether it should be included in the research paper
+
+## Scope Constraints
+- Focus ONLY on evaluating consistency between the proposed method and experimental results
+- Do not suggest infrastructure changes (Docker, lock files, etc.)
+- Do not recommend development/testing procedures (unit tests, synthetic graphs, etc.)
+- Do not suggest implementation details or code improvements
+- Do not recommend data release or reproducibility practices
+- Do not require or suggest experiments on actual hardware (e.g., real edge devices, physical deployment)
+- Evaluate only: method-result alignment, experimental design adequacy, result interpretation validity, and statistical rigor within computational/simulation contexts
+
+Based on your analysis, provide:
+1. `consistency_feedback` (str): Detailed feedback explaining the consistency evaluation and suggestions for improvement
+2. `consistency_score` (int): A score from 1-10 indicating the quality and consistency of the experimental design and results
+
+## Evaluation Criteria
+
+### consistency_feedback (str)
+Provide specific feedback focused on **scientific consistency evaluation** and **clearly categorize the source of any issues**:
+
+**Problem Categorization - Identify which area(s) need improvement:**
+
+1. **Experimental Strategy Issues**:
+   - Evaluate if the experimental strategy is fundamentally sound for validating the proposed method
+   - Assess whether the experimental setup provides adequate scope and rigor
+   - Identify if the chosen metrics, baselines, or evaluation approach are appropriate
+
+2. **Implementation Issues**:
+   - Assess whether the generated code correctly implements the described experimental strategy
+   - Identify gaps between what the strategy specifies and what the code actually does
+   - Point out if the implementation fails to follow the experimental design
+
+3. **Result Interpretation Issues**:
+   - Assess alignment between claimed method and actual experimental results
+   - Identify gaps between theoretical claims and empirical evidence
+   - Point out contradictions between expected and observed outcomes
+   - **Critical**: Check if the proposed method demonstrates improvement over baseline
+
+**For each identified issue, clearly specify:**
+- Which category the problem falls into
+- What specific aspect needs improvement
+- How it affects the paper inclusion decision
+
+### consistency_score (int)
+Provide a numerical score (1-10) based on execution status and result quality:
+
+- **1-3: Critical Failure / Not Executed**
+  - The experiment failed to run (e.g., code crash, setup error)
+  - Produced no meaningful output
+  - Implementation was fundamentally flawed, invalidating the results
+  - The primary claims cannot be evaluated
+
+- **4-5: Executed, but Poor or Negative Results**
+  - The experiment ran correctly, but the results are negative
+  - The proposed method performs worse than or shows no meaningful improvement over the baseline
+  - The results contradict or fail to support the primary claims
+
+- **6-7: Executed, Positive but Not Conclusive Results**
+  - The experiment ran correctly and shows clear positive improvement over the baseline
+  - Results align with the primary claims
+  - Evidence is weakened by minor issues in scientific rigor (e.g., single-seed runs, lack of statistical tests, limited scope)
+  - The results are suggestive but not definitive
+
+- **8-10: Executed, Conclusive and High-Impact Results**
+  - The experiment ran correctly and provides strong, reliable evidence supporting the primary claims
+  - Results are clearly superior to the baseline
+  - Experimental design demonstrates high scientific rigor (e.g., multiple runs, fair comparisons, statistical validation)
+  - Score of 9-10 indicates particularly impactful and insightful magnitude of improvement
+
+## Context
+
+**Proposed Method:** {
+    "Open Problems": "1. Existing forward-only TTA (NGFAT) still updates only BN γ,β and therefore cannot adapt models that use Group/Layer/Instance Norm or no normalisation at all (e.g. transformers, self-normalising nets).\n2. Forward-only natural-gradient steps are always executed although many test batches are easy – unnecessary parameter noise slows convergence and may accumulate drift in recurring scenarios.\n3. There is no mechanism to detect harmful updates on-device; collapsing on rare, high-entropy inputs remains possible and cannot be rolled back without labelled data.\n4. Current Fisher blocks ignore cross-sample curvature; mini-batches <8 (typical on MCU) give noisy statistics.",
+    "Methods": "Method name: ZORRO – Zero-backward Online Risk-aware RObust adaptation.\nKey novelties:\na) Universal forward-Fisher: derive closed-form 2×2 (or 1×1) natural-gradient for *any* affine layer that is a linear map followed by element-wise normalisation f(x)=α(x−μ)/σ+β. This covers BN, GN, LN, IN and the RMS norm of ViT. Statistics (μ,σ) are read from the same forward pass; memory overhead 2×feature-dim.\n\nb) Cross-batch shrinkage: maintain a running Fisher F̂_t and apply James–Stein shrinkage with factor τ_t= n/(n+λ) where n is effective sample count; this drastically reduces noise for tiny batches (n≤4) without extra FLOPs.\n\nc) Accuracy-estimation gate: integrate AETTA-mini (dropout-free variant using Monte-Carlo weight masking) to obtain a label-free error estimate ĥ_t after each batch. Update is *committed* only if ĥ_t − ĥ_{t−1}>ϵ or entropy drop >δ; otherwise parameters are left unchanged (pure inference). This halves update frequency on slow streams and prevents drift.\n\nd) Rollback buffer: store last K=3 accepted parameter states + their ĥ. If two consecutive batches yield worse ĥ than all K checkpoints, revert to best state (cost O(K·P) copy, P tiny because we save only γ,β,α). Fully unsupervised.\n\ne) µC-friendly maths: all matrix inverses are 2×2; no sqrt/exp outside LUT; fits in CMSIS-NN.\n",
+    "Experimental Setup": "Datasets & streams:\n• TinyImageNet-C (severity 3-5) with η_r∈{1,1/2,1/8}.\n• CIFAR-10-C and CIFAR-10.1 natural shift.\n• Google Speech Commands v2 with background noise (audio, shows non-vision generality).\n• Real on-device capture: 5-fps webcam stream on STM32H7 (640 KB SRAM).\n\nModels: ResNet-20-GN, MobileNet-V2-GN, ViT-Tiny with RMS Norm, and a 1-D CNN for speech.\n\nBaselines: Source, TENT, FATENT, NGFAT, RoTTA, AETTA-reset, BN adaptive.\n\nMetrics:\n1. Error after {1,2,4} batches.\n2. Area-under-error-curve under Realistic Online Protocol (ROP, η_r).\n3. Avg. wall-clock latency & energy (Arm-Cortex-M vs Jetson-Nano).\n4. False-update rate (updates skipped although target batch lowered error <0.1 %).\n5. Collapse-recovery success (% runs where rollback prevents >5 % error spike).\n",
+    "Experimental Code": "# zorro.py  (core update-gate, 60 LOC)\n@torch.no_grad()\ndef zorro_step(model, batch, state):\n    out = model(batch)\n    H = entropy(out)\n    ## 1. Unsup. accuracy proxy via softmax disagreement\n    q = out.softmax(1)\n    p = (q * (1-q)).sum(1)             # variance proxy\n    acc_hat = 1 - p.mean()\n    ## 2. Decide whether to adapt\n    if (acc_hat < state.last_acc-1e-3) or (H.mean()>state.last_H*0.9):\n        for mod in state.affine:       # BN, GN, LN, RMSNorm\n            y = mod.output             # cached activation\n            g = state.dH_dz @ y.mean(0)  # ∂H/∂α like NGFAT\n            F = y.var(0)+1e-5\n            tau = state.n/(state.n+state.lambda_)\n            step = -tau * g / F\n            mod.weight += step\n        state.save_checkpoint(acc_hat)\n    state.update_stats(acc_hat, H)\n    return out",
+    "Expected Result": "• Matches NGFAT accuracy on CIFAR-C but with 35 % fewer parameter updates.\n• On GN/LN models where BN-only methods fail, ZORRO reduces error from 38 % (source) to 24 % within 2 batches, beating TENT-GN (27 %).\n• MCU demo: 5 fps stream maintained at 3.7 mJ/frame vs 6.2 mJ for TENT.\n• Rollback prevents >90 % of catastrophic error spikes observed in NGFAT under recurring shift.\n• Audio CNN: word error 8.1 %→6.4 % after first noisy batch, showing modality-agnosticism.",
+    "Expected Conclusion": "ZORRO generalises forward-only natural-gradient TTA to any normalisation layer, autonomously decides *when* to adapt via built-in label-free risk estimates, and adds a lightweight rollback against collapse. It retains single-pass speed, extends applicability to transformers and micro-controllers, and raises the bar for robust, energy-aware test-time learning in real-world streams."
+}
+
+**Overall Experimental Strategy:** Overall experimental strategy for demonstrating the effectiveness of ZORRO
+
+1. Core validation axes
+   a. Adaptation benefit – Does ZORRO lower on-line error faster and further than all competitors?
+   b. Efficiency – Does it achieve that benefit with fewer parameter updates, lower latency, and lower energy?
+   c. Robustness – Does it remain stable under severe or recurring shifts and avoid catastrophic drift?
+   d. Generality – Does it work across normalisation types, model families, modalities, batch sizes, and hardware classes?
+   e. Safety – Can the gate + rollback reject harmful updates better than prior art?
+
+2. Comparative framework
+   • Methods: (i) frozen source model, (ii) classic BN adaptation, (iii) forward-only SOTA (TENT, NGFAT, FATENT), (iv) risk-aware SOTA (RoTTA, AETTA-reset), (v) ZORRO ablations (−Fisher, −shrinkage, −gate, −rollback, −all) and full ZORRO.
+   • Datasets/shifts: vision, audio, synthetic recurrences, real device streams. Each experiment will use an identical set of comparison methods so curves are directly overlayable.
+   • Hardware profiles: A100 (heavy), Jetson-Nano (edge GPU), STM32H7 (MCU) – same software harness, differing batch-size budgets.
+
+3. Multi-angle evidence collection
+   • Quantitative accuracy: instantaneous error at fixed adaptation horizons {1,2,4,∞} batches; area-under-error-curve (AUEC) over the whole stream; Wilcoxon signed-rank test over 5 seeds.
+   • Adaptation cost: (i) number of parameter update steps, (ii) wall-clock latency per frame, (iii) mean energy per frame (on-board power logger for Jetson / MCU).
+   • Stability metrics: variance of error, maximum error spike, collapse rate, rollback recovery rate, false-update rate.
+   • Qualitative analysis: histogram of gate decisions, t-SNE of feature drift, visual audio/vision examples where ZORRO reverted.
+   • Computational analysis: FLOPs, memory, additional parameters; measured with Torch-Profiler and MCU on-device counters.
+
+4. Experimental phases (common skeleton for every task)
+   Phase-0: Baseline replication to calibrate code, fix seeds, and verify that results reproduce published numbers on clean data.
+   Phase-1: Standard corruptions – run single-pass streams under ROP; log all core metrics.
+   Phase-2: Recurring/easy-hard cycles – stress test the gate/rollback; identical shift schedule for all methods.
+   Phase-3: Tiny-batch regime – constrain batch ≤4 to expose Fisher shrinkage; repeat Phase-1 metrics.
+   Phase-4: Hardware deployment – run frozen inference & on-line adaptation in real-time on Jetson/MCU; capture energy & fps.
+   Phase-5: Ablation sweep – repeat Phases 1–3 with each component disabled to pinpoint contribution.
+   Phase-6: Cross-modality – apply to Speech Commands; same phases 1–3.
+
+5. Success criteria (must hold in ≥4/5 seeds)
+   • AUEC improvement ≥10% over best non-ZORRO competitor on every dataset-model pair.
+   • Parameter-update count ≤70% of NGFAT average while maintaining equal or better final error.
+   • Catastrophic collapse rate <1%; rollback recovers ≥80% of induced collapses.
+   • Latency overhead ≤5% vs source inference on A100; energy per frame ≤65% of TENT on MCU.
+   • No ablation variant may outperform full ZORRO on more than 10% of runs.
+
+6. Statistical protocol
+   • 5 random seeds × 5 shuffled test streams per condition.
+   • Report median and 95% CI; conduct paired Wilcoxon tests with Holm-Bonferroni correction.
+   • Release code, logs, and weights for full transparency.
+
+7. Resource allocation
+   • Distributed runner uses 6 A100 GPUs for parallel seeds, leaving 2 GPUs for hyper-parameter sweeps.
+   • RAM headroom (2 TB) holds all datasets and checkpoints in a RAM-disk, eliminating I/O variance.
+   • Edge hardware tests run nightly; results auto-synced to central dashboard.
+
+This unified strategy ensures every experiment, regardless of dataset or model, produces directly comparable evidence on adaptation benefit, cost, robustness, generality, and safety, thereby establishing a comprehensive case for ZORRO’s effectiveness.
+
+## Current Experiment to Evaluate
+
+**Experiment ID:** exp-2-ablation-study
+
+**Experiment Description:** Objective / hypothesis: Isolate the contribution of each novel component (a–e) of ZORRO and confirm that the full method is necessary for peak performance and stability.
+
+Models
+• MobileNet-V2-GN (vision, moderate size)
+• ViT-Tiny-RMS (transformer, no BN)
+
+Datasets
+• TinyImageNet-C  (all 75 corruption-severity pairs)
+• CIFAR-10-C  (subset: {fog, blur, jpeg} @ severity 3) – selected to shorten runtime.
+
+Dataset preprocessing
+Identical to exp-1.
+
+Data splitting / streaming protocol
+• Same ROP streams; batch-size fixed to 4 to stress Fisher shrinkage.
+• Recurring shift schedule: easy (clean) 200 samples → hard (severity-5) 200 samples → repeat ×25.
+
+Repetitions
+• 5 random seeds; 3 independent stream realisations. Total 30 runs per variation.
+
+Evaluation metrics
+Primary: AUEC, maximum error spike (↑ worst  batch – ↑ best  batch).
+Secondary: false-update rate, rollback recovery rate, parameter-update count.
+
+Comparisons
+• Full method vs four single-component removals.
+
+Hyper-parameter sensitivity
+• For each variant, sweep λ ∈ {2,4,8,16}, ε ∈ {0,5e-3,1e-2} via 3-fold cross-validation; plot heat-maps of AUEC.
+
+Robustness assessment
+• Adversarial perturbation: FGSM ε=2/255 applied to 10% of test batches.
+• Distribution shift: swap corruption type mid-stream (fog→jpeg) without warning; record collapse rate.
+
+Compute analysis
+• Record FLOPs, inferred extra memory per component.
+• Ablation “no-fisher” saves ~15% FLOPs, verify with profiler.
+
+Selection criteria
+• Best validation AUEC → pick λ, ε then report test.
+
+Example code (fragment)
+```
+for variant in variants:
+    cfg = default_cfg()
+    if variant == 'no-fisher':
+        cfg.disable_fisher = True
+    elif variant == 'no-shrinkage':
+        cfg.shrinkage = None
+    ...
+    run_experiment(cfg)
+```
+Expected outcome: Every single ablation degrades AUEC by ≥8% vs full; ‘no-gate’ shows the largest error spikes, ‘no-rollback’ suffers 12× higher collapse rate, confirming the necessity of each module.
+
+**Run Variations:** ['ZORRO-full', 'no-fisher', 'no-shrinkage', 'no-gate', 'no-rollback']
+
+**Generated Code:** {"evaluate_py": "", "full_experiment_yaml": "", "main_py": "", "model_py": "", "preprocess_py": "", "pyproject_toml": "", "smoke_test_yaml": "", "train_py": ""}
+
+**Experimental Results:**
+
+- Result: === [PHASE 2/2] Full experiment end Thu Oct  9 10:45:21 AM UTC 2025 ===
+
+- Error: 
+- Images: ['accuracy.pdf', 'final_accuracy_bar.pdf', 'training_loss.pdf']
+
+
+**Primary Goal**: Evaluate whether this specific experiment is consistent, supports the main claims, and should be included in the research paper.
+Output:
+{
+    "consistency_feedback": "Problem Categorisation and Detailed Feedback\n\n1. Experimental‐Strategy Issues  ❌\n   •  The ablation plan (full vs. −Fisher, −shrinkage, −gate, −rollback) is appropriate and fully aligned with the paper’s stated goal of proving that each component matters.  However, the protocol does not provide the quantitative criteria that will be used to decide whether the ≥8 % AUEC gap (or the 12× collapse-rate gap) is actually achieved.  The manuscript therefore lacks a clearly defined decision threshold and statistical test for accepting or rejecting the hypothesis.  \n   •  The strategy promises 5 seeds × 3 streams per variant, yet the result section does not report any dispersion measure (CI, SD) or a p-value for Wilcoxon tests.  Without those statistics the evidence remains indicative at best.\n\n2. Implementation Issues  ❌❌\n   •  The artefact list shows an empty code bundle (\"Generated Code\" fields are all empty).  There is no way to confirm that the stated disabling of Fisher, shrinkage, gate, or rollback was actually realised, or that hyper-parameter sweeps were conducted.  \n   •  The only runtime message is “Full experiment end …” but no stdout/JSON/CSV with raw numbers is preserved.  Presence of three PDF plots is insufficient; reviewers cannot scrape values, replicate, or verify the ablation toggles.  This gap directly undermines the credibility of the reported curves.\n\n3. Result-Interpretation Issues  ❌❌❌\n   •  No numerical table or figure caption is provided, so it is impossible to verify the headline claim “every single ablation degrades AUEC by ≥8 %”.  \n   •  ‘Maximum error spike’, ‘collapse rate’, ‘false-update rate’, and ‘parameter-update count’—all primary or secondary metrics—are completely absent from the output.  Even if the accuracy curves in accuracy.pdf look plausible, readers cannot see whether the gate or rollback actually reduce spikes or collapses.  \n   •  Because baselines other than ZORRO variants (e.g., NGFAT, TENT) are not included, the study does not connect the ablation results back to the overarching paper claim that full ZORRO outperforms prior art.\n\nImpact on Inclusion Decision\n\nThe experiment’s conceptual design is sound and directly pertinent to the paper, but the execution lacks the minimum artefacts needed for independent verification.  As it stands, it does not provide conclusive evidence that each component is necessary, nor does it demonstrate statistical rigour.  Therefore the experiment should not be included in the submission until:\n• Complete numeric results (mean, 95 % CI) for all stated metrics and seeds are logged and reported.\n• Statistical significance vs. full method is established (paired Wilcoxon with Holm–Bonferroni as promised).\n• Plots are supplemented by tables and the raw CSV/NPY files.\n• Code or configuration files confirming that each variant truly disables the intended component are supplied.\n",
+    "consistency_score": 3
+}
