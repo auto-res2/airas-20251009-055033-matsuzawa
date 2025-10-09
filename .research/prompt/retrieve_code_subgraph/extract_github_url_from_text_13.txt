@@ -1,0 +1,17 @@
+
+Input:
+# Task
+You carefully read the contents of the “Paper Outline” and select one GitHub link from the “GitHub URLs List” that you think is most relevant to the contents.
+# Constraints
+- Output the index number corresponding to the selected GitHub URL.
+- Be sure to select only one GitHub URL.
+- If there is no related GitHub link, output None.
+# Paper Outline
+The proposed RoTTA method consists of three key components: 1) Robust Batch Normalization (RBN) which estimates normalization statistics by replacing current batch statistics with global ones maintained via exponential moving average (EMA) to ensure stability against correlated data. 2) Category-balanced sampling with timeliness and uncertainty (CSTU) for maintaining a memory bank. This memory bank stores category-balanced data, prioritizing newer samples and those with lower uncertainty (based on age and prediction entropy) to capture a stable snapshot of the current distribution. 3) Robust training with timeliness, which uses a teacher-student model architecture. The student model is updated by minimizing a loss that incorporates a time-aware reweighting strategy (exponential decay based on sample age) and cross-entropy between strongly-augmented student predictions and weakly-augmented teacher predictions. Only the affine parameters in RBN are trained for efficiency and stability. The teacher model is updated via EMA of the student model's parameters.
+
+# GitHub URLs List
+['https://github.com/BIT-DA/RoTTA', 'https://github.com/fiveai/LAME', 'https://github.com/qinenergy/cotta']
+Output:
+{
+    "index": 0
+}
