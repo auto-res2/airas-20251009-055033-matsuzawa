@@ -1,0 +1,17 @@
+
+Input:
+# Task
+You carefully read the contents of the “Paper Outline” and select one GitHub link from the “GitHub URLs List” that you think is most relevant to the contents.
+# Constraints
+- Output the index number corresponding to the selected GitHub URL.
+- Be sure to select only one GitHub URL.
+- If there is no related GitHub link, output None.
+# Paper Outline
+TTAC employs a mixture of Gaussians to model clusters in the target domain, using category-wise source domain statistics as anchors. It minimizes the KL-Divergence between target and source component Gaussians for category-wise alignment. For robustness against noisy predictions, a pseudo label filtering mechanism is developed, combining temporal consistency filtering (based on exponential moving average posteriors) and posterior probability filtering. Component Gaussians are updated only by samples passing these filters. To utilize all test samples, a global feature alignment objective minimizes the KL-Divergence between global source and target feature distributions. An efficient iterative updating strategy is proposed for running statistics of target domain Gaussians, avoiding storing all features and incorporating a clipping mechanism to prevent gradient vanishing. The overall TTAC algorithm uses a fixed-length queue for recent test samples and optimizes a combined anchored clustering and global feature alignment loss.
+
+# GitHub URLs List
+['https://github.com/Gorilla-Lab-SCUT/TTAC']
+Output:
+{
+    "index": 0
+}
