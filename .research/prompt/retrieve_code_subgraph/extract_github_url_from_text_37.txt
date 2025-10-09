@@ -1,0 +1,17 @@
+
+Input:
+# Task
+You carefully read the contents of the “Paper Outline” and select one GitHub link from the “GitHub URLs List” that you think is most relevant to the contents.
+# Constraints
+- Output the index number corresponding to the selected GitHub URL.
+- Be sure to select only one GitHub URL.
+- If there is no related GitHub link, output None.
+# Paper Outline
+The core methodology revolves around optimization-based meta-learning, building upon the Model-Agnostic Meta-Learning (MAML) and Online-aware Meta-Learning (OML) objectives. The base algorithm, C-MAML, optimizes an online OML objective (Eq. 5) to minimize cumulative risk across tasks. This objective's k-step MAML update is shown to be equivalent to an asymmetric CL objective (Eq. 6) that aligns the current task's gradients with the average gradient of previous tasks, offering a speedup over MER. La-MAML extends C-MAML by incorporating learnable, per-parameter LRs into the inner updates (Algorithm 1). These LRs are updated asynchronously in the meta-update, with their gradients (gMAML(αj)) reflecting the alignment between old and new tasks (Eq. 8). The LRs are clipped to positive values to prevent ascending gradients and mitigate catastrophic forgetting. This asynchronous update mechanism allows the model to conservatively modulate the pace and direction of learning, thereby accelerating progress on new tasks while facilitating knowledge transfer from old ones. The approach integrates concepts from replay-based and prior-based methods by using a replay buffer and data-driven LR modulation.
+
+# GitHub URLs List
+['https://github.com/montrealrobotics/La-MAML']
+Output:
+{
+    "index": 0
+}
