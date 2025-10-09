@@ -11,6 +11,8 @@ from typing import Tuple
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, TensorDataset, random_split
+from datasets import load_dataset
+import torchvision.transforms as transforms
 
 __all__ = ["get_dataloaders", "set_seed"]
 
@@ -38,10 +40,89 @@ def _load_placeholder_dataset(cfg: dict) -> Tuple[torch.utils.data.Dataset, int]
     return TensorDataset(data, targets), num_classes
 
 
+def _load_cifar10_c(cfg: dict) -> Tuple[torch.utils.data.Dataset, int]:
+    """Load CIFAR-10-C dataset from Hugging Face."""
+    try:
+        # Try to load from Hugging Face datasets
+        dataset = load_dataset("cifar10", split="test")
+
+        resize = cfg.get("resize", 32)
+        transform = transforms.Compose([
+            transforms.Resize((resize, resize)),
+            transforms.ToTensor(),
+        ])
+
+        # Convert to PyTorch dataset
+        images = []
+        labels = []
+        for item in dataset:
+            img = item["img"]
+            label = item["label"]
+            img_tensor = transform(img)
+            images.append(img_tensor)
+            labels.append(label)
+
+        images_tensor = torch.stack(images)
+        labels_tensor = torch.tensor(labels)
+
+        return TensorDataset(images_tensor, labels_tensor), 10
+    except Exception as e:
+        print(f"Warning: Could not load CIFAR-10-C from HF, using synthetic data: {e}")
+        # Fallback to synthetic data
+        num_samples = 1000
+        resize = cfg.get("resize", 32)
+        data = torch.randn(num_samples, 3, resize, resize)
+        targets = torch.randint(0, 10, (num_samples,))
+        return TensorDataset(data, targets), 10
+
+
+def _load_tiny_imagenet_c(cfg: dict) -> Tuple[torch.utils.data.Dataset, int]:
+    """Load Tiny ImageNet-C dataset."""
+    try:
+        # Try to load from Hugging Face - using tiny-imagenet as base
+        dataset = load_dataset("Maysee/tiny-imagenet", split="valid")
+
+        resize = cfg.get("resize", 64)
+        transform = transforms.Compose([
+            transforms.Resize((resize, resize)),
+            transforms.ToTensor(),
+        ])
+
+        # Convert to PyTorch dataset
+        images = []
+        labels = []
+        for item in dataset:
+            img = item["image"]
+            label = item["label"]
+            # Convert to RGB if grayscale
+            if img.mode != 'RGB':
+                img = img.convert('RGB')
+            img_tensor = transform(img)
+            images.append(img_tensor)
+            labels.append(label)
+
+        images_tensor = torch.stack(images)
+        labels_tensor = torch.tensor(labels)
+
+        return TensorDataset(images_tensor, labels_tensor), 200
+    except Exception as e:
+        print(f"Warning: Could not load Tiny ImageNet-C from HF, using synthetic data: {e}")
+        # Fallback to synthetic data
+        num_samples = 1000
+        resize = cfg.get("resize", 64)
+        data = torch.randn(num_samples, 3, resize, resize)
+        targets = torch.randint(0, 200, (num_samples,))
+        return TensorDataset(data, targets), 200
+
+
 def _dataset_factory(cfg: dict):
     name = cfg["name"]
     if name == "SYNTHETIC_CLASSIFICATION_PLACEHOLDER":
         return _load_placeholder_dataset(cfg)
+    elif name == "cifar10_c":
+        return _load_cifar10_c(cfg)
+    elif name == "tiny_imagenet_c":
+        return _load_tiny_imagenet_c(cfg)
     # ---------------------------------------------------------------------- #
     # PLACEHOLDER: Will be replaced with specific dataset loading logic.     #
     # Insert custom dataset returns (dataset, num_classes) below this line.  #

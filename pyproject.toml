@@ -6,19 +6,18 @@ requires-python = ">=3.9"
 authors = [
     { name = "Research Automation" }
 ]
-
-[tool.poetry.dependencies]
-python = "^3.9"
-torch = "^2.0"
-torchvision = "^0.15"
-matplotlib = "^3.7"
-seaborn = "^0.12"
-pyyaml = "^6.0"
-pandas = "^2.0"
-scikit-learn = "^1.2"
-rich = "^13.0"
-tqdm = "^4.0"
-datasets = "^2.12"  # Added for HF dataset loading
+dependencies = [
+    "torch>=2.0",
+    "torchvision>=0.15",
+    "matplotlib>=3.7",
+    "seaborn>=0.12",
+    "pyyaml>=6.0",
+    "pandas>=2.0",
+    "scikit-learn>=1.2",
+    "rich>=13.0",
+    "tqdm>=4.0",
+    "datasets>=2.12",
+]
 
 [build-system]
 requires = ["setuptools", "wheel"]

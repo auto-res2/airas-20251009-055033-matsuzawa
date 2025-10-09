@@ -90,8 +90,10 @@ def main():
     plot_comparisons(df, results_dir)
 
     # Output comparison results in JSON (stdout)
-    comp = df[["run_id", "val_acc", "val_loss" if "val_loss" in df.columns else None]].to_dict(
-        orient="records")
+    cols_to_export = ["run_id", "val_acc"]
+    if "val_loss" in df.columns:
+        cols_to_export.append("val_loss")
+    comp = df[cols_to_export].to_dict(orient="records")
     print(json.dumps({"comparison": comp}))
 
 

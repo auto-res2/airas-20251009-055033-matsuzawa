@@ -1,0 +1,16 @@
+dataset:
+  name: tiny_imagenet_c
+  resize: 64
+  severities:
+  - 3
+  - 4
+  - 5
+model:
+  name: mobilenet_v2_gn
+run_id: tin_c_mnv2_no_gate
+seed: 42
+training:
+  batch_size: 32
+  disable_gate: true
+  epochs: 1
+  method: zorro

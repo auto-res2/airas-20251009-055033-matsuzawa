@@ -93,7 +93,7 @@ def main():
     args = parse_args()
     results_root = Path(args.results_dir).expanduser()
     if results_root.exists():
-        shutil.rmtree(results_root)
+        shutil.rmtree(results_root, ignore_errors=True)
     results_root.mkdir(parents=True, exist_ok=True)
 
     cfg_path = CONFIG_DIR / ("smoke_test.yaml" if args.smoke_test else "full_experiment.yaml")

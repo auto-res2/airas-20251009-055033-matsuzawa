@@ -126,7 +126,8 @@ class ZorroState:
                     fisher_diag = y.var(dim=0) + 1e-5
 
                 if self.disable_fisher:
-                    step = -tau * g
+                    # Use L2 norm as a simple regularizer to prevent instability
+                    step = -tau * g / (g.norm() + 1e-5)
                 else:
                     step = -tau * g / fisher_diag
 
@@ -191,6 +192,9 @@ def main():
     # --------------------------------------------------------------   model #
     model_cfg = cfg["model"]
     model_cfg["num_classes"] = num_classes  # ensure consistency
+    # Pass image size from dataset config if available
+    if "resize" in cfg["dataset"]:
+        model_cfg["img_size"] = cfg["dataset"]["resize"]
     model = build_model(model_cfg).to(device)
 
     # Optionally load a pre-trained source checkpoint

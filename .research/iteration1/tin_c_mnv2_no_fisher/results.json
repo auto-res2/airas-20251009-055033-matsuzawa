@@ -1,0 +1,14 @@
+{
+  "run_id": "tin_c_mnv2_no_fisher",
+  "method": "zorro",
+  "epochs": 1,
+  "train_history": [
+    {
+      "epoch": 1,
+      "loss": 5.378187860488891,
+      "acc": 0.4375
+    }
+  ],
+  "val_loss": 5.492682594299317,
+  "val_acc": 0.3
+}

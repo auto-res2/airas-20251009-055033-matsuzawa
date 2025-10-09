@@ -1,0 +1,14 @@
+{
+  "run_id": "tin_c_mnv2_no_shrinkage",
+  "method": "zorro",
+  "epochs": 1,
+  "train_history": [
+    {
+      "epoch": 1,
+      "loss": 7.614089138031006,
+      "acc": 0.525
+    }
+  ],
+  "val_loss": 7.765893081665039,
+  "val_acc": 0.45
+}
