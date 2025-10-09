@@ -1,0 +1,17 @@
+
+Input:
+# Task
+You carefully read the contents of the “Paper Outline” and select one GitHub link from the “GitHub URLs List” that you think is most relevant to the contents.
+# Constraints
+- Output the index number corresponding to the selected GitHub URL.
+- Be sure to select only one GitHub URL.
+- If there is no related GitHub link, output None.
+# Paper Outline
+The proposed approach builds upon a base algorithm called Continual-MAML (C-MAML). C-MAML aims to optimize an Online-aware Meta-Learning (OML) objective online, adapted to optimize model parameters, and utilizes a replay buffer. The meta-objective used is shown to be equivalent to the A-GEM objective, which is asymmetric and focuses on aligning the gradients of the current task with the average gradient of previously seen tasks, leading to faster learning compared to objectives that align all pairwise task gradients. La-MAML extends C-MAML by incorporating a set of learnable per-parameter learning rates (LRs) used in the inner updates. These LRs are modulated based on the alignment (or interference) between gradients of old and new tasks, with negative LR gradients increasing LR magnitude (for alignment) and positive gradients decreasing it (for interference). The network weights and LRs are updated asynchronously: LRs are updated first based on their hypergradients, and then weights are updated using these new, clipped-to-positive LRs to ensure conservative updates and mitigate catastrophic forgetting. A replay buffer is maintained using reservoir sampling to store past samples, which are used to form meta-batches alongside current task data for meta-loss evaluation.
+
+# GitHub URLs List
+['https://github.com/montrealrobotics/La-MAML']
+Output:
+{
+    "index": 0
+}
