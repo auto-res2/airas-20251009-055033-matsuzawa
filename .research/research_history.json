@@ -1087,7 +1087,161 @@
         "TinyImageNet-C",
         "Google Speech Commands v2",
         "STM32 Webcam Stream"
-      ]
+      ],
+      "external_resources": {
+        "hugging_face": {
+          "models": [],
+          "datasets": [
+            {
+              "id": "robro/cifar10-c-parquet",
+              "author": "robro",
+              "sha": "19c813b71fc13aa6cb76e97cb036c768df69cf3e",
+              "created_at": "2025-09-10T19:53:55+00:00",
+              "last_modified": "2025-09-10T20:39:09+00:00",
+              "private": false,
+              "gated": false,
+              "disabled": false,
+              "downloads": 282,
+              "likes": 1,
+              "siblings": [
+                {
+                  "rfilename": ".gitattributes"
+                },
+                {
+                  "rfilename": "README.md"
+                },
+                {
+                  "rfilename": "data-00000-of-00005.arrow"
+                },
+                {
+                  "rfilename": "data-00001-of-00005.arrow"
+                },
+                {
+                  "rfilename": "data-00002-of-00005.arrow"
+                },
+                {
+                  "rfilename": "data-00003-of-00005.arrow"
+                },
+                {
+                  "rfilename": "data-00004-of-00005.arrow"
+                },
+                {
+                  "rfilename": "dataset_info.json"
+                },
+                {
+                  "rfilename": "state.json"
+                }
+              ],
+              "tags": [
+                "size_categories:100K<n<1M",
+                "format:arrow",
+                "modality:image",
+                "modality:text",
+                "library:datasets",
+                "library:mlcroissant",
+                "arxiv:1903.12261",
+                "region:us"
+              ],
+              "readme": "---\n# For reference on dataset card metadata, see the spec: https://github.com/huggingface/hub-docs/blob/main/datasetcard.md?plain=1\n# Doc / guide: https://huggingface.co/docs/hub/datasets-cards\n{}\n---\n\n# Dataset Card for CIFAR10-C\n\n<!-- Provide a quick summary of the dataset. -->\n\nThis dataset is simply an update of the original dataset into the parquet format which should work with the current (circa 2025) huggingface dataset library\n\n## Dataset Details\n\n### Dataset Description\n\n<!-- Provide a longer summary of what this dataset is. -->\nThe CIFAR-10-C dataset is an extension of CIFAR-10 designed to evaluate model robustness to common corruptions. It consists of 950,000 images derived from the original CIFAR-10 test set (10,000 images) by applying 19 different corruption types at 5 severity levels. The corruptions include noise, blur, weather effects, and digital distortions. This dataset is widely used for benchmarking robustness in image classification tasks.\n\n### Dataset Sources\n\n<!-- Provide the basic links for the dataset. -->\n\n- **Homepage:** https://github.com/hendrycks/robustness\n- **Paper:** Hendrycks, D., & Dietterich, T. (2019). Benchmarking neural network robustness to common corruptions and perturbations. arXiv preprint arXiv:1903.12261.\n\n## Dataset Structure\n\n<!-- This section provides a description of the dataset fields, and additional information about the dataset structure such as criteria used to create the splits, relationships between data points, etc. -->\n\nEach sample in the dataset contains:\n\n- **image**: A 32×32 RGB image in PNG format\n\n- **label**: An integer between 0 and 9, representing the class\n\n- **corruption_name**: The name of the applied corruption\n\n- **corruption_level**: An integer between 1 and 5 indicating severity\n\n\nTotal images: 950,000\n\nClasses: 10 (airplane, automobile, bird, cat, deer, dog, frog, horse, ship, truck)\n\nCorruptions: 19 types (e.g., Gaussian noise, motion blur, contrast, fog, frost, elastic transform, pixelate, JPEG compression, etc.)\n\nSeverity Levels: 5 (ranging from least to most severe)\n\nSplits:\n\n- **Train**: 950,000 images\n\nImage specs: PNG format, 32×32 pixels, RGB\n\n## Example Usage\nBelow is a quick example of how to load this dataset via the Hugging Face Datasets library.\n\n```python\nfrom datasets import load_dataset\n\n# Load the dataset\ndataset = load_dataset(\"robro/cifar10-c-parquet\", split=\"train\", trust_remote_code=False)\nclasses = [\"airplane\",\"automobile\",\"bird\",\"cat\",\"deer\",\"dog\",\"frog\",\"horse\",\"ship\",\"truck\",]\n\n# Access a sample from the dataset\nexample = dataset[0]\nimage = example[\"image\"]\nlabel = example[\"label\"]\n\nimage.show()  # Display the image\nprint(f\"Label: {classes[label]}\")\n```\n\n## Citation\n\n<!-- If there is a paper or blog post introducing the dataset, the APA and Bibtex information for that should go in this section. -->\n\n**BibTeX:**\n\n```bibtex\n@article{hendrycks2019benchmarking,\n  title={Benchmarking neural network robustness to common corruptions and perturbations},\n  author={Hendrycks, Dan and Dietterich, Thomas},\n  journal={arXiv preprint arXiv:1903.12261},\n  year={2019}\n}\n```\n",
+              "extracted_code": "from datasets import load_dataset\n\n# Load the dataset\ndataset = load_dataset(\"robro/cifar10-c-parquet\", split=\"train\", trust_remote_code=False)\nclasses = [\"airplane\", \"automobile\", \"bird\", \"cat\", \"deer\", \"dog\", \"frog\", \"horse\", \"ship\", \"truck\"]\n\n# Access a sample from the dataset\nexample = dataset[0]\nimage = example[\"image\"]\nlabel = example[\"label\"]\n\nimage.show()  # Display the image\nprint(f\"Label: {classes[label]}\")"
+            },
+            {
+              "id": "randall-lab/cifar10-c",
+              "author": "randall-lab",
+              "sha": "e93deb9d9bdca84b5fc3ea5e8b5d427c4fbc2dd6",
+              "created_at": "2025-02-23T18:15:31+00:00",
+              "last_modified": "2025-02-23T18:36:34+00:00",
+              "private": false,
+              "gated": false,
+              "disabled": false,
+              "downloads": 101,
+              "likes": 0,
+              "siblings": [
+                {
+                  "rfilename": ".gitattributes"
+                },
+                {
+                  "rfilename": "README.md"
+                },
+                {
+                  "rfilename": "cifar10-c.py"
+                }
+              ],
+              "tags": [
+                "arxiv:1903.12261",
+                "region:us"
+              ],
+              "readme": "---\n# For reference on dataset card metadata, see the spec: https://github.com/huggingface/hub-docs/blob/main/datasetcard.md?plain=1\n# Doc / guide: https://huggingface.co/docs/hub/datasets-cards\n{}\n---\n\n# Dataset Card for CIFAR10-C\n\n<!-- Provide a quick summary of the dataset. -->\n\n## Dataset Details\n\n### Dataset Description\n\n<!-- Provide a longer summary of what this dataset is. -->\nThe CIFAR-10-C dataset is an extension of CIFAR-10 designed to evaluate model robustness to common corruptions. It consists of 950,000 images derived from the original CIFAR-10 test set (10,000 images) by applying 19 different corruption types at 5 severity levels. The corruptions include noise, blur, weather effects, and digital distortions. This dataset is widely used for benchmarking robustness in image classification tasks.\n\n### Dataset Sources\n\n<!-- Provide the basic links for the dataset. -->\n\n- **Homepage:** https://github.com/hendrycks/robustness\n- **Paper:** Hendrycks, D., & Dietterich, T. (2019). Benchmarking neural network robustness to common corruptions and perturbations. arXiv preprint arXiv:1903.12261.\n\n## Dataset Structure\n\n<!-- This section provides a description of the dataset fields, and additional information about the dataset structure such as criteria used to create the splits, relationships between data points, etc. -->\n\nEach sample in the dataset contains:\n\n- **image**: A 32×32 RGB image in PNG format\n\n- **label**: An integer between 0 and 9, representing the class\n\n- **corruption_name**: The name of the applied corruption\n\n- **corruption_level**: An integer between 1 and 5 indicating severity\n\n\nTotal images: 950,000\n\nClasses: 10 (airplane, automobile, bird, cat, deer, dog, frog, horse, ship, truck)\n\nCorruptions: 19 types (e.g., Gaussian noise, motion blur, contrast, fog, frost, elastic transform, pixelate, JPEG compression, etc.)\n\nSeverity Levels: 5 (ranging from least to most severe)\n\nSplits:\n\n- **Test**: 950,000 images\n\nImage specs: PNG format, 32×32 pixels, RGB\n\n## Example Usage\nBelow is a quick example of how to load this dataset via the Hugging Face Datasets library.\n```\nfrom datasets import load_dataset  \n\n# Load the dataset  \ndataset = load_dataset(\"randall-lab/cifar10-c\", split=\"test\", trust_remote_code=True)  \n\n# Access a sample from the dataset  \nexample = dataset[0]  \nimage = example[\"image\"]  \nlabel = example[\"label\"]  \n\nimage.show()  # Display the image  \nprint(f\"Label: {label}\")\n```\n\n## Citation\n\n<!-- If there is a paper or blog post introducing the dataset, the APA and Bibtex information for that should go in this section. -->\n\n**BibTeX:**\n\n@article{hendrycks2019benchmarking,\n  title={Benchmarking neural network robustness to common corruptions and perturbations},\n  author={Hendrycks, Dan and Dietterich, Thomas},\n  journal={arXiv preprint arXiv:1903.12261},\n  year={2019}\n}\n",
+              "extracted_code": "from datasets import load_dataset\n\n# Load the dataset\ndataset = load_dataset(\"randall-lab/cifar10-c\", split=\"test\", trust_remote_code=True)\n\n# Access a sample from the dataset\nexample = dataset[0]\nimage = example[\"image\"]\nlabel = example[\"label\"]\n\nimage.show()  # Display the image\nprint(f\"Label: {label}\")"
+            },
+            {
+              "id": "XiangPan/CIFAR10.1",
+              "author": "XiangPan",
+              "sha": "c62f392e8aea6b2f1ea5a2c12d9bc04b48e50741",
+              "created_at": "2023-01-04T21:38:30+00:00",
+              "last_modified": "2023-01-04T21:38:30+00:00",
+              "private": false,
+              "gated": false,
+              "disabled": false,
+              "downloads": 20,
+              "likes": 0,
+              "siblings": [
+                {
+                  "rfilename": ".gitattributes"
+                },
+                {
+                  "rfilename": "README.md"
+                }
+              ],
+              "card_data": {
+                "license": "mit",
+                "language": [],
+                "tags": [],
+                "datasets": [],
+                "task_categories": [],
+                "size_categories": [],
+                "metrics": [],
+                "widget": []
+              },
+              "tags": [
+                "license:mit",
+                "region:us"
+              ],
+              "readme": "---\nlicense: mit\n---\n",
+              "extracted_code": ""
+            },
+            {
+              "id": "randall-lab/tiny-imagenet-c",
+              "author": "randall-lab",
+              "sha": "c1fd717edefaec2969bb434b9221de0cd07c581c",
+              "created_at": "2025-03-19T16:03:37+00:00",
+              "last_modified": "2025-03-19T18:51:55+00:00",
+              "private": false,
+              "gated": false,
+              "disabled": false,
+              "downloads": 86,
+              "likes": 0,
+              "siblings": [
+                {
+                  "rfilename": ".gitattributes"
+                },
+                {
+                  "rfilename": "README.md"
+                },
+                {
+                  "rfilename": "tiny-imagenet-c.py"
+                }
+              ],
+              "tags": [
+                "arxiv:1903.12261",
+                "region:us"
+              ],
+              "readme": "---\n{}\n---\n\n# Dataset Card for Tiny-ImageNet-C\n\n<!-- Provide a quick summary of the dataset. -->\n\n## Dataset Details\n\n### Dataset Description\n\n<!-- Provide a longer summary of what this dataset is. -->\n\nIn Tiny ImageNet-C, there are 75,109 corrupted images derived from the original Tiny ImageNet dataset. The images are affected by two different corruption types at five severity levels.\n\n- **License:** CC BY 4.0\n\n### Dataset Sources\n\n<!-- Provide the basic links for the dataset. -->\n\n- **Homepage:** https://github.com/hendrycks/robustness\n- **Paper:** Hendrycks, D., & Dietterich, T. (2019). Benchmarking neural network robustness to common corruptions and perturbations. arXiv preprint arXiv:1903.12261.\n\n## Dataset Structure\n\n<!-- This section provides a description of the dataset fields, and additional information about the dataset structure such as criteria used to create the splits, relationships between data points, etc. -->\n\nTotal images: 75,109\n\nClasses: 200 categories\n\nSplits:\n\n- **Test:** 75,109 images\n\nImage specs: JPEG format, 64×64 pixels, RGB\n\n## Example Usage\nBelow is a quick example of how to load this dataset via the Hugging Face Datasets library.\n```\nfrom datasets import load_dataset  \n\n# Load the dataset  \ndataset = load_dataset(\"randall-lab/tiny-imagenet-c\", split=\"test\", trust_remote_code=True)\n\n# Access a sample from the dataset  \nexample = dataset[0]  \nimage = example[\"image\"]  \nlabel = example[\"label\"]  \n\nimage.show()  # Display the image  \nprint(f\"Label: {label}\")\n```\n\n## Citation\n\n<!-- If there is a paper or blog post introducing the dataset, the APA and Bibtex information for that should go in this section. -->\n\n**BibTeX:**\n\n@article{hendrycks2019benchmarking,\n  title={Benchmarking neural network robustness to common corruptions and perturbations},\n  author={Hendrycks, Dan and Dietterich, Thomas},\n  journal={arXiv preprint arXiv:1903.12261},\n  year={2019}\n}\n",
+              "extracted_code": "from datasets import load_dataset\n\n# Load the dataset\ndataset = load_dataset(\"randall-lab/tiny-imagenet-c\", split=\"test\", trust_remote_code=True)\n\n# Access a sample from the dataset\nexample = dataset[0]\nimage = example[\"image\"]\nlabel = example[\"label\"]\n\nimage.show()  # Display the image\nprint(f\"Label: {label}\")"
+            }
+          ]
+        }
+      }
     }
   },
   "idea_info_history": [
