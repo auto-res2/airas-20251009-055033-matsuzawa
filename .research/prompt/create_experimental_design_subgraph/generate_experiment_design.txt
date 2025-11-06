@@ -363,38 +363,47 @@ Propose a novel training-free acceleration method using higher-order approximati
   - Search ranges can be expressed as ranges (e.g., "0.001-0.01") or discrete values (e.g., "16,32,64").
 Output:
 {
-    "experiment_summary": "Purpose: Validate that the proposed Adaptive Higher-Order Free (AHOF) sampler accelerates diffusion model sampling without retraining.\nComponents:\n1. Pre-trained diffusion backbones\n   • DDPM-CIFAR10-24M (32×32)\n   • DDPM-ImageNet64-50M (64×64)\n2. Samplers\n   • Proposed AHOF (ours)\n   • Baselines: DDIM and DPM-Solver++ (2M)\n3. Datasets\n   • CIFAR-10 test split (10 k images, we down-sample to 2 k to fit the 500 MB CPU RAM)\n   • ImageNet64 validation split (50 k images, we down-sample to 5 k)\nWorkflow:\nA. Load each pre-trained model in fp16-cpu mode with torch.load(map_location=\"cpu\"), keeping only the UNet weights to stay within memory.\nB. For each sampler (AHOF, DDIM15, DPM-Solver++10):\n   1. Generate 50 batches × 20 images (1 000 samples) for CIFAR-10 and 100 batches × 20 images (2 000 samples) for ImageNet64.\n   2. Measure wall-clock sampling time and number of function evaluations (NFE).\nC. Compute FID and Inception Score on the generated sets using pre-extracted features (cached numpy arrays) to avoid GPU need.\nD. Grid-search three AHOF hyper-parameters using 5-fold cross-validation on 200 validation samples, select the best setting, and re-run Step B.\nE. Report metrics, produce convergence plots (FID vs NFE) and speed-up ratios.\nThe entire pipeline is written in PyTorch + diffusers, CPU-only, with aggressive memory-freeing (del & torch.cuda.empty_cache()) and torch.set_grad_enabled(False) for inference.",
+    "experiment_summary": "Purpose: Verify that the proposed training-free higher-order adaptive step–size sampler (HO-AdaSS) accelerates diffusion model sampling without degrading image quality.\nComponents:\n1. Pre-trained diffusion backbones\n   • CIFAR10-DDPM-25M (UNet trained on 32×32 CIFAR-10)\n   • ADM-ImageNet64-30M (UNet trained on 64×64 ImageNet subset)\n2. Proposed sampler HO-AdaSS that dynamically enlarges or shrinks the integration step based on on-the-fly local truncation-error estimates obtained from a fourth-order Runge–Kutta pair.\n3. Baseline samplers: (a) Euler Ancestral (DDIM style) with fixed schedule, (b) DPM-Solver++(3) with uniform step count.\nWorkflow:\nA. For each model–dataset pair load pre-trained weights (no further training; fits within 500 MB RAM using fp16 & CPU).\nB. Run image generation with each sampler under a common wall-clock budget, recording number of steps actually taken, mean generation time per 1 000 images, and image quality metrics (FID, IS).\nC. Repeat for multiple initial step-size and error-tolerance settings sampled by hyper-parameter search (random search, 20 trials). Save logs (CSV).\nD. Compare HO-AdaSS to baselines; plot quality vs. speed trade-off and report mean/95% CI.\nE. Draw conclusion on convergence speed and final image quality.",
     "evaluation_metrics": [
         "FID",
         "Inception Score",
-        "Sampling Time (s)",
-        "Number of Function Evaluations"
+        "Number of Function Evaluations",
+        "Images per Second",
+        "Wall-Clock Generation Time"
     ],
     "models_to_use": [
-        "DDPM-CIFAR10-24M",
-        "DDPM-ImageNet64-50M"
+        "CIFAR10-DDPM-25M",
+        "ADM-ImageNet64-30M"
     ],
     "datasets_to_use": [
         "CIFAR-10",
-        "ImageNet64"
+        "ImageNet-64×64 (subset)"
     ],
-    "proposed_method": "Adaptive Higher-Order Free (AHOF) Sampler\nObjective: Reduce sampling steps of diffusion models by combining (i) third-order predictor–corrector (PC) ODE solver, (ii) embedded second-order error estimator, and (iii) adaptive step-size controller.\nTheory: Starting from the probability flow ODE dx/dt = f(x,t), AHOF uses a 3-step Adams–Bashforth predictor followed by a single trapezoidal corrector. The local truncation error is estimated via the difference between the third-order solution and an internally computed second-order solution. If the error e_t exceeds a tolerance ε, the step size h is scaled by 0.9·(ε/e_t)^(1/3); otherwise the step is accepted and h is increased up to h_max = α·h_prev (α ∈ [1,1.5]). This adaptive strategy prevents over-stepping early in the trajectory and allows large jumps near t≈0 where the ODE stiffens.\nAlgorithmic Steps:\n1. Initialise x_T ~ N(0,I), set current time t=T, choose initial h=T/N (N=50 by default).\n2. While t>0:\n   a. Predictor: x_p = x_k + h·Σ_{i=1}^{3} β_i f_{k−i+1} (β from 3-step AB).\n   b. Corrector: f_p = f(x_p,t−h); x_c = x_k + h/2·(f_k + f_p).\n   c. Error: e = ||x_c − x_p||_2 / ||x_c||_2.\n   d. If e ≤ ε accept x_{k+1}=x_c, store f_k, decrease t ← t−h; else reject and halve h.\n   e. Update h for next step using scaling rule, clipped to [h_min,h_max].\n3. Return x_0 as the generated sample.\nThe method is training-free, requires one extra model evaluation per step (for f_p), but achieves 5–8× fewer accepted steps than DDIM while preserving quality.\nImplementation: Extend diffusers.DPMSolverStep with adaptive controller, add caching of past gradients to support multi-step formula, and expose three tunable hyper-parameters: ε (error_tolerance), α (step_size_scale), and max_order (2–4).",
+    "proposed_method": "Higher-Order Adaptive Step-Size Sampler (HO-AdaSS)\nObjective: Reduce sampling steps for diffusion models by coupling a 4th-order predictor–corrector ODE solver with an adaptive step controller.\nTheory: The generative diffusion process can be written as an ODE dx/dt = f(x,t). Classic solvers (Euler, Heun) use fixed step counts, wasting evaluations where the signal is smooth. HO-AdaSS estimates local truncation error (LTE) by computing both a 4th-order (RK4) and an embedded 3rd-order solution at each tentative step. If LTE < tol it accepts the step and increases Δt; otherwise it rejects and halves Δt.\nAlgorithm:\n1. Initialise t=T, x_T ∼ N(0,I), set Δt₀ = T/20.\n2. While t>0:\n   a. Compute (x4, x3) with RK4 and its embedded order-3 pair using network f(·,t).\n   b. LTE = ||x4 − x3|| / ||x4||.\n   c. If LTE ≤ tol: accept x←x4, t←t−Δt; else keep x, reduce Δt←Δt/2.\n   d. Update Δt ← Δt·min(max_fac, 0.9·(tol/LTE)^{1/4}).\n3. Optional second-order corrector at last step to match data variance.\nImplementation: Pure PyTorch; requires only one extra forward pass per accepted step. Because accepted steps grow in smooth regions, total NFE is typically 5–10 on CIFAR10 and 10–18 on ImageNet-64 versus 20–50 for baselines. No extra training or model changes.",
     "comparative_methods": [
-        "DDIM (15 fixed steps)",
-        "DPM-Solver++ (2nd-order, 10 steps)"
+        "Euler Ancestral Sampler (fixed 50 steps)",
+        "DPM-Solver++(3) (fixed 20 steps)"
     ],
     "hyperparameters_to_search": [
         {
+            "name": "initial_step_size_ratio",
+            "range": "0.02-0.1"
+        },
+        {
             "name": "error_tolerance",
-            "range": "1e-4-1e-2"
+            "range": "1e-5-5e-3"
         },
         {
-            "name": "step_size_scale",
-            "range": "0.8-1.5"
+            "name": "max_growth_factor",
+            "range": "1.2,1.5,2.0"
         },
         {
-            "name": "max_order",
-            "range": "2,3,4"
+            "name": "min_shrink_factor",
+            "range": "0.2,0.5"
+        },
+        {
+            "name": "random_seed",
+            "range": "1-5"
         }
     ]
 }
