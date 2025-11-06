@@ -1,0 +1,312 @@
+
+LLM Name: o3-2025-04-16
+Input:
+You are an AI code reviewer validating production-ready experiment code for research papers.
+
+Analyze the provided experiment code and determine if it meets all requirements for immediate execution in research experiments.
+
+# Instructions
+
+## Core Validation Criteria
+Check if the generated experiment code meets ALL of the following requirements:
+
+1. **Complete Implementation**:
+   - Every component is fully functional, production-ready, publication-worthy code
+   - No "omitted for brevity", no "simplified version", no TODO, PLACEHOLDER, pass, or ...
+   - All functions and classes are completely implemented
+   - No truncated code sections or incomplete implementations
+
+2. **Hydra Integration**:
+   - Uses Hydra to manage all experiment configurations from `config/run/*.yaml` files
+   - All parameters are loaded from run configs dynamically
+   - Proper configuration structure with run_id, method, model, dataset, training, and optuna sections
+   - CLI interface matches:
+     * Training (full): `uv run python -u -m src.main run={run_id} results_dir={path} mode=full`
+     * Training (trial): `uv run python -u -m src.main run={run_id} results_dir={path} mode=trial`
+     * Evaluation: `uv run python -m src.evaluate results_dir={path} run_ids='["run-1", "run-2", ...]'` (independent execution)
+   - Code must automatically configure based on mode:
+     * When `cfg.mode == "trial"`: Set `cfg.wandb.mode = "disabled"`, `cfg.optuna.n_trials = 0`, epochs=1
+     * When `cfg.mode == "full"`: Set `cfg.wandb.mode = "online"` and use full configuration
+
+3. **Complete Data Pipeline**:
+   - Full data loading and preprocessing implementation
+   - Dataset-specific preprocessing is properly implemented
+   - No placeholder dataset loading code
+   - Proper error handling for data operations
+   - Uses `.cache/` as the cache directory for all datasets and models
+
+4. **Model Implementation**:
+   - Complete model architectures for all methods (proposed and comparative methods)
+   - No placeholders (TODO, PLACEHOLDER, pass, or incomplete implementations)
+   - When External Resources specify HuggingFace models: properly use and customize them (acceptable to wrap AutoModel, add adapters, etc.)
+   - When no external models specified: implement architectures from scratch using PyTorch primitives
+   - Model-specific configurations correctly applied
+   - Proper PyTorch usage throughout
+
+5. **File Structure Compliance**:
+   - Contains EXACTLY these required files (and NO other files):
+     * `src/train.py`
+     * `src/evaluate.py`
+     * `src/preprocess.py`
+     * `src/model.py`
+     * `src/main.py`
+     * `pyproject.toml`
+     * `config/config.yaml`
+   - NO additional files (e.g., NO `src/__init__.py`, NO `setup.py`, NO other Python files)
+   - No missing files from the structure
+   - All functionality contained within specified files
+
+6. **WandB Integration**:
+   - train.py initializes WandB and logs ALL metrics comprehensively:
+     * Use `wandb.log()` at each training step/batch/epoch with ALL relevant time-series metrics
+     * Log as frequently as possible (per-batch or per-epoch) to capture complete training dynamics
+     * Use `wandb.summary["key"] = value` to save final/best metrics (best_val_acc, final_test_acc, best_epoch, etc.)
+     * Metric names in train.py's wandb.log() MUST exactly match the keys used in evaluate.py's run.history()
+   - Optuna Integration: If using Optuna, DO NOT log intermediate trial results to WandB - only log the final run with best hyperparameters
+   - Code must automatically configure based on mode:
+     * When `cfg.mode == "trial"`: Set `cfg.wandb.mode = "disabled"` before any WandB operations
+     * When `cfg.mode == "full"`: Set `cfg.wandb.mode = "online"` before any WandB operations
+   - NO results.json or stdout JSON dumps in train.py
+   - config/config.yaml contains mandatory WandB settings (entity/project)
+   - `WANDB_API_KEY` environment variable is available for authentication
+
+7. **Configuration Files**:
+   - The generated code properly references config files via Hydra
+   - NOTE: config/run/{run_id}.yaml files are provided separately (not in ExperimentCode)
+   - All run configurations match the experiment_runs provided
+   - Optuna search spaces are properly defined if applicable
+
+8. **Evaluation Script Independence**:
+   - evaluate.py is executed independently via `uv run python -m src.evaluate results_dir={path} run_ids='["run-1", "run-2"]'`
+   - Accepts `run_ids` parameter as JSON string list (parse with `json.loads(args.run_ids)`)
+   - main.py DOES NOT call evaluate.py
+   - evaluate.py loads WandB config from `config/config.yaml` (in repository root)
+   - evaluate.py retrieves comprehensive data from WandB API:
+     * Use `wandb.Api()` to get run data: `run = api.run(f"{entity}/{project}/{run_id}")`
+     * Retrieve: `history = run.history()`, `summary = run.summary._json_dict`, `config = dict(run.config)`
+   - **STEP 1: Per-Run Processing** (for each run_id):
+     * Export comprehensive run-specific metrics to: `{results_dir}/{run_id}/metrics.json`
+     * Generate run-specific figures (learning curves, confusion matrices) to: `{results_dir}/{run_id}/`
+     * Each run should have its own subdirectory with its metrics and figures
+   - **STEP 2: Aggregated Analysis** (after processing all runs):
+     * Export aggregated metrics to: `{results_dir}/comparison/aggregated_metrics.json`
+     * Compute secondary/derived metrics (e.g., improvement rate: (proposed - baseline) / baseline)
+     * Generate comparison figures to: `{results_dir}/comparison/`
+     * Cross-run comparison charts (bar charts, box plots)
+     * Performance metrics tables
+     * Statistical significance tests
+   - Proper figure quality: legends, annotations, tight_layout
+   - Follows GLOBALLY UNIQUE naming convention to prevent collisions:
+     * Per-run figures: `{run_id}_{figure_topic}[_<condition>][_pairN].pdf` (e.g., `run-1-proposed-bert-glue_learning_curve.pdf`)
+     * Comparison figures: `comparison_{figure_topic}[_<condition>][_pairN].pdf` (e.g., `comparison_accuracy_bar_chart.pdf`)
+   - train.py and main.py generate NO figures
+   - evaluate.py cannot run in trial_mode (no WandB data available when WandB disabled)
+
+9. **Mode-Based Implementation**:
+   - `mode` parameter controls experiment behavior (required parameter)
+   - When `cfg.mode == "trial"`:
+     * Properly reduces computational load: epochs=1, batches limited to 1-2, Optuna disabled (n_trials=0), small evaluation subset
+     * Automatically sets `cfg.wandb.mode = "disabled"`
+     * Purpose: Fast validation that code runs without errors
+   - When `cfg.mode == "full"`:
+     * Automatically sets `cfg.wandb.mode = "online"`
+     * Uses full configuration (full epochs, full Optuna trials, etc.)
+
+## Output Format
+Respond with a JSON object containing:
+- `is_code_ready`: boolean - true if ALL criteria are met, false otherwise
+- `code_issue`: string - specific issues found if any criteria are not met, focusing on what needs to be fixed
+
+# Hypothesis
+open_problems='Diffusion models suffer from slow sampling speed' method='Improve existing method with adaptive step sizes' experimental_setup='Test on CIFAR-10 and ImageNet datasets' experimental_code='Using PyTorch and diffusers library' expected_result='Achieve even better convergence' expected_conclusion='Further acceleration'
+
+# Current Research Method
+Propose a novel training-free acceleration method using higher-order approximation
+
+# Experimental Design
+- Strategy: Purpose: Validate that the proposed Adaptive Higher-Order Free (AHOF) sampler accelerates diffusion model sampling without retraining.
+Components:
+1. Pre-trained diffusion backbones
+   • DDPM-CIFAR10-24M (32×32)
+   • DDPM-ImageNet64-50M (64×64)
+2. Samplers
+   • Proposed AHOF (ours)
+   • Baselines: DDIM and DPM-Solver++ (2M)
+3. Datasets
+   • CIFAR-10 test split (10 k images, we down-sample to 2 k to fit the 500 MB CPU RAM)
+   • ImageNet64 validation split (50 k images, we down-sample to 5 k)
+Workflow:
+A. Load each pre-trained model in fp16-cpu mode with torch.load(map_location="cpu"), keeping only the UNet weights to stay within memory.
+B. For each sampler (AHOF, DDIM15, DPM-Solver++10):
+   1. Generate 50 batches × 20 images (1 000 samples) for CIFAR-10 and 100 batches × 20 images (2 000 samples) for ImageNet64.
+   2. Measure wall-clock sampling time and number of function evaluations (NFE).
+C. Compute FID and Inception Score on the generated sets using pre-extracted features (cached numpy arrays) to avoid GPU need.
+D. Grid-search three AHOF hyper-parameters using 5-fold cross-validation on 200 validation samples, select the best setting, and re-run Step B.
+E. Report metrics, produce convergence plots (FID vs NFE) and speed-up ratios.
+The entire pipeline is written in PyTorch + diffusers, CPU-only, with aggressive memory-freeing (del & torch.cuda.empty_cache()) and torch.set_grad_enabled(False) for inference.
+- Proposed Method: Adaptive Higher-Order Free (AHOF) Sampler
+Objective: Reduce sampling steps of diffusion models by combining (i) third-order predictor–corrector (PC) ODE solver, (ii) embedded second-order error estimator, and (iii) adaptive step-size controller.
+Theory: Starting from the probability flow ODE dx/dt = f(x,t), AHOF uses a 3-step Adams–Bashforth predictor followed by a single trapezoidal corrector. The local truncation error is estimated via the difference between the third-order solution and an internally computed second-order solution. If the error e_t exceeds a tolerance ε, the step size h is scaled by 0.9·(ε/e_t)^(1/3); otherwise the step is accepted and h is increased up to h_max = α·h_prev (α ∈ [1,1.5]). This adaptive strategy prevents over-stepping early in the trajectory and allows large jumps near t≈0 where the ODE stiffens.
+Algorithmic Steps:
+1. Initialise x_T ~ N(0,I), set current time t=T, choose initial h=T/N (N=50 by default).
+2. While t>0:
+   a. Predictor: x_p = x_k + h·Σ_{i=1}^{3} β_i f_{k−i+1} (β from 3-step AB).
+   b. Corrector: f_p = f(x_p,t−h); x_c = x_k + h/2·(f_k + f_p).
+   c. Error: e = ||x_c − x_p||_2 / ||x_c||_2.
+   d. If e ≤ ε accept x_{k+1}=x_c, store f_k, decrease t ← t−h; else reject and halve h.
+   e. Update h for next step using scaling rule, clipped to [h_min,h_max].
+3. Return x_0 as the generated sample.
+The method is training-free, requires one extra model evaluation per step (for f_p), but achieves 5–8× fewer accepted steps than DDIM while preserving quality.
+Implementation: Extend diffusers.DPMSolverStep with adaptive controller, add caching of past gradients to support multi-step formula, and expose three tunable hyper-parameters: ε (error_tolerance), α (step_size_scale), and max_order (2–4).
+- Evaluation Metrics: ['FID', 'Inception Score', 'Sampling Time (s)', 'Number of Function Evaluations']
+
+# Experiment Runs
+
+- Run ID: proposed-DDPM-CIFAR10-24M-CIFAR-10
+  Method: proposed
+  Model: DDPM-CIFAR10-24M
+  Dataset: CIFAR-10
+  
+  Config Content:
+  ```yaml
+  run_id: proposed-DDPM-CIFAR10-24M-CIFAR-10
+method: proposed
+model:
+  name: DDPM-CIFAR10-24M
+  image_size: 32
+  parameters: 24_000_000
+  noise_schedule: cosine
+  precision: fp16
+  weights_path: checkpoints/ddpm_cifar10_24m.pt
+dataset:
+  name: CIFAR-10
+  split: test
+  subsample: 2000        # to satisfy 500 MB RAM cap
+  transforms:
+    - type: resize
+      size: 32
+    - type: to_tensor
+    - type: normalize
+      mean: 0.5
+      std: 0.5
+  num_workers: 2
+training:                  # inference-only, kept for Hydra schema compatibility
+  inference_only: true
+  epochs: 0
+  batch_size: 20           # = images_per_batch during sampling
+  optimizer: none
+sampling:
+  sampler_name: AHOF
+  init_step_count: 50      # N in description
+  max_function_evals: null # unlimited, controlled by adaptive steps
+  eps_default: 1e-3
+  num_batches: 50          # 50 × 20 = 1 000 images
+  images_per_batch: 20
+  save_dir: outputs/cifar10/proposed_ahof/
+evaluation:
+  metrics: [FID, Inception Score, Sampling Time (s), Number of Function Evaluations]
+  metric_for_optuna: FID
+optuna:
+  n_trials: 40
+  timeout: 7200            # seconds
+  direction: minimize
+  search_space:
+    error_tolerance:
+      type: loguniform
+      low: 1e-4
+      high: 1e-2
+    step_size_scale:
+      type: uniform
+      low: 0.8
+      high: 1.5
+    max_order:
+      type: categorical
+      choices: [2, 3, 4]
+resources:
+  device: cpu
+  ram_limit_mb: 500
+seed: 42
+
+  ```
+  
+
+- Run ID: proposed-DDPM-CIFAR10-24M-ImageNet64
+  Method: proposed
+  Model: DDPM-CIFAR10-24M
+  Dataset: ImageNet64
+  
+  Config Content:
+  ```yaml
+  run_id: proposed-DDPM-CIFAR10-24M-ImageNet64
+method: proposed
+model:
+  name: DDPM-CIFAR10-24M
+  image_size: 32           # note: backbone trained at 32×32; kept per run list
+  parameters: 24_000_000
+  noise_schedule: cosine
+  precision: fp16
+  weights_path: checkpoints/ddpm_cifar10_24m.pt
+dataset:
+  name: ImageNet64
+  split: val
+  subsample: 5000          # down-sample per experimental design
+  transforms:
+    - type: resize
+      size: 64
+    - type: center_crop
+      size: 64
+    - type: to_tensor
+    - type: normalize
+      mean: 0.5
+      std: 0.5
+  num_workers: 2
+training:
+  inference_only: true
+  epochs: 0
+  batch_size: 20
+  optimizer: none
+sampling:
+  sampler_name: AHOF
+  init_step_count: 50
+  max_function_evals: null
+  eps_default: 1e-3
+  num_batches: 100         # 100 × 20 = 2 000 images
+  images_per_batch: 20
+  save_dir: outputs/imagenet64/proposed_ahof/
+evaluation:
+  metrics: [FID, Inception Score, Sampling Time (s), Number of Function Evaluations]
+  metric_for_optuna: FID
+optuna:
+  n_trials: 40
+  timeout: 10800           # longer due to larger data
+  direction: minimize
+  search_space:
+    error_tolerance:
+      type: loguniform
+      low: 1e-4
+      high: 1e-2
+    step_size_scale:
+      type: uniform
+      low: 0.8
+      high: 1.5
+    max_order:
+      type: categorical
+      choices: [2, 3, 4]
+resources:
+  device: cpu
+  ram_limit_mb: 500
+seed: 42
+
+  ```
+  
+
+
+# Generated Experiment Code (To be validated)
+{"config_yaml": "defaults:\n  - _self_\n\nwandb:\n  entity: gengaru617-personal\n  project: 251017-test\n  mode: online\n\n# These keys will be overridden by individual run/*.yaml files ----------------\nrun:\n  run_id: dummy-id\nmethod: null\nmodel: {}\ndataset: {}\ntraining: {}\nsampling: {}\nevaluation: {}\noptuna:\n  n_trials: 0\n  timeout: 0\n  direction: minimize\nresources:\n  device: cpu\nseed: 42\nmode: full\nresults_dir: ./results\n", "evaluate_py": "# src/evaluate.py\n\"\"\"Comprehensive evaluation \u0026 visualisation script.\nRun as:\nuv run python -m src.evaluate results_dir=./results run_ids=\u0027[\"run-1\", \"run-2\"]\u0027\n\"\"\"\nimport argparse\nimport json\nimport os\nfrom pathlib import Path\nfrom typing import List, Dict\n\nimport matplotlib.pyplot as plt\nimport numpy as np\nimport pandas as pd\nimport seaborn as sns\nimport wandb\nimport yaml\n\n# -----------------------------------------------------------------------------\n# Utility\n# -----------------------------------------------------------------------------\n\ndef _ensure_dir(path: Path) -\u003e None:\n    path.mkdir(parents=True, exist_ok=True)\n\n\ndef _save_json(data: Dict, path: Path) -\u003e None:\n    with path.open(\"w\") as fp:\n        json.dump(data, fp, indent=2)\n\n\n# -----------------------------------------------------------------------------\n# Per-run processing\n# -----------------------------------------------------------------------------\n\ndef process_single_run(api: wandb.Api, entity: str, project: str, run_id: str, out_dir: Path) -\u003e Dict:\n    run = api.run(f\"{entity}/{project}/{run_id}\")\n    history_df = run.history()  # All metrics\n    summary = dict(run.summary._json_dict)\n    config = dict(run.config)\n\n    # --- Persist metrics ---------------------------------------------------- #\n    _ensure_dir(out_dir)\n    metrics_json_path = out_dir / \"metrics.json\"\n    _save_json({\n        \"history\": history_df.to_dict(orient=\"list\"),\n        \"summary\": summary,\n        \"config\": config,\n    }, metrics_json_path)\n\n    # --- Learning curve figure --------------------------------------------- #\n    if \"fid\" in history_df.columns:\n        plt.figure(figsize=(6, 4))\n        sns.lineplot(x=history_df.index, y=history_df[\"fid\"], marker=\"o\", label=\"FID\")\n        plt.title(f\"FID Learning Curve \u2013 {run_id}\")\n        plt.xlabel(\"Iteration\")\n        plt.ylabel(\"FID (\u2193)\")\n        plt.tight_layout()\n        fig_path = out_dir / f\"{run_id}_learning_curve.pdf\"\n        plt.savefig(fig_path)\n        plt.close()\n        print(fig_path)\n\n    return {\n        \"run_id\": run_id,\n        \"summary\": summary,\n    }\n\n\n# -----------------------------------------------------------------------------\n# Aggregated processing\n# -----------------------------------------------------------------------------\n\ndef aggregate(runs_info: List[Dict], out_dir: Path) -\u003e None:\n    _ensure_dir(out_dir)\n    df = pd.DataFrame([ri[\"summary\"] | {\"run_id\": ri[\"run_id\"]} for ri in runs_info])\n    agg_json_path = out_dir / \"aggregated_metrics.json\"\n    _save_json(df.to_dict(orient=\"list\"), agg_json_path)\n\n    # Improvement rate (assumes first is baseline)\n    if len(df) \u003e= 2 and \"fid\" in df.columns:\n        baseline_fid = df.iloc[0][\"fid\"]\n        df[\"fid_improvement_%\"] = (baseline_fid - df[\"fid\"]) / baseline_fid * 100\n\n    # --- Bar chart of FID ---------------------------------------------------- #\n    if \"fid\" in df.columns:\n        plt.figure(figsize=(8, 4))\n        sns.barplot(x=\"run_id\", y=\"fid\", data=df)\n        for idx, val in enumerate(df[\"fid\"]):\n            plt.text(idx, val, f\"{val:.2f}\", ha=\"center\", va=\"bottom\")\n        plt.ylabel(\"FID (\u2193)\")\n        plt.tight_layout()\n        fig_path = out_dir / \"comparison_fid_bar_chart.pdf\"\n        plt.savefig(fig_path)\n        plt.close()\n        print(fig_path)\n\n\n# -----------------------------------------------------------------------------\n# Entry-point\n# -----------------------------------------------------------------------------\n\ndef main() -\u003e None:\n    parser = argparse.ArgumentParser(description=\"Evaluate multiple WandB runs.\")\n    parser.add_argument(\"results_dir\", type=str)\n    parser.add_argument(\"run_ids\", type=str, help=\u0027JSON string list, e.g. \"[\\\"run-1\\\", \\\"run-2\\\"]\"\u0027)\n    args = parser.parse_args()\n\n    results_base = Path(args.results_dir)\n    run_ids_list: List[str] = json.loads(args.run_ids)\n\n    # Load WandB credentials from config/config.yaml\n    with open(Path(__file__).resolve().parent.parent / \"config\" / \"config.yaml\", \"r\") as fp:\n        cfg = yaml.safe_load(fp)\n    entity = cfg[\"wandb\"][\"entity\"]\n    project = cfg[\"wandb\"][\"project\"]\n\n    api = wandb.Api()\n\n    runs_info = []\n    # ---------------- Per-run ------------------------------------------------ #\n    for rid in run_ids_list:\n        out_dir = results_base / rid\n        info = process_single_run(api, entity, project, rid, out_dir)\n        runs_info.append(info)\n\n    # ---------------- Aggregated comparison -------------------------------- #\n    agg_dir = results_base / \"comparison\"\n    aggregate(runs_info, agg_dir)\n\n\nif __name__ == \"__main__\":\n    main()\n", "main_py": "# src/main.py\n\"\"\"Main orchestrator that spawns `src.train` as a subprocess.\n\nRun example:\nuv run python -u -m src.main run=proposed-DDPM-CIFAR10-24M-CIFAR-10 results_dir=./results mode=full\n\"\"\"\nfrom __future__ import annotations\n\nimport os\nimport subprocess\nimport sys\nfrom pathlib import Path\n\nimport hydra\nfrom omegaconf import OmegaConf\n\n\n@hydra.main(config_path=\"../config\", version_base=None)\ndef _main(cfg) -\u003e None:\n    # --------------------------------------------------------------------- #\n    # Mode handling (trial vs full)\n    # --------------------------------------------------------------------- #\n    if cfg.mode not in {\"trial\", \"full\"}:\n        raise ValueError(\"cfg.mode must be \u0027trial\u0027 or \u0027full\u0027\")\n\n    if cfg.mode == \"trial\":\n        cfg.wandb.mode = \"disabled\"\n        cfg.optuna.n_trials = 0\n        cfg.sampling.num_batches = min(2, cfg.sampling.num_batches)\n    else:  # full\n        cfg.wandb.mode = \"online\"\n\n    # --------------------------------------------------------------------- #\n    # Spawn subprocess for src.train with overrides (inherit Hydra run cfg)\n    # --------------------------------------------------------------------- #\n    python_exe = sys.executable\n    cmd = [\n        python_exe,\n        \"-u\",\n        \"-m\",\n        \"src.train\",\n        f\"run={cfg.run.run_id}\",\n        f\"results_dir={cfg.results_dir}\",\n        f\"mode={cfg.mode}\",\n    ]\n\n    # Record environment (Hydra already changes cwd)\n    env = os.environ.copy()\n    print(\"[Main] Launching subprocess:\", \" \".join(cmd))\n    subprocess.run(cmd, check=True, env=env)\n\n\nif __name__ == \"__main__\":\n    _main()\n", "model_py": "# src/model.py\n\"\"\"Model \u0026 Sampler abstraction layer.\"\"\"\nfrom __future__ import annotations\n\nimport math\nfrom typing import Any, Dict\n\nimport torch\nfrom diffusers import (\n    DDPMPipeline,\n    DDPMScheduler,\n    DDIMScheduler,\n    DPMSolverMultistepScheduler,\n    UNet2DModel,\n)\n\nCACHE_DIR = \".cache/\"\n\n\n# ---------------------------------------------------------------------------- #\n# Adaptive Higher-Order Free (AHOF) Scheduler\n# ---------------------------------------------------------------------------- #\n\nclass AHOFScheduler(DDPMScheduler):\n    \"\"\"A simple, training-free, adaptive higher-order scheduler.\n\n    NOTE: This is a demonstration implementation that adapts the step-size `dt`\n    based on a local error estimate between consecutive predictions. The order\n    of the method is increased by Richardson extrapolation up to `max_order`.\n    \"\"\"\n\n    def __init__(self, *args, error_tolerance: float = 1e-3, step_size_scale: float = 1.0, max_order: int = 3, **kwargs):  # noqa: D401,E501\n        super().__init__(*args, **kwargs)\n        self.error_tolerance = error_tolerance\n        self.step_size_scale = step_size_scale\n        self.max_order = max_order\n\n    @classmethod\n    def from_config(cls, config, **kwargs):\n        cfg = dict(config)\n        cfg.update(kwargs)\n        return cls(**cfg)\n\n    # --------------------------------------------------------------------- #\n    # Overrides\n    # --------------------------------------------------------------------- #\n    def set_timesteps(self, num_inference_steps: int):\n        # Start with a uniform grid; will be adapted on-the-fly\n        super().set_timesteps(num_inference_steps)\n        self.dt = self.step_size_scale * (self.timesteps[0] - self.timesteps[1]).abs().item()\n\n    def step(self, model_output: torch.FloatTensor, timestep: int, sample: torch.FloatTensor, order: int = 1, **kwargs):  # noqa: D401,E501\n        \"\"\"Perform one solver step with simple adaptive strategy.\"\"\"\n        order = min(order, self.max_order)\n        # Default Euler update\n        prev_sample = super().step(model_output, timestep, sample, **kwargs).prev_sample\n        # Second pass for error estimation (half step)\n        mid_t = timestep - self.dt / 2\n        mid_sample = sample + (prev_sample - sample) / 2\n        # Model evaluate at mid step (assume same model_output for demo)\n        mid_model_output = model_output  # Placeholder for second eval\n        prev_sample_half = super().step(mid_model_output, mid_t, mid_sample, **kwargs).prev_sample\n        # Error estimate\n        error = (prev_sample - prev_sample_half).abs().mean()\n        # Adapt dt\n        if error \u003e 0:\n            adapt_ratio = (self.error_tolerance / error) ** (1 / (order + 1))\n            self.dt = max(1, adapt_ratio) * self.dt\n        return type(\"StepOutput\", (), {\"prev_sample\": prev_sample})\n\n\n# ---------------------------------------------------------------------------- #\n# DiffusionModel wrapper\n# ---------------------------------------------------------------------------- #\n\nclass DiffusionModel:\n    def __init__(self, cfg):\n        self.cfg = cfg\n        device_str = cfg.resources.device if hasattr(cfg, \"resources\") else \"cpu\"\n        self.device = torch.device(device_str)\n        dtype = torch.float16 if cfg.model.precision == \"fp16\" else torch.float32\n        self.dtype = dtype\n\n        # Try to load pipeline directly; fallback to randomly initialised UNet\n        try:\n            self.pipeline = DDPMPipeline.from_pretrained(cfg.model.weights_path, torch_dtype=dtype, cache_dir=CACHE_DIR)\n        except Exception as e:  # noqa: BLE001\n            print(f\"[WARN] Could not load weights at {cfg.model.weights_path}: {e}. Using random init.\")\n            unet = UNet2DModel(sample_size=cfg.model.image_size, in_channels=3, out_channels=3, block_out_channels=(64, 128, 128, 256))\n            scheduler = DDPMScheduler(num_train_timesteps=1000)\n            self.pipeline = DDPMPipeline(unet=unet, scheduler=scheduler)\n\n        self.pipeline.to(self.device)\n        self.set_sampler(cfg.sampling.sampler_name)\n\n    # --------------------------------------------------------------------- #\n    # Sampler switching\n    # --------------------------------------------------------------------- #\n    def set_sampler(self, name: str, **kwargs) -\u003e None:\n        name = name.lower()\n        if name == \"ddim\":\n            self.pipeline.scheduler = DDIMScheduler.from_config(self.pipeline.scheduler.config)\n        elif name in {\"dpm-solver++\", \"dpmsolver++\", \"dpm_solver_pp\"}:\n            self.pipeline.scheduler = DPMSolverMultistepScheduler.from_config(self.pipeline.scheduler.config)\n        elif name == \"ahof\":\n            self.pipeline.scheduler = AHOFScheduler.from_config(self.pipeline.scheduler.config, **kwargs)\n        else:  # default DDPM\n            self.pipeline.scheduler = DDPMScheduler.from_config(self.pipeline.scheduler.config)\n\n    # --------------------------------------------------------------------- #\n    # Sampling helper\n    # --------------------------------------------------------------------- #\n    @torch.inference_mode()\n    def generate(self, batch_size: int, num_inference_steps: int = 50) -\u003e torch.FloatTensor:\n        images = self.pipeline(\n            batch_size=batch_size,\n            num_inference_steps=num_inference_steps,\n            output_type=\"pt\",\n            generator=torch.Generator(device=self.device).manual_seed(0),\n        ).images  # Returned in [0,1]\n        return images.to(torch.float32)\n", "preprocess_py": "# src/preprocess.py\n\"\"\"Dataset loading \u0026 preprocessing utilities.\"\"\"\nimport os\nimport random\nfrom typing import Tuple, List, Dict\n\nimport torch\nfrom torch.utils.data import DataLoader, Subset\nimport torchvision.transforms as T\nfrom torchvision import datasets\n\nCACHE_DIR = \".cache/datasets\"\n\n\n# -----------------------------------------------------------------------------\n# Transform builder\n# -----------------------------------------------------------------------------\n\ndef _build_transform_item(item_cfg: Dict):\n    t_type = item_cfg[\"type\"].lower()\n    if t_type == \"resize\":\n        return T.Resize(item_cfg[\"size\"])\n    elif t_type == \"center_crop\":\n        return T.CenterCrop(item_cfg[\"size\"])\n    elif t_type == \"to_tensor\":\n        return T.ToTensor()\n    elif t_type == \"normalize\":\n        return T.Normalize(mean=item_cfg[\"mean\"], std=item_cfg[\"std\"])\n    else:\n        raise ValueError(f\"Unsupported transform type: {t_type}\")\n\n\ndef build_transforms(tf_cfg: List[Dict]):\n    transforms = [_build_transform_item(t) for t in tf_cfg]\n    return T.Compose(transforms)\n\n\n# -----------------------------------------------------------------------------\n# Dataset builder\n# -----------------------------------------------------------------------------\n\ndef build_dataset(dataset_cfg) -\u003e torch.utils.data.Dataset:\n    name = dataset_cfg.name.lower()\n    root = os.path.join(CACHE_DIR, name.replace(\"/\", \"_\"))\n\n    transform = build_transforms(dataset_cfg.transforms)\n\n    if name == \"cifar-10\":\n        train = dataset_cfg.split in [\"train\", \"training\"]\n        ds = datasets.CIFAR10(root=root, train=train, download=True, transform=transform)\n    elif name.startswith(\"imagenet64\") or name.startswith(\"imagenet\"):\n        # Expect the root path to be provided via env var or default under CACHE_DIR\n        imagenet_root = os.environ.get(\"IMAGENET64_ROOT\", os.path.join(CACHE_DIR, \"imagenet64\"))\n        ds = datasets.ImageFolder(root=imagenet_root, transform=transform)\n    else:\n        raise NotImplementedError(f\"Dataset {name} is not supported.\")\n\n    # Sub-sampling (for memory constraint)\n    if dataset_cfg.get(\"subsample\", None):\n        random.seed(dataset_cfg.get(\"seed\", 42))\n        indices = random.sample(range(len(ds)), dataset_cfg.subsample)\n        ds = Subset(ds, indices)\n    return ds\n\n\n# -----------------------------------------------------------------------------\n# Dataloader builder\n# -----------------------------------------------------------------------------\n\ndef build_dataloader(dataset_cfg, batch_size: int):\n    ds = build_dataset(dataset_cfg)\n    loader = DataLoader(\n        ds,\n        batch_size=batch_size,\n        shuffle=False,\n        num_workers=dataset_cfg.get(\"num_workers\", 2),\n        pin_memory=False,\n    )\n    return ds, loader\n", "pyproject_toml": "[project]\nname = \"adaptive-diffusion-sampler\"\nversion = \"0.1.0\"\ndescription = \"Adaptive Higher-Order Free sampler experiments (Hydra-managed)\"\nrequires-python = \"\u003e=3.9\"\nauthors = [\n    {name = \"Research Automation\", email = \"noreply@example.com\"}\n]\n\n[project.dependencies]\n# Core frameworks\ntorch = \"*\"\ntorchvision = \"*\"\n# Diffusion\ndiffusers = \"*\"\n# Experiment management\nhydra-core = \"*\"\nwandb = \"*\"\noptuna = \"*\"\n# Metrics \u0026 Utils\ntorchmetrics = \"*\"\nmatplotlib = \"*\"\nseaborn = \"*\"\npandas = \"*\"\nscikit-learn = \"*\"\nnumpy = \"*\"\nscipy = \"*\"\n# Progress, etc.\ntqdm = \"*\"\n\n[tool.setuptools.packages.find]\nwhere = [\"src\"]\n", "train_py": "# src/train.py\nimport json\nimport os\nimport sys\nimport time\nimport random\nfrom typing import Any, Dict, Tuple\n\nimport numpy as np\nimport torch\nimport torch.nn.functional as F\nfrom omegaconf import OmegaConf\nfrom torch.utils.data import DataLoader\nfrom tqdm import tqdm\n\n# Hydra / Optuna / WandB -------------------------------------------------------\nimport hydra\nfrom hydra.utils import instantiate\nimport optuna\nimport wandb\n\n# Metrics ---------------------------------------------------------------------\nfrom torchmetrics.image.fid import FrechetInceptionDistance\nfrom torchmetrics.image.inception import InceptionScore\n\n# Internal modules -------------------------------------------------------------\nfrom .preprocess import build_dataloader\nfrom .model import DiffusionModel\n\n# ---------------------------------------------------------------------------- #\n#                                TRAIN (SAMPLING)                              #\n# ---------------------------------------------------------------------------- #\n\ndef set_seed(seed: int) -\u003e None:\n    random.seed(seed)\n    np.random.seed(seed)\n    torch.manual_seed(seed)\n    torch.cuda.manual_seed_all(seed)\n\n\n# -----------------------------------------------------------------------------\n# Objective function for Optuna\n# -----------------------------------------------------------------------------\n\ndef _build_sampler_params(cfg, trial: optuna.trial.Trial) -\u003e Dict[str, Any]:\n    \"\"\"Sample hyper-parameters from the Optuna search-space defined in cfg.\"\"\"\n    sampled_params = {}\n    for name, space in cfg.optuna.search_space.items():\n        if space.type == \"loguniform\":\n            sampled_params[name] = trial.suggest_loguniform(name, space.low, space.high)\n        elif space.type == \"uniform\":\n            sampled_params[name] = trial.suggest_uniform(name, space.low, space.high)\n        elif space.type == \"categorical\":\n            sampled_params[name] = trial.suggest_categorical(name, space.choices)\n        else:\n            raise ValueError(f\"Unsupported Optuna space type: {space.type}\")\n    return sampled_params\n\n\ndef _evaluate_sampler(cfg, model: DiffusionModel, real_loader: DataLoader, sampler_params: Dict[str, Any]) -\u003e Tuple[float, Dict[str, Any]]:\n    \"\"\"Run sampling with the given parameters, return FID (lower is better).\"\"\"\n    device = torch.device(cfg.resources.device)\n\n    # Set sampler\n    model.set_sampler(cfg.sampling.sampler_name, **sampler_params)\n\n    fid_metric = FrechetInceptionDistance(feature=2048, normalize=True).to(device)\n\n    # ---------- Feed real images ---------- #\n    with torch.no_grad():\n        for real_batch in real_loader:\n            real_imgs = real_batch[0].to(device, non_blocking=True)\n            fid_metric.update(real_imgs, real=True)\n\n    # ---------- Generate fake images ---------- #\n    n_batches = cfg.sampling.num_batches if cfg.mode == \"full\" else min(2, cfg.sampling.num_batches)\n    images_per_batch = cfg.sampling.images_per_batch\n\n    start_time = time.time()\n    for _ in range(n_batches):\n        fake_imgs = model.generate(batch_size=images_per_batch, num_inference_steps=sampler_params.get(\"init_step_count\", cfg.sampling.init_step_count))\n        fake_imgs = (fake_imgs * 2 - 1).clamp(-1, 1)  # Ensure [-1, 1]\n        fid_metric.update(fake_imgs.to(device), real=False)\n    elapsed = time.time() - start_time\n\n    fid = fid_metric.compute().item()\n    metrics = {\n        \"fid\": fid,\n        \"sampling_time\": elapsed,\n        \"nfe\": sampler_params.get(\"init_step_count\", cfg.sampling.init_step_count) * n_batches,\n    }\n    return fid, metrics\n\n\ndef run_optuna(cfg, model: DiffusionModel, real_loader: DataLoader) -\u003e Dict[str, Any]:\n    \"\"\"Hyper-parameter optimisation wrapper.\"\"\"\n\n    def objective(trial: optuna.trial.Trial):\n        sampler_params = _build_sampler_params(cfg, trial)\n        fid, _ = _evaluate_sampler(cfg, model, real_loader, sampler_params)\n        return fid\n\n    study = optuna.create_study(direction=cfg.optuna.direction)\n    study.optimize(objective, n_trials=cfg.optuna.n_trials, timeout=cfg.optuna.timeout)\n\n    return study.best_params\n\n\n# -----------------------------------------------------------------------------\n# Main entry-point executed via `uv run python -u -m src.train \u2026`               \n# -----------------------------------------------------------------------------\n\n@hydra.main(config_path=\"../config\", version_base=None)\ndef _main(cfg) -\u003e None:  # noqa: C901  (keep it one function for Hydra)\n    # ---------------- Mode handling ---------------- #\n    if cfg.mode == \"trial\":\n        cfg.wandb.mode = \"disabled\"\n        cfg.optuna.n_trials = 0\n        cfg.sampling.num_batches = min(2, cfg.sampling.num_batches)\n\n    set_seed(cfg.seed)\n\n    # ---------------- WandB init ------------------- #\n    if cfg.wandb.mode != \"disabled\":\n        wandb.init(\n            entity=cfg.wandb.entity,\n            project=cfg.wandb.project,\n            id=cfg.run.run_id,\n            config=OmegaConf.to_container(cfg, resolve=True),\n            resume=\"allow\",\n            mode=cfg.wandb.mode,\n        )\n    else:\n        wandb_run_dummy = wandb.wandb_sdk.lib.disabled.RunDisabled()\n        wandb.run = wandb_run_dummy  # type: ignore\n\n    # ---------------- Data / Model ---------------- #\n    real_dataset, real_loader = build_dataloader(cfg.dataset, batch_size=cfg.sampling.images_per_batch)\n    model = DiffusionModel(cfg)\n\n    # ---------------- Hyper-parameter search ------- #\n    if cfg.optuna.n_trials \u003e 0:\n        best_params = run_optuna(cfg, model, real_loader)\n    else:\n        best_params = {}\n    # Merge best_params back to cfg.sampling (for logging)\n    for k, v in best_params.items():\n        cfg.sampling[k] = v\n\n    # ---------------- Final evaluation ------------ #\n    fid, metrics = _evaluate_sampler(cfg, model, real_loader, best_params)\n\n    # Inception Score --------------------------------------------------------- #\n    device = torch.device(cfg.resources.device)\n    is_metric = InceptionScore(normalize=True).to(device)\n    for _ in range(cfg.sampling.num_batches):\n        fake_imgs = model.generate(batch_size=cfg.sampling.images_per_batch, num_inference_steps=cfg.sampling.init_step_count)\n        is_metric.update(fake_imgs.to(device))\n    inception_mean, inception_std = is_metric.compute()\n    metrics.update({\n        \"inception_score_mean\": inception_mean.item(),\n        \"inception_score_std\": inception_std.item(),\n    })\n\n    # ---------------- Logging --------------------- #\n    for k, v in metrics.items():\n        wandb.log({k: v})\n        wandb.summary[k] = v\n\n    print(json.dumps(metrics, indent=2))\n    if wandb.run is not None and hasattr(wandb.run, \"url\"):\n        print(f\"WandB URL: {wandb.run.url}\")\n\n    wandb.finish()\n\n\nif __name__ == \"__main__\":\n    _main()\n"}
+
+Analyze the experiment code thoroughly. Ensure it is complete, executable, and ready for publication-quality research experiments.
+Output:
+{
+    "is_code_ready": false,
+    "code_issue": "The submission does not satisfy several required criteria:\n\n1. File-structure mismatch:\n   • Code is executed with \"python -m src.train\" / \"src.main\", which requires src to be a Python package, but an __init__.py is forbidden – the program will fail with \"No module named src\".\n\n2. Hydra integration is incomplete:\n   • config/config.yaml ‘defaults’ block lacks the `- run: <…>` entry, therefore overrides like run=proposed-… cannot be resolved and Hydra raises \"No matches found for run=…\".\n\n3. WandB logging requirements unmet:\n   • train.py logs only once at the very end; it does not log per batch / epoch as required, so full training dynamics are not captured.\n\n4. Scheduler/model implementation still contains placeholders / incomplete logic:\n   • AHOFScheduler.step uses `mid_model_output = model_output  # Placeholder` instead of a real second model evaluation; adaptive step-size therefore incorrect → not publication-ready.\n\n5. Data/metrics pipeline issues:\n   • Optuna search-space helper uses deprecated `suggest_loguniform`/`suggest_uniform` APIs.\n\n6. Evaluation script syntax error and limited outputs:\n   • `_ensure_dir` definition in evaluate.py uses an illegal \"- >\" arrow (typo) which causes a SyntaxError.\n\n7. Mode handling only clips `num_batches`; epochs are not forced to 1 in trial mode as required.\n\nBecause of these blocking problems the code is NOT ready for immediate execution in production-quality research experiments."
+}
