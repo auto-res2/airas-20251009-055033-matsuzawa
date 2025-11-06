@@ -1,0 +1,59 @@
+run_id: proposed-DDPM-CIFAR10-24M-ImageNet64
+method: proposed
+model:
+  name: DDPM-CIFAR10-24M
+  image_size: 32           # note: backbone trained at 32×32; kept per run list
+  parameters: 24_000_000
+  noise_schedule: cosine
+  precision: fp16
+  weights_path: checkpoints/ddpm_cifar10_24m.pt
+dataset:
+  name: ImageNet64
+  split: val
+  subsample: 5000          # down-sample per experimental design
+  transforms:
+    - type: resize
+      size: 64
+    - type: center_crop
+      size: 64
+    - type: to_tensor
+    - type: normalize
+      mean: 0.5
+      std: 0.5
+  num_workers: 2
+training:
+  inference_only: true
+  epochs: 0
+  batch_size: 20
+  optimizer: none
+sampling:
+  sampler_name: AHOF
+  init_step_count: 50
+  max_function_evals: null
+  eps_default: 1e-3
+  num_batches: 100         # 100 × 20 = 2 000 images
+  images_per_batch: 20
+  save_dir: outputs/imagenet64/proposed_ahof/
+evaluation:
+  metrics: [FID, Inception Score, Sampling Time (s), Number of Function Evaluations]
+  metric_for_optuna: FID
+optuna:
+  n_trials: 40
+  timeout: 10800           # longer due to larger data
+  direction: minimize
+  search_space:
+    error_tolerance:
+      type: loguniform
+      low: 1e-4
+      high: 1e-2
+    step_size_scale:
+      type: uniform
+      low: 0.8
+      high: 1.5
+    max_order:
+      type: categorical
+      choices: [2, 3, 4]
+resources:
+  device: cpu
+  ram_limit_mb: 500
+seed: 42

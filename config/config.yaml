@@ -1,0 +1,27 @@
+defaults:
+  # This MUST be overridden from CLI (run=<run_id>)
+  - run: ???
+  - _self_
+
+wandb:
+  entity: gengaru617-personal
+  project: 251017-test
+  mode: online  # trial-mode overrides to "disabled" automatically
+
+run:
+  run_id: dummy-run-id
+method: null
+model: {}
+dataset: {}
+training: {}
+sampling: {}
+optuna:
+  n_trials: 0
+  timeout: 0
+  direction: minimize
+  search_space: {}
+resources:
+  device: cpu
+seed: 42
+mode: full
+results_dir: ./results

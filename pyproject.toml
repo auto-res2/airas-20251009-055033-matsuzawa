@@ -1,1 +1,27 @@
-# Please list the required python packages.
+[project]
+name = "adaptive-diffusion-ahof"
+version = "0.1.0"
+requires-python = ">=3.9"
+description = "Adaptive Higher-Order Free sampler experiments (Hydra-managed)"
+authors = [ {name = "Automated Research", email = "noreply@example.com"} ]
+
+[project.dependencies]
+# core
+torch = "*"
+torchvision = "*"
+# diffusion backbone
+"diffusers" = "*"
+# experiment management
+"hydra-core" = "*"
+wandb = "*"
+optuna = "*"
+# metrics & plotting
+torchmetrics = "*"
+matplotlib = "*"
+seaborn = "*"
+pandas = "*"
+numpy = "*"
+scikit-learn = "*"
+scipy = "*"
+# progress
+"tqdm" = "*"

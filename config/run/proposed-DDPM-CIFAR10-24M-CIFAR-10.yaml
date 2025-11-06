@@ -1,0 +1,57 @@
+run_id: proposed-DDPM-CIFAR10-24M-CIFAR-10
+method: proposed
+model:
+  name: DDPM-CIFAR10-24M
+  image_size: 32
+  parameters: 24_000_000
+  noise_schedule: cosine
+  precision: fp16
+  weights_path: checkpoints/ddpm_cifar10_24m.pt
+dataset:
+  name: CIFAR-10
+  split: test
+  subsample: 2000        # to satisfy 500 MB RAM cap
+  transforms:
+    - type: resize
+      size: 32
+    - type: to_tensor
+    - type: normalize
+      mean: 0.5
+      std: 0.5
+  num_workers: 2
+training:                  # inference-only, kept for Hydra schema compatibility
+  inference_only: true
+  epochs: 0
+  batch_size: 20           # = images_per_batch during sampling
+  optimizer: none
+sampling:
+  sampler_name: AHOF
+  init_step_count: 50      # N in description
+  max_function_evals: null # unlimited, controlled by adaptive steps
+  eps_default: 1e-3
+  num_batches: 50          # 50 × 20 = 1 000 images
+  images_per_batch: 20
+  save_dir: outputs/cifar10/proposed_ahof/
+evaluation:
+  metrics: [FID, Inception Score, Sampling Time (s), Number of Function Evaluations]
+  metric_for_optuna: FID
+optuna:
+  n_trials: 40
+  timeout: 7200            # seconds
+  direction: minimize
+  search_space:
+    error_tolerance:
+      type: loguniform
+      low: 1e-4
+      high: 1e-2
+    step_size_scale:
+      type: uniform
+      low: 0.8
+      high: 1.5
+    max_order:
+      type: categorical
+      choices: [2, 3, 4]
+resources:
+  device: cpu
+  ram_limit_mb: 500
+seed: 42
